@@ -42,6 +42,17 @@ pub mod win32 {
         let ap = cwd.join(path).clean();
         Ok(fixdrive(&fix_separators(ap.as_path())))
     }
+
+    /// Resolve a Windows path, following symlinks and junctions.
+    ///
+    /// The `std::fs::canonicalize` Windows implementation already does the
+    /// right thing (it issues `GetFinalPathNameByHandleW`), so we just delegate
+    /// and normalize the forward-slash convention the rest of this module
+    /// relies on.
+    pub fn realpath(path: &Path) -> Result<PathBuf, std::io::Error> {
+        let canonical = std::fs::canonicalize(path)?;
+        Ok(fixdrive(&fix_separators(canonical.as_path())))
+    }
 }
 
 pub mod posix {
