@@ -2,6 +2,7 @@ use crate::lock::{Lock, LockError};
 use std::collections::HashMap;
 use std::fs::{Metadata, Permissions};
 use std::io::{Read, Seek};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::time::UNIX_EPOCH;
 use url::Url;
@@ -61,9 +62,9 @@ pub fn map_io_err_to_transport_err(err: std::io::Error, path: Option<&str>) -> E
         // std::io::ErrorKind::NotADirectoryError => Error::NotADirectoryError(None),
         // std::io::ErrorKind::IsADirectoryError => Error::IsADirectoryError(None),
         _ => match err.raw_os_error() {
-            Some(nix::libc::ENOTDIR) => Error::NotADirectoryError(path.map(|p| p.to_string())),
-            Some(nix::libc::EISDIR) => Error::IsADirectoryError(path.map(|p| p.to_string())),
-            Some(nix::libc::ENOTEMPTY) => {
+            Some(e) if e == libc::ENOTDIR => Error::NotADirectoryError(path.map(|p| p.to_string())),
+            Some(e) if e == libc::EISDIR => Error::IsADirectoryError(path.map(|p| p.to_string())),
+            Some(e) if e == libc::ENOTEMPTY => {
                 Error::DirectoryNotEmptyError(path.map(|p| p.to_string()))
             }
             _ => Error::Io(err),
@@ -83,17 +84,43 @@ impl From<crate::urlutils::Error> for Error {
     }
 }
 
+/// Coarse file kind. Mirrors `std::fs::FileType` but is cross-platform and
+/// sidesteps the Unix-only mode-bit parsing the old implementation relied on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileKind {
+    File,
+    Dir,
+    Symlink,
+    Other,
+}
+
 pub struct Stat {
     pub size: usize,
+    /// Unix permission bits. Not present on Windows — see
+    /// `memory/project_windows_port.md` for the design rationale.
+    #[cfg(unix)]
     pub mode: u32,
+    pub kind: FileKind,
     pub mtime: Option<f64>,
 }
 
 impl From<Metadata> for Stat {
     fn from(metadata: Metadata) -> Self {
+        let ft = metadata.file_type();
+        let kind = if ft.is_dir() {
+            FileKind::Dir
+        } else if ft.is_file() {
+            FileKind::File
+        } else if ft.is_symlink() {
+            FileKind::Symlink
+        } else {
+            FileKind::Other
+        };
         Stat {
             size: metadata.len() as usize,
+            #[cfg(unix)]
             mode: metadata.permissions().mode(),
+            kind,
             mtime: metadata.modified().map_or(None, |t| {
                 Some(t.duration_since(UNIX_EPOCH).unwrap().as_secs_f64())
             }),
@@ -103,11 +130,11 @@ impl From<Metadata> for Stat {
 
 impl Stat {
     pub fn is_dir(&self) -> bool {
-        (self.mode as nix::libc::mode_t) & nix::libc::S_IFMT == nix::libc::S_IFDIR
+        self.kind == FileKind::Dir
     }
 
     pub fn is_file(&self) -> bool {
-        (self.mode as nix::libc::mode_t) & nix::libc::S_IFMT == nix::libc::S_IFREG
+        self.kind == FileKind::File
     }
 }
 
@@ -415,7 +442,14 @@ pub trait Transport: std::fmt::Debug + 'static + Send + Sync {
         // create target directory with the same rwx bits as source
         // use umask to ensure bits other than rwx are ignored
         let stat = self.stat(from_relpath)?;
-        target.mkdir(".", Some(Permissions::from_mode(stat.mode)))?;
+        #[cfg(unix)]
+        let perms = Some(Permissions::from_mode(stat.mode));
+        #[cfg(not(unix))]
+        let perms: Option<Permissions> = {
+            let _ = stat;
+            None
+        };
+        target.mkdir(".", perms)?;
         source.copy_tree_to_transport(target.as_ref())?;
         Ok(())
     }
