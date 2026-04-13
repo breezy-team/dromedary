@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 
 pub mod win32 {

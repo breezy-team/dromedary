@@ -8,7 +8,7 @@ use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
 fn open(filename: &Path, options: &OpenOptions) -> std::result::Result<(PathBuf, File), LockError> {
-    let filename = dromedary_osutils::path::realpath(filename)?;
+    let filename = crate::osutils::path::realpath(filename)?;
     match options.open(&filename) {
         Ok(f) => Ok((filename, f)),
         Err(e) => match e.kind() {
@@ -45,7 +45,7 @@ pub struct WriteLock {
 
 impl WriteLock {
     pub fn new(filename: &Path, strict_locks: bool) -> Result<WriteLock, LockError> {
-        let filename = dromedary_osutils::path::realpath(filename)?;
+        let filename = crate::osutils::path::realpath(filename)?;
         if OPEN_WRITE_LOCKS.lock().unwrap().contains(&filename) {
             return Err(LockError::Contention(filename));
         }
@@ -125,7 +125,7 @@ pub struct ReadLock {
 
 impl ReadLock {
     pub fn new(filename: &Path, strict_locks: bool) -> std::result::Result<Self, LockError> {
-        let filename = dromedary_osutils::path::realpath(filename)?;
+        let filename = crate::osutils::path::realpath(filename)?;
         if OPEN_WRITE_LOCKS.lock().unwrap().contains(&filename) {
             if strict_locks {
                 return Err(LockError::Contention(filename));

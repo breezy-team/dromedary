@@ -111,8 +111,7 @@ struct PyWriteStream(Box<dyn WriteStream + Sync + Send>);
 #[pymethods]
 impl PyWriteStream {
     fn write(&mut self, py: Python, data: &[u8]) -> PyResult<usize> {
-        py.detach(|| self.0.write(data))
-            .map_err(|e| e.into())
+        py.detach(|| self.0.write(data)).map_err(|e| e.into())
     }
 
     #[pyo3(signature = (want_fdatasync=None))]
@@ -124,8 +123,7 @@ impl PyWriteStream {
     }
 
     fn fdatasync(&mut self, py: Python) -> PyResult<()> {
-        py.detach(|| self.0.sync_data())
-            .map_err(|e| e.into())
+        py.detach(|| self.0.sync_data()).map_err(|e| e.into())
     }
 
     fn __enter__(slf: PyRef<Self>) -> Py<Self> {
@@ -162,10 +160,8 @@ impl PyBufReadStream {
     }
 
     fn map_io_err_to_py_err(&self, e: std::io::Error) -> PyErr {
-        let transport_err = dromedary::map_io_err_to_transport_err(
-            e,
-            Some(&self.path.as_path().to_string_lossy()),
-        );
+        let transport_err =
+            dromedary::map_io_err_to_transport_err(e, Some(&self.path.as_path().to_string_lossy()));
         map_transport_err_to_py_err(
             transport_err,
             None,
@@ -292,20 +288,18 @@ impl Transport {
         path: &'a str,
     ) -> PyResult<Bound<'a, PyBytes>> {
         let t = &slf.borrow().0;
-        let ret = py
-            .detach(|| t.get_bytes(path))
-            .map_err(|e| match e {
-                Error::IsADirectoryError(_) => {
-                    ReadError::new_err((path.to_string(), "Is a directory".to_string()))
-                }
-                Error::NotADirectoryError(_) => {
-                    NoSuchFile::new_err((path.to_string(), "Not a directory".to_string()))
-                }
-                e => {
-                    let obj = slf.unbind().into_any();
-                    map_transport_err_to_py_err(e, Some(obj), Some(path))
-                }
-            })?;
+        let ret = py.detach(|| t.get_bytes(path)).map_err(|e| match e {
+            Error::IsADirectoryError(_) => {
+                ReadError::new_err((path.to_string(), "Is a directory".to_string()))
+            }
+            Error::NotADirectoryError(_) => {
+                NoSuchFile::new_err((path.to_string(), "Not a directory".to_string()))
+            }
+            e => {
+                let obj = slf.unbind().into_any();
+                map_transport_err_to_py_err(e, Some(obj), Some(path))
+            }
+        })?;
 
         Ok(PyBytes::new(py, &ret))
     }
@@ -868,9 +862,7 @@ impl LocalTransport {
 fn get_test_permutations(py: Python) -> PyResult<Bound<PyList>> {
     let test_server_module = py.import("dromedary.tests.test_server")?;
     let local_url_server = test_server_module.getattr("LocalURLServer")?;
-    let local_transport = py
-        .import("dromedary.local")?
-        .getattr("LocalTransport")?;
+    let local_transport = py.import("dromedary.local")?.getattr("LocalTransport")?;
     let ret = PyList::empty(py);
     ret.append((local_transport, local_url_server))?;
     Ok(ret)
