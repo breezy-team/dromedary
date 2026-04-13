@@ -17,10 +17,10 @@
 
 """Version information for dromedary."""
 
-__version__ = "0.1.0.dev0"
+__version__ = "0.1.0"
 
 # Version information for dromedary
-version_info = (0, 1, 0, "dev", 0)
+version_info = (0, 1, 0, "final", 0)
 
 
 def _format_version_tuple(version_info):
