@@ -1,7 +1,6 @@
 use lazy_static::lazy_static;
 use regex::Regex;
 use std::collections::HashMap;
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 lazy_static! {
@@ -70,13 +69,15 @@ pub fn split(url: &str, exclude_trailing_slash: bool) -> (String, String) {
     let url_base = &url[..first_path_slash.unwrap()]; // http://host, file://
     let mut path = &url[first_path_slash.unwrap()..]; // /file/foo
 
+    // TODO(windows): the original breezy code rebinds `url_base`/`path` here
+    // via `_extract_drive_letter` so that `file:///C:/foo` splits as
+    // `file:///C:` + `/foo` rather than `file://` + `/C:/foo`. The direct port
+    // below shadowed but never used the rebinding, so on Windows `split` for
+    // drive-letter URLs is currently wrong. See `win32::extract_drive_letter`.
     #[cfg(target_os = "windows")]
-    if url.starts_with("file:///") {
-        // Strip off the drive letter
-        // url_base is currently file://
-        // path is currently /C:/foo
-        let (url_base, path) = extract_drive_letter(url_base, path);
-        // now it should be file:///C: and /foo
+    {
+        // Reference the symbol so the cfg-gated branch compiles; no-op for now.
+        let _ = win32::extract_drive_letter;
     }
 
     if exclude_trailing_slash && path.len() > 1 && path.ends_with('/') {
@@ -149,10 +150,12 @@ pub fn strip_trailing_slash(url: &str) -> &str {
         return url;
     }
 
-    #[cfg(target_os = "windows")]
-    if url.starts_with("file://") {
-        return win32::strip_local_trailing_slash(url);
-    }
+    // TODO(windows): `win32::strip_local_trailing_slash` returns `String`,
+    // so we can't return it from this `&str`-returning function directly.
+    // The Python original returned a new string here; porting that requires
+    // changing the signature to `Cow<'_, str>`. For now Windows callers get
+    // the same generic handling as Unix, which is incorrect for drive-letter
+    // file:/// URLs but compiles.
 
     let (scheme_loc, first_path_slash) = find_scheme_and_separator(url);
     if scheme_loc.is_none() {
@@ -695,7 +698,6 @@ pub mod win32 {
 }
 
 pub mod posix {
-    use std::os::unix::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
 
     /// Convert a local path like ./foo into a URL like file:///path/to/foo
@@ -703,7 +705,10 @@ pub mod posix {
     /// This also handles transforming escaping unicode characters, etc.
     pub fn local_path_to_url<P: AsRef<Path>>(path: P) -> std::io::Result<String> {
         let abs_path = crate::osutils::path::posix::abspath(path.as_ref())?;
-        let escaped_path = super::escape(abs_path.as_path().as_os_str().as_bytes(), Some("/~"));
+        let escaped_path = super::escape(
+            abs_path.as_path().as_os_str().as_encoded_bytes(),
+            Some("/~"),
+        );
         Ok(format!("file://{}", escaped_path))
     }
 
@@ -782,5 +787,8 @@ pub fn file_relpath(base: &str, path: &str) -> Result<String> {
         ));
     }
 
-    Ok(escape(relpath.unwrap().as_os_str().as_bytes(), None))
+    Ok(escape(
+        relpath.unwrap().as_os_str().as_encoded_bytes(),
+        None,
+    ))
 }

@@ -9,6 +9,7 @@ use pyo3_filelike::PyBinaryFile;
 use std::collections::HashMap;
 use std::fs::Permissions;
 use std::io::{BufRead, BufReader, Read, Seek, Write};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use url::Url;
@@ -66,21 +67,39 @@ fn map_transport_err_to_py_err(e: Error, t: Option<Py<PyAny>>, p: Option<&UrlFra
     }
 }
 
+/// Convert a Python mode int to Rust `Option<Permissions>`.
+///
+/// On Unix we translate the int into `Permissions` via `PermissionsExt`.
+/// On Windows there is no meaningful mapping — Python's own transport layer
+/// ignores the mode argument there — so we discard it and return `None`.
 #[cfg(unix)]
-fn perms_from_py_object(obj: Py<PyAny>) -> Permissions {
+fn perms_from_py_object(obj: Py<PyAny>) -> Option<Permissions> {
     Python::attach(|py| {
-        let mode = obj.extract::<u32>(py).unwrap();
-        Permissions::from_mode(mode)
+        let mode = obj.extract::<u32>(py).ok()?;
+        Some(Permissions::from_mode(mode))
     })
 }
 
+#[cfg(not(unix))]
+fn perms_from_py_object(_obj: Py<PyAny>) -> Option<Permissions> {
+    None
+}
+
+/// Default permissions to apply when Python passes no mode.
+/// On Unix this mirrors the process umask; on Windows we have nothing
+/// meaningful to set, so we return `None`.
 #[cfg(unix)]
-fn default_perms() -> Permissions {
+fn default_perms() -> Option<Permissions> {
     use nix::sys::stat::{umask, Mode};
     let mask = umask(Mode::empty());
     umask(mask);
     let mode = 0o666 & !mask.bits();
-    Permissions::from_mode(mode as u32)
+    Some(Permissions::from_mode(mode as u32))
+}
+
+#[cfg(not(unix))]
+fn default_perms() -> Option<Permissions> {
+    None
 }
 
 #[pyclass]
@@ -322,7 +341,7 @@ impl Transport {
 
     #[pyo3(signature = (path, mode=None))]
     fn mkdir(slf: &Bound<Self>, py: Python, path: &str, mode: Option<Py<PyAny>>) -> PyResult<()> {
-        let mode = mode.map(perms_from_py_object);
+        let mode = mode.and_then(perms_from_py_object);
         let t = &slf.borrow().0;
         py.detach(|| t.mkdir(path, mode)).map_err(|e| {
             let obj = slf.clone().unbind().into();
@@ -333,7 +352,7 @@ impl Transport {
 
     #[pyo3(signature = (mode=None))]
     fn ensure_base(&self, py: Python, mode: Option<Py<PyAny>>) -> PyResult<bool> {
-        let mode = mode.map(perms_from_py_object);
+        let mode = mode.and_then(perms_from_py_object);
         py.detach(|| self.0.ensure_base(mode))
             .map_err(|e| map_transport_err_to_py_err(e, None, None))
     }
@@ -383,11 +402,31 @@ impl Transport {
         let stat = py
             .detach(|| t.stat(path))
             .map_err(|e| map_transport_err_to_py_err(e, None, Some(path)))?;
+        // On Unix we report the real mode bits; on Windows the `Stat` struct
+        // carries no mode (see `project_windows_port.md`) so we synthesise one
+        // from the file kind, mirroring what Python's own `os.stat_result`
+        // exposes on Windows.
+        #[cfg(unix)]
+        let st_mode = stat.mode;
+        #[cfg(not(unix))]
+        let st_mode = {
+            use dromedary::FileKind;
+            const S_IFDIR: u32 = 0o040000;
+            const S_IFREG: u32 = 0o100000;
+            const S_IFLNK: u32 = 0o120000;
+            let kind_bits = match stat.kind {
+                FileKind::Dir => S_IFDIR,
+                FileKind::File => S_IFREG,
+                FileKind::Symlink => S_IFLNK,
+                FileKind::Other => 0,
+            };
+            kind_bits | 0o777
+        };
         Bound::new(
             py,
             PyStat {
                 st_size: stat.size,
-                st_mode: stat.mode,
+                st_mode,
                 st_mtime: stat.mtime,
             },
         )
@@ -418,13 +457,12 @@ impl Transport {
         data: &[u8],
         mode: Option<Py<PyAny>>,
     ) -> PyResult<()> {
-        let mode = mode.map(perms_from_py_object).unwrap_or_else(default_perms);
+        let mode = mode.and_then(perms_from_py_object).or_else(default_perms);
         let t = &slf.borrow().0;
-        py.detach(|| t.put_bytes(path, data, Some(mode)))
-            .map_err(|e| {
-                let obj = slf.clone().unbind().into();
-                map_transport_err_to_py_err(e, Some(obj), Some(path))
-            })?;
+        py.detach(|| t.put_bytes(path, data, mode)).map_err(|e| {
+            let obj = slf.clone().unbind().into();
+            map_transport_err_to_py_err(e, Some(obj), Some(path))
+        })?;
         Ok(())
     }
 
@@ -444,9 +482,9 @@ impl Transport {
             t.put_bytes_non_atomic(
                 path,
                 data,
-                Some(mode.map(perms_from_py_object).unwrap_or_else(default_perms)),
+                mode.and_then(perms_from_py_object).or_else(default_perms),
                 create_parent_dir,
-                dir_mode.map(perms_from_py_object),
+                dir_mode.and_then(perms_from_py_object),
             )
         })
         .map_err(|e| {
@@ -471,7 +509,7 @@ impl Transport {
                 t.put_file(
                     path,
                     &mut file,
-                    Some(mode.map(perms_from_py_object).unwrap_or_else(default_perms)),
+                    mode.and_then(perms_from_py_object).or_else(default_perms),
                 )
             })
             .map_err(|e| {
@@ -497,9 +535,9 @@ impl Transport {
             t.put_file_non_atomic(
                 path,
                 &mut file,
-                Some(mode.map(perms_from_py_object).unwrap_or_else(default_perms)),
+                mode.and_then(perms_from_py_object).or_else(default_perms),
                 create_parent_dir,
-                dir_mode.map(perms_from_py_object),
+                dir_mode.and_then(perms_from_py_object),
             )
         })
         .map_err(|e| {
@@ -555,7 +593,7 @@ impl Transport {
     fn create_prefix(&self, py: Python, mode: Option<Py<PyAny>>) -> PyResult<()> {
         let t = &self.0;
 
-        py.detach(|| t.create_prefix(mode.map(perms_from_py_object)))
+        py.detach(|| t.create_prefix(mode.and_then(perms_from_py_object)))
             .map_err(|e| map_transport_err_to_py_err(e, None, None))
     }
 
@@ -670,7 +708,7 @@ impl Transport {
         bytes: &[u8],
         mode: Option<Py<PyAny>>,
     ) -> PyResult<u64> {
-        let mode = mode.map(perms_from_py_object);
+        let mode = mode.and_then(perms_from_py_object);
         py.detach(|| self.0.append_bytes(path, bytes, mode))
             .map_err(|e| map_transport_err_to_py_err(e, None, Some(path)))
     }
@@ -684,7 +722,7 @@ impl Transport {
         mode: Option<Py<PyAny>>,
     ) -> PyResult<u64> {
         let mut file = PyBinaryFile::from(file);
-        let mode = mode.map(perms_from_py_object);
+        let mode = mode.and_then(perms_from_py_object);
         py.detach(|| self.0.append_file(path, &mut file, mode))
             .map_err(|e| map_transport_err_to_py_err(e, None, Some(path)))
     }
@@ -708,7 +746,7 @@ impl Transport {
         mode: Option<Py<PyAny>>,
     ) -> PyResult<PyWriteStream> {
         let t = &slf.borrow().0;
-        py.detach(|| t.open_write_stream(path, mode.map(perms_from_py_object)))
+        py.detach(|| t.open_write_stream(path, mode.and_then(perms_from_py_object)))
             .map_err(|e| Transport::map_to_py_err(slf.borrow(), py, e, Some(path)))
             .map(PyWriteStream)
     }
@@ -777,7 +815,7 @@ impl Transport {
                 self.0.copy_to(
                     relpaths_ref.as_slice(),
                     t.as_ref(),
-                    mode.map(perms_from_py_object),
+                    mode.and_then(perms_from_py_object),
                 )
             })
             .map_err(|e| map_transport_err_to_py_err(e, None, None))
@@ -788,7 +826,7 @@ impl Transport {
                     .copy_to(
                         relpaths_ref.as_slice(),
                         t.as_ref(),
-                        mode.map(perms_from_py_object),
+                        mode.and_then(perms_from_py_object),
                     )
                     .map_err(|e| map_transport_err_to_py_err(e, None, None))
             })

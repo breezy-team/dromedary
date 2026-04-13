@@ -9,8 +9,25 @@ use pyo3_filelike::PyBinaryFile;
 use std::collections::HashMap;
 use std::fs::Permissions;
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+
+/// Convert `Option<Permissions>` to the `Optional[int]` mode expected by the
+/// Python transport API. On Windows Python itself ignores the mode argument
+/// (chmod there only touches the read-only bit), so we pass `None`.
+#[inline]
+fn perms_to_py_mode(perms: Option<&Permissions>) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        perms.map(|p| p.mode())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = perms;
+        None
+    }
+}
 
 import_exception!(dromedary.errors, TransportError);
 import_exception!(dromedary.errors, NoSmartMedium);
@@ -220,16 +237,16 @@ impl Transport for PyTransport {
     fn mkdir(&self, relpath: &UrlFragment, perms: Option<Permissions>) -> Result<()> {
         Python::attach(|py| {
             self.0
-                .call_method1(py, "mkdir", (relpath, perms.map(|p| p.mode())))?;
+                .call_method1(py, "mkdir", (relpath, perms_to_py_mode(perms.as_ref())))?;
             Ok(())
         })
     }
 
     fn ensure_base(&self, perms: Option<Permissions>) -> Result<bool> {
         Python::attach(|py| {
-            let obj = self
-                .0
-                .call_method1(py, "ensure_base", (perms.map(|p| p.mode()),))?;
+            let obj =
+                self.0
+                    .call_method1(py, "ensure_base", (perms_to_py_mode(perms.as_ref()),))?;
             Ok(obj.extract::<bool>(py)?)
         })
     }
@@ -244,8 +261,26 @@ impl Transport for PyTransport {
                 None
             };
 
+            let st_mode = stat_result.getattr(py, "st_mode")?.extract::<u32>(py)?;
+            // Derive kind from the POSIX mode bits Python reported.
+            // On Windows Python still reports something meaningful for dir vs file.
+            let kind = {
+                const S_IFMT: u32 = 0o170000;
+                const S_IFDIR: u32 = 0o040000;
+                const S_IFREG: u32 = 0o100000;
+                const S_IFLNK: u32 = 0o120000;
+                match st_mode & S_IFMT {
+                    S_IFDIR => crate::FileKind::Dir,
+                    S_IFREG => crate::FileKind::File,
+                    S_IFLNK => crate::FileKind::Symlink,
+                    _ => crate::FileKind::Other,
+                }
+            };
+
             Ok(Stat {
-                mode: stat_result.getattr(py, "st_mode")?.extract::<u32>(py)?,
+                #[cfg(unix)]
+                mode: st_mode,
+                kind,
                 size: stat_result.getattr(py, "st_size")?.extract::<usize>(py)?,
                 mtime,
             })
@@ -283,9 +318,11 @@ impl Transport for PyTransport {
     ) -> Result<u64> {
         let f = py_read(f)?;
         Python::attach(|py| {
-            let ret = self
-                .0
-                .call_method1(py, "put_file", (relpath, f, mode.map(|p| p.mode())))?;
+            let ret = self.0.call_method1(
+                py,
+                "put_file",
+                (relpath, f, perms_to_py_mode(mode.as_ref())),
+            )?;
             Ok(ret.extract::<u64>(py)?)
         })
     }
@@ -297,8 +334,11 @@ impl Transport for PyTransport {
         mode: Option<Permissions>,
     ) -> Result<()> {
         Python::attach(|py| {
-            self.0
-                .call_method1(py, "put_bytes", (relpath, bytes, mode.map(|p| p.mode())))?;
+            self.0.call_method1(
+                py,
+                "put_bytes",
+                (relpath, bytes, perms_to_py_mode(mode.as_ref())),
+            )?;
             Ok(())
         })
     }
@@ -319,9 +359,9 @@ impl Transport for PyTransport {
                 (
                     relpath,
                     f,
-                    mode.map(|p| p.mode()),
+                    perms_to_py_mode(mode.as_ref()),
                     create_parent,
-                    parent_mode.map(|p| p.mode()),
+                    perms_to_py_mode(parent_mode.as_ref()),
                 ),
             )?;
             Ok(())
@@ -343,9 +383,9 @@ impl Transport for PyTransport {
                 (
                     relpath,
                     bytes,
-                    mode.map(|p| p.mode()),
+                    perms_to_py_mode(mode.as_ref()),
                     create_parent,
-                    parent_mode.map(|p| p.mode()),
+                    perms_to_py_mode(parent_mode.as_ref()),
                 ),
             )?;
             Ok(())
@@ -392,8 +432,11 @@ impl Transport for PyTransport {
 
     fn create_prefix(&self, permissions: Option<Permissions>) -> Result<()> {
         Python::attach(|py| {
-            self.0
-                .call_method1(py, "create_prefix", (permissions.map(|p| p.mode()),))?;
+            self.0.call_method1(
+                py,
+                "create_prefix",
+                (perms_to_py_mode(permissions.as_ref()),),
+            )?;
             Ok(())
         })
     }
@@ -465,7 +508,7 @@ impl Transport for PyTransport {
             let pos = self.0.call_method1(
                 py,
                 "append_bytes",
-                (relpath, bytes, permissions.map(|p| p.mode())),
+                (relpath, bytes, perms_to_py_mode(permissions.as_ref())),
             )?;
             Ok(pos.extract::<u64>(py)?)
         })
@@ -482,7 +525,7 @@ impl Transport for PyTransport {
             let pos = self.0.call_method1(
                 py,
                 "append_file",
-                (relpath, f, permissions.map(|p| p.mode())),
+                (relpath, f, perms_to_py_mode(permissions.as_ref())),
             )?;
             Ok(pos.extract::<u64>(py)?)
         })
@@ -546,7 +589,7 @@ impl Transport for PyTransport {
             let obj = self.0.call_method1(
                 py,
                 "open_write_stream",
-                (relpath, permissions.map(|p| p.mode())),
+                (relpath, perms_to_py_mode(permissions.as_ref())),
             )?;
             let file = PyWriteStream(obj);
             Ok(Box::new(file) as Box<dyn WriteStream + Send + Sync>)
