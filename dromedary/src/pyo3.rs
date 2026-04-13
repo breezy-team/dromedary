@@ -183,7 +183,7 @@ impl Transport for PyTransport {
     fn get_bytes(&self, path: &str) -> Result<Vec<u8>> {
         Python::attach(|py| {
             let obj = self.0.call_method1(py, "get_bytes", (path,))?;
-            let bytes = obj.extract::<Bound<PyBytes>>(py)?;
+            let bytes = obj.cast_bound::<PyBytes>(py).map_err(PyErr::from)?;
             Ok(bytes.as_bytes().to_vec())
         })
     }
@@ -236,8 +236,7 @@ impl Transport for PyTransport {
 
     fn stat(&self, path: &UrlFragment) -> Result<Stat> {
         Python::attach(|py| {
-            let obj = self.0.call_method1(py, "stat", (path,)).unwrap();
-            let stat_result = obj.extract::<Py<PyAny>>(py)?;
+            let stat_result = self.0.call_method1(py, "stat", (path,)).unwrap();
 
             let mtime = if let Ok(mtime) = stat_result.getattr(py, "mtime") {
                 Some(mtime.extract::<f64>(py)?)
@@ -427,13 +426,11 @@ impl Transport for PyTransport {
         upper_limit: Option<u64>,
     ) -> Box<dyn Iterator<Item = Result<(u64, Vec<u8>)>> + Send> {
         let iter = Python::attach(|py| {
-            self.0
-                .call_method1(
-                    py,
-                    "readv",
-                    (relpath, offsets, adjust_for_latency, upper_limit),
-                )?
-                .extract::<Py<PyAny>>(py)
+            self.0.call_method1(
+                py,
+                "readv",
+                (relpath, offsets, adjust_for_latency, upper_limit),
+            )
         });
 
         if let Err(e) = iter {
@@ -516,11 +513,7 @@ impl Transport for PyTransport {
     }
 
     fn iter_files_recursive(&self) -> Box<dyn Iterator<Item = Result<String>>> {
-        let iter = Python::attach(|py| {
-            self.0
-                .call_method0(py, "iter_files_recursive")?
-                .extract::<Py<PyAny>>(py)
-        });
+        let iter = Python::attach(|py| self.0.call_method0(py, "iter_files_recursive"));
 
         if let Err(e) = iter {
             return Box::new(std::iter::once(Err(Error::from(e))));
@@ -612,11 +605,7 @@ impl Transport for PyTransport {
     }
 
     fn list_dir(&self, relpath: &UrlFragment) -> Box<dyn Iterator<Item = Result<String>>> {
-        let iter = Python::attach(|py| {
-            self.0
-                .call_method1(py, "list_dir", (relpath,))?
-                .extract::<Py<PyAny>>(py)
-        });
+        let iter = Python::attach(|py| self.0.call_method1(py, "list_dir", (relpath,)));
 
         if let Err(e) = iter {
             return Box::new(std::iter::once(Err(Error::from(e))));
