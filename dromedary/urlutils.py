@@ -20,7 +20,7 @@ import re
 import sys
 from urllib import parse as urlparse
 
-from dromedary.osutils import splitpath, pathjoin
+from dromedary.osutils import pathjoin, splitpath
 
 from . import errors
 
@@ -40,6 +40,7 @@ class InvalidURLJoin(errors.PathError):
     _fmt = "Invalid URL join request: %(reason)s: %(base)r + %(join_args)r"
 
     def __init__(self, reason, base, join_args):
+        """Initialize with the join failure reason, base URL, and join args."""
         self.reason = reason
         self.base = base
         self.join_args = join_args
@@ -55,6 +56,7 @@ class InvalidRebaseURLs(errors.TransportError):
     _fmt = "URLs differ by more than path: %(old_base)r and %(new_base)r"
 
     def __init__(self, old_base, new_base):
+        """Initialize with the original and new base URLs."""
         self.old_base = old_base
         self.new_base = new_base
         errors.TransportError.__init__(self)
@@ -235,7 +237,7 @@ def rebase_url(url, old_base, new_base):
     The result will be a relative path.
     Absolute paths and full URLs are returned unaltered.
     """
-    scheme, separator = _find_scheme_and_separator(url)
+    scheme, _separator = _find_scheme_and_separator(url)
     if scheme is not None:
         return url
     if _is_absolute(url):
@@ -256,6 +258,7 @@ def determine_relative_path(from_path, to_path):
         zip(
             from_segments,
             to_segments,
+            strict=False,
         )
     ):
         if from_element != to_element:
@@ -356,7 +359,7 @@ class URL:
                 raise InvalidURL(url) from err
         else:
             raise InvalidURL(url)
-        (scheme, netloc, path, params, query, fragment) = urlparse.urlparse(
+        (scheme, netloc, path, _params, _query, _fragment) = urlparse.urlparse(
             url, allow_fragments=False
         )
         user = password = host = port = None

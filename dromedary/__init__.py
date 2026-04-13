@@ -29,17 +29,16 @@ it.
 import contextlib
 import errno
 import logging
+import os
 import sys
+from collections.abc import Callable
 from io import BytesIO
 from stat import S_ISDIR
-from typing import Any, Callable, TypeVar
+from typing import Any, TypeVar
 
-from . import _hooks
-from . import _ui
 from catalogus import registry
-import os
 
-from . import errors, osutils, urlutils
+from . import _hooks, _ui, errors, osutils, urlutils
 
 # Set up logging
 logger = logging.getLogger("dromedary")
@@ -86,8 +85,6 @@ def _get_transport_modules():
     modules.add("dromedary.pathfilter")
     result = sorted(modules)
     return result
-
-
 
 
 class TransportListRegistry(registry.Registry):
@@ -1162,7 +1159,9 @@ class Transport:
 
     def readlink(self, relpath):
         """Return a string representing the path to which the symbolic link points."""
-        raise errors.TransportNotPossible(f"Dereferencing symlinks is not supported on {self}")
+        raise errors.TransportNotPossible(
+            f"Dereferencing symlinks is not supported on {self}"
+        )
 
     def hardlink(self, source, link_name):
         """Create a hardlink pointing to source named link_name."""
@@ -1266,7 +1265,9 @@ class Transport:
         """
         # This returns None by default, meaning the transport can't handle the
         # redirection.
-        raise errors.UnusableRedirect(source, target, "transport does not support redirection")
+        raise errors.UnusableRedirect(
+            source, target, "transport does not support redirection"
+        )
 
 
 class _SharedConnection:

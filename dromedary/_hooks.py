@@ -82,7 +82,7 @@ class Hooks(dict):
         try:
             hook = self[hook_name]
         except KeyError:
-            raise KeyError(f"Unknown hook: {hook_name!r}")
+            raise KeyError(f"Unknown hook: {hook_name!r}") from None
         hook._callbacks.append(a_callable)
         if name is not None:
             self._callable_names[a_callable] = name

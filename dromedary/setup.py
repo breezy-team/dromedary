@@ -5,11 +5,12 @@
 Dromedary is the transport layer abstraction extracted from Breezy.
 """
 
-from setuptools import find_packages, setup
+import os
 
 # Import version from version module
 import sys
-import os
+
+from setuptools import find_packages, setup
 
 sys.path.insert(0, os.path.dirname(__file__))
 from version import version_string
@@ -54,8 +55,7 @@ setup(
         "Topic :: Software Development :: Version Control",
     ],
     python_requires=">=3.8",
-    install_requires=[
-    ],
+    install_requires=[],
     extras_require={
         "sftp": ["paramiko"],
         "gio": ["pygobject"],

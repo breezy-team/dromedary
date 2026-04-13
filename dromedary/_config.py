@@ -20,6 +20,7 @@ Embedders should replace these functions to provide config/auth.
 The defaults provide basic functionality using the standard library.
 """
 
+
 def get_ssh_vendor_name():
     """Return the configured SSH vendor name, or None for auto-detect."""
     return None

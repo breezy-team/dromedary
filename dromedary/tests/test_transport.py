@@ -22,21 +22,22 @@ import sys
 import threading
 from io import BytesIO
 
-from dromedary import errors, osutils
-from dromedary import tests
 import dromedary as transport
-from dromedary import urlutils
 from dromedary import (
     chroot,
+    errors,
     fakenfs,
     local,
     memory,
+    osutils,
     pathfilter,
     readonly,
+    tests,
+    urlutils,
 )
+from dromedary import tests as features
 from dromedary.errors import FileExists, NoSuchFile, UnsupportedProtocol
 from dromedary.local import file_kind
-from dromedary import tests as features
 from dromedary.tests import test_server
 
 # TODO: Should possibly split transport-specific tests into their own files.
@@ -764,6 +765,7 @@ class TestTransportImplementation(tests.TestCaseInTempDir):
         """
         if transport is None or transport.is_readonly():
             from dromedary import get_transport_from_path
+
             transport = get_transport_from_path(".")
         for name in shape:
             escaped = urlutils.escape(name.rstrip("/"))
@@ -1031,6 +1033,7 @@ class TestTransportTrace(tests.TestCase):
     def test_decorator(self):
         t = transport.get_transport_from_url("trace+memory://")
         from dromedary.trace import TransportTraceDecorator
+
         self.assertIsInstance(t, TransportTraceDecorator)
 
     def test_clone_preserves_activity(self):
@@ -1076,7 +1079,9 @@ class TestSSHConnections(tests.TestCaseWithTransport):
 
         Note: this test requires breezy's bzr+ssh transport to be registered.
         """
-        raise tests.TestNotApplicable("bzr+ssh:// is registered by breezy, not dromedary")
+        raise tests.TestNotApplicable(
+            "bzr+ssh:// is registered by breezy, not dromedary"
+        )
         # This test actually causes a bzr instance to be invoked, which is very
         # expensive: it should be the only such test in the test suite.
         # A reasonable evolution for this would be to simply check inside

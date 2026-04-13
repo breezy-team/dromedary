@@ -29,7 +29,9 @@ from dromedary.log import TransportLogDecorator
 class TestTransportLog(TestCaseWithMemoryTransport):
     def test_log_transport(self):
         base_transport = self.get_transport("")
-        logging_transport = transport.get_transport_from_url("log+" + base_transport.base)
+        logging_transport = transport.get_transport_from_url(
+            "log+" + base_transport.base
+        )
 
         # operations such as mkdir are logged
         logger.debug("where are you?")

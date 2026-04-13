@@ -24,7 +24,11 @@ import tempfile
 import unittest
 
 
-class TestNotApplicable(unittest.TestCase.skipException if hasattr(unittest.TestCase, 'skipException') else unittest.SkipTest):
+class TestNotApplicable(
+    unittest.TestCase.skipException
+    if hasattr(unittest.TestCase, "skipException")
+    else unittest.SkipTest
+):
     """Test is not applicable to the current situation."""
 
 
@@ -65,12 +69,14 @@ class Feature:
 class _Win32Feature(Feature):
     def _probe(self):
         import sys
+
         return sys.platform == "win32"
 
 
 class _ParamikoFeature(Feature):
     def _probe(self):
         import importlib.util
+
         return importlib.util.find_spec("paramiko") is not None
 
 
@@ -136,7 +142,7 @@ class _AssertHelpersMixin:
             except UnicodeDecodeError:
                 raise AssertionError(
                     f"{msg + ': ' if msg else ''}{expected!r} != {actual!r}"
-                )
+                ) from None
         else:
             expected_text = str(expected)
             actual_text = str(actual)
@@ -151,9 +157,7 @@ class _AssertHelpersMixin:
                 tofile="actual",
             )
         )
-        raise AssertionError(
-            f"{msg + chr(10) if msg else ''}values not equal:\n{diff}"
-        )
+        raise AssertionError(f"{msg + chr(10) if msg else ''}values not equal:\n{diff}")
 
     def overrideAttr(self, obj, attr_name, new_value=None):
         """Temporarily replace an attribute, restoring it after the test."""
@@ -217,9 +221,7 @@ class TestCase(_AssertHelpersMixin, unittest.TestCase):
     def assertContainsRe(self, haystack, needle, flags=0):
         """Assert that a string matches a regular expression."""
         if not re.search(needle, haystack, flags):
-            raise AssertionError(
-                f"pattern {needle!r} not found in {haystack!r}"
-            )
+            raise AssertionError(f"pattern {needle!r} not found in {haystack!r}")
 
     def overrideEnv(self, name, new_value):
         """Temporarily override an environment variable."""

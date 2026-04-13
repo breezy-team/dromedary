@@ -26,9 +26,10 @@ import time
 
 import paramiko
 
-from .. import osutils, trace, urlutils
 from dromedary import ssh
 from dromedary.ssh.paramiko import ParamikoVendor
+
+from .. import osutils, trace, urlutils
 from . import test_server
 
 

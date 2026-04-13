@@ -32,17 +32,25 @@ import time
 from io import BytesIO
 from urllib.parse import urlparse, urlunparse
 
-from dromedary import _config, _ui, errors
-from dromedary.osutils import pumpfile
-from dromedary.errors import DependencyNotPresent, TransportError, PathError, PermissionDenied
-from dromedary.tests.test_server import TestServer
 from dromedary import (
     ConnectedTransport,
     FileStream,
+    _config,
     _file_streams,
+    _ui,
+    errors,
+    urlutils,
 )
-from dromedary.errors import FileExists, NoSuchFile
-from dromedary import urlutils
+from dromedary.errors import (
+    DependencyNotPresent,
+    FileExists,
+    NoSuchFile,
+    PathError,
+    PermissionDenied,
+    TransportError,
+)
+from dromedary.osutils import pumpfile
+from dromedary.tests.test_server import TestServer
 
 logger = logging.getLogger("dromedary.gio_transport")
 debug_logger = logging.getLogger("dromedary.gio")
@@ -136,11 +144,11 @@ class GioTransport(ConnectedTransport):
         if not base.startswith("gio+"):
             raise ValueError(base)
 
-        (scheme, netloc, path, params, query, fragment) = urlparse(
+        (scheme, netloc, path, _params, _query, _fragment) = urlparse(
             base[len("gio+") :], allow_fragments=False
         )
         if "@" in netloc:
-            user, netloc = netloc.rsplit("@", 1)
+            _user, netloc = netloc.rsplit("@", 1)
         # Seems it is not possible to list supported backends for GIO
         # so a hardcoded list it is then.
         gio_backends = ["dav", "file", "ftp", "obex", "sftp", "ssh", "smb"]

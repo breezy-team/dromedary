@@ -18,17 +18,19 @@
 """Foundation SSH support for SFTP and smart server."""
 
 import errno
-from binascii import hexlify
 import logging
 import os
 import socket
 import subprocess
 import sys
+from binascii import hexlify
 
 from catalogus import registry
-from dromedary import _config, _ui, _bedding as bedding, errors
+
+from dromedary import _bedding as bedding
+from dromedary import _config, _ui, errors
 from dromedary.errors import SocketConnectionError, StrangeHostname
-from dromedary.osutils import pathjoin, set_fd_cloexec, get_terminal_encoding
+from dromedary.osutils import get_terminal_encoding, pathjoin, set_fd_cloexec
 
 from .._transport_rs import sftp as _sftp_rs
 
@@ -59,9 +61,9 @@ class UnknownSSH(errors.TransportError):
     _fmt = "Unrecognised value for BRZ_SSH environment variable: %(vendor)s"
 
     def __init__(self, vendor):
+        """Initialize with the unrecognised vendor name."""
         self.vendor = vendor
         errors.TransportError.__init__(self)
-
 
 
 class SSHVendorManager(registry.Registry[str, "SSHVendor", None]):

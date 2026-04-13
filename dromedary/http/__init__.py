@@ -26,7 +26,6 @@ import sys
 
 from dromedary.version import version_string as dromedary_version
 
-
 _user_agent_prefix = f"Dromedary/{dromedary_version}"
 
 

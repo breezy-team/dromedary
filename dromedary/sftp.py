@@ -33,24 +33,25 @@ import stat
 import sys
 import time
 
-from dromedary import _config
-from dromedary import errors
+from dromedary import (
+    ConnectedTransport,
+    FileFileStream,
+    _config,
+    _file_streams,
+    errors,
+    ssh,
+    urlutils,
+)
 from dromedary.errors import (
     DependencyNotPresent,
+    FileExists,
     LockContention,
+    NoSuchFile,
     PathError,
     ReadError,
     TransportNotPossible,
 )
 from dromedary.osutils import fancy_rename, pumpfile
-from dromedary import (
-    ConnectedTransport,
-    FileFileStream,
-    _file_streams,
-    ssh,
-    urlutils,
-)
-from dromedary.errors import FileExists, NoSuchFile
 
 logger = logging.getLogger("dromedary.sftp")
 debug_logger = logging.getLogger("dromedary.sftp")
@@ -219,7 +220,7 @@ class _SFTPReadvHelper:
         # rather than just because the data stream ended. This lets us detect
         # short readv.
         data_stream = itertools.chain(fp.readv(requests), itertools.repeat(None))
-        for (start, length), data in zip(requests, data_stream):
+        for (start, length), data in zip(requests, data_stream, strict=False):
             if data is None and cur_coalesced is not None:
                 raise errors.ShortReadvError(self.relpath, start, length, len(data))
             if len(data) != length:
@@ -386,7 +387,9 @@ class SFTPTransport(ConnectedTransport):
         vendor = ssh._get_ssh_vendor()
         user = self._parsed_url.user
         if user is None:
-            user = _config.get_auth_user("ssh", self._parsed_url.host, self._parsed_url.port)
+            user = _config.get_auth_user(
+                "ssh", self._parsed_url.host, self._parsed_url.port
+            )
         connection = vendor.connect_sftp(
             self._parsed_url.user,
             password,
