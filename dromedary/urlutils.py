@@ -66,7 +66,7 @@ unquote_to_bytes = urlparse.unquote_to_bytes
 unquote = urlparse.unquote
 
 
-from ._urlutils_rs import (  # noqa: F401
+from ._transport_rs.urlutils import (  # noqa: F401
     _find_scheme_and_separator,
     basename,
     combine_paths,
@@ -90,8 +90,8 @@ from ._urlutils_rs import (  # noqa: F401
     strip_trailing_slash,
     unescape,
 )
-from ._urlutils_rs import posix as posix_rs
-from ._urlutils_rs import win32 as win32_rs
+from ._transport_rs.urlutils import posix as posix_rs
+from ._transport_rs.urlutils import win32 as win32_rs
 
 _posix_local_path_to_url = posix_rs.local_path_to_url
 _win32_local_path_to_url = win32_rs.local_path_to_url
