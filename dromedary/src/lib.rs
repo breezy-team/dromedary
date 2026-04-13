@@ -498,6 +498,8 @@ pub trait SmartMedium {}
 
 pub mod local;
 
+pub mod osutils;
+
 #[cfg(feature = "pyo3")]
 pub mod pyo3;
 pub mod readv;

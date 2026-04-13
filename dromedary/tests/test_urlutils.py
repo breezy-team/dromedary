@@ -21,11 +21,10 @@ import os
 import posixpath
 import sys
 
-from dromedary import osutils
+from dromedary import osutils, urlutils
+from dromedary import tests as features
 from dromedary.errors import PathNotChild
 from dromedary.tests import TestCase, TestCaseInTempDir, TestSkipped
-from dromedary import tests as features
-from dromedary import urlutils
 
 
 class TestUrlToPath(TestCase):

@@ -16,8 +16,8 @@
 
 """Implementation of Transport that adapts another transport to be readonly."""
 
-from dromedary.errors import NoSmartMedium, TransportNotPossible
 from dromedary import decorator
+from dromedary.errors import NoSmartMedium, TransportNotPossible
 
 
 class ReadonlyTransportDecorator(decorator.TransportDecorator):

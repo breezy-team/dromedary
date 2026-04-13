@@ -31,11 +31,9 @@ from binascii import hexlify
 import paramiko
 
 from dromedary import _bedding, _config, _ui
-from dromedary.osutils import pathjoin
 from dromedary.errors import TransportError
+from dromedary.osutils import pathjoin
 from dromedary.ssh import SSHConnection, SSHVendor
-
-from . import errors
 
 logger = logging.getLogger("dromedary.ssh.paramiko")
 
@@ -64,7 +62,9 @@ def _paramiko_auth(username, password, host, port, paramiko_transport):
     # paramiko requires a username, but it might be none if nothing was
     # supplied.  If so, use the local username.
     if username is None:
-        username = _config.get_auth_user("ssh", host, port=port, default=getpass.getuser())
+        username = _config.get_auth_user(
+            "ssh", host, port=port, default=getpass.getuser()
+        )
     agent = paramiko.Agent()
     for key in agent.get_keys():
         logger.debug("Trying SSH agent key %s", hexlify(key.get_fingerprint()).upper())

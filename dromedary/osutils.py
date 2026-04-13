@@ -88,6 +88,7 @@ def fancy_rename(old, new, rename_func, unlink_func):
         succeeds
     """
     import time
+
     from dromedary.errors import NoSuchFile
 
     # sftp rename doesn't allow overwriting, so play tricks:
@@ -327,20 +328,21 @@ def _win32_abspath(path):
 
 def _win32_normpath(path):
     """Normalize a Windows path.
-    
+
     This is used on Windows to normalize path separators and handle
     drive letters properly.
-    
+
     Args:
         path: Path to normalize
-        
+
     Returns:
         Normalized path string
     """
     if sys.platform == "win32":
         # On Windows, normalize path separators and handle drive letters
         import os.path
-        return os.path.normpath(path).replace('\\', '/')
+
+        return os.path.normpath(path).replace("\\", "/")
     else:
         # On non-Windows, just return the path as-is
         return path

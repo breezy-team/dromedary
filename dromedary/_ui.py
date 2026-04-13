@@ -20,6 +20,7 @@ Embedders should replace these functions to integrate with their UI.
 The defaults provide basic functionality using the standard library.
 """
 
+
 def report_transport_activity(transport, byte_count, direction):
     """Called during transport I/O to report activity. Default: no-op."""
     pass

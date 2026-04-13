@@ -26,15 +26,15 @@ import http.client as http_client
 import os
 from io import BytesIO
 
-from dromedary.osutils import pumpfile
 from dromedary.errors import (
     HttpBoundaryMissing,
-    InvalidHttpResponse,
     InvalidHttpRange,
+    InvalidHttpResponse,
     InvalidRange,
     ShortReadvError,
     UnexpectedHttpStatus,
 )
+from dromedary.osutils import pumpfile
 
 
 class ResponseFile:

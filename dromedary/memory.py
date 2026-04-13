@@ -26,18 +26,17 @@ import os
 from io import BytesIO
 from stat import S_IFDIR, S_IFLNK, S_IFREG, S_ISDIR
 
-from dromedary.errors import InProcessTransport, LockContention
 from dromedary import (
     AppendBasedFileStream,
     LateReadError,
-    Transport,
     Server,
+    Transport,
+    _file_streams,
     register_transport,
     unregister_transport,
-    _file_streams,
+    urlutils,
 )
-from dromedary.errors import FileExists, NoSuchFile
-from dromedary import urlutils
+from dromedary.errors import FileExists, InProcessTransport, LockContention, NoSuchFile
 
 
 class MemoryStat:

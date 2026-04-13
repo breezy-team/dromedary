@@ -27,20 +27,22 @@ import stat
 import sys
 from io import BytesIO
 
-from dromedary import errors, osutils
 from catalogus import pyutils
-from dromedary import urlutils
+
 import dromedary as _mod_transport
-from dromedary.errors import PathError, TransportNotPossible
-from dromedary.osutils import getcwd
 from dromedary import (
     ConnectedTransport,
     Transport,
     _get_transport_modules,
+    errors,
+    osutils,
+    urlutils,
 )
-from dromedary.errors import FileExists, NoSuchFile
+from dromedary.errors import FileExists, NoSuchFile, PathError, TransportNotPossible
 from dromedary.memory import MemoryTransport
-from dromedary.tests import TestNotApplicable, TestSkipped, multiply_tests, test_server
+from dromedary.osutils import getcwd
+from dromedary.tests import TestNotApplicable, TestSkipped, multiply_tests
+
 from .test_transport import TestTransportImplementation
 
 
@@ -198,7 +200,7 @@ class TransportTests(TestTransportImplementation):
         self.build_tree(files, transport=t, line_endings="binary")
         self.check_transport_contents(b"contents of a\n", t, "a")
 
-        for content, fname in zip(contents, files):
+        for content, fname in zip(contents, files, strict=False):
             self.assertEqual(content, t.get_bytes(fname))
 
     def test_get_bytes_unknown_file(self):
@@ -968,7 +970,7 @@ class TransportTests(TestTransportImplementation):
         sizes = [14, 0, 16, 0, 18]
         self.build_tree(paths, transport=t, line_endings="binary")
 
-        for path, size in zip(paths, sizes):
+        for path, size in zip(paths, sizes, strict=False):
             st = t.stat(path)
             if path.endswith("/"):
                 self.assertTrue(S_ISDIR(st.st_mode))

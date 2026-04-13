@@ -20,9 +20,12 @@ This does not change the transport behaviour at all, but provides all the
 stub functions to allow other decorators to be written easily.
 """
 
-from dromedary import Transport
-from dromedary import get_transport_from_path, get_transport_from_url
-from dromedary import urlutils
+from dromedary import (
+    Transport,
+    get_transport_from_path,
+    get_transport_from_url,
+    urlutils,
+)
 
 
 class TransportDecorator(Transport):

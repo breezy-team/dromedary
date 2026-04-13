@@ -2,11 +2,7 @@
 resolver = "2"
 members = [
     "dromedary",
-    "dromedary/osutils-rs",
     "dromedary/_transport_rs",
-    "dromedary/transport-py",
-    "dromedary/_urlutils_rs",
-    "dromedary/_urlutils_rs/urlutils",
 ]
 
 [workspace.package]

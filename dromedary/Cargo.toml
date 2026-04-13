@@ -12,7 +12,6 @@ authors = [ "Martin Packman <gzlist@googlemail.com>", "Jelmer Vernooij <jelmer@j
 [lib]
 
 [dependencies]
-dromedary-osutils = { path = "osutils-rs" }
 url = { workspace = true }
 tempfile = "3"
 pyo3 = { workspace = true, optional = true }
@@ -31,4 +30,4 @@ default = ["pyo3", "sftp"]
 pyo3 = ["dep:pyo3", "dep:pyo3-filelike"]
 
 [target.'cfg(unix)'.dependencies]
-nix = { workspace = true }
+nix = { workspace = true, features = ["fs"] }

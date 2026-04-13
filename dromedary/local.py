@@ -21,8 +21,8 @@ This is a fairly thin wrapper on regular file IO.
 
 import os
 
-from dromedary.osutils import file_kind_from_stat_mode, pathjoin, _win32_normpath
 from dromedary import errors, urlutils
+from dromedary.osutils import _win32_normpath, file_kind_from_stat_mode, pathjoin
 
 
 def file_stat(f, _lstat=os.lstat):
@@ -84,9 +84,7 @@ class EmulatedWin32LocalTransport(LocalTransport):  # type:ignore
         Returns:
             Absolute URL using Win32 path conventions.
         """
-        path = _win32_normpath(
-            pathjoin(self._local_base, urlutils.unescape(relpath))
-        )
+        path = _win32_normpath(pathjoin(self._local_base, urlutils.unescape(relpath)))
         return urlutils._win32_local_path_to_url(path)
 
     def clone(self, offset=None):

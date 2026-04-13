@@ -29,7 +29,7 @@ from dromedary.cethread import CatchingExceptionThread
 
 def connect_socket(address):
     """Connect to the given address, trying all results from getaddrinfo."""
-    err = socket.error("getaddrinfo returns an empty list")
+    err = OSError("getaddrinfo returns an empty list")
     host, port = address
     for res in socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM):
         af, socktype, proto, _canonname, sa = res

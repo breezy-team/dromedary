@@ -24,11 +24,6 @@ rust_extensions = [
         "dromedary/_transport_rs/Cargo.toml",
         binding=Binding.PyO3,
     ),
-    RustExtension(
-        "dromedary._urlutils_rs",
-        "dromedary/_urlutils_rs/Cargo.toml",
-        binding=Binding.PyO3,
-    ),
 ]
 
 setup(

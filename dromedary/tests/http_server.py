@@ -23,9 +23,8 @@ import random
 import re
 from urllib.parse import urlparse
 
-from dromedary import osutils
+from dromedary import osutils, urlutils
 from dromedary.tests import test_server
-from dromedary import urlutils
 
 
 class BadWebserverPath(ValueError):
@@ -321,8 +320,8 @@ Message: %(message)s.
         path = self._cwd
         for num, word in enumerate(w for w in words if w):
             if num == 0:
-                drive, word = os.path.splitdrive(word)
-            head, word = os.path.split(word)
+                _drive, word = os.path.splitdrive(word)
+            _head, word = os.path.split(word)
             if word in (os.curdir, os.pardir):
                 continue
             path = os.path.join(path, word)
