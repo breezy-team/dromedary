@@ -30,4 +30,4 @@ default = ["pyo3", "sftp"]
 pyo3 = ["dep:pyo3", "dep:pyo3-filelike"]
 
 [target.'cfg(unix)'.dependencies]
-nix = { workspace = true }
+nix = { workspace = true, features = ["fs"] }
