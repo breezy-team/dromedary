@@ -14,7 +14,7 @@ version = "0.1.0"
 
 [workspace.dependencies]
 nix = ">=0.26"
-pyo3 = "0.26"
+pyo3 = "0.28"
 pyo3-filelike = "0.5.0"
 url = "2"
 log = "0.4"
