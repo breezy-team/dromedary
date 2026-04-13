@@ -19,7 +19,7 @@ pyo3-filelike = { workspace = true, optional = true }
 path-clean = "1"
 walkdir = "2.3"
 lazy_static = "1"
-sftp = { version = ">=0.2", optional = true }
+sftp = { version = "0.2.3", optional = true }
 log = { workspace = true }
 nix = { workspace = true, features = ["uio"] }
 regex = "1.5.4"

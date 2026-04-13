@@ -410,6 +410,7 @@ impl SFTPClient {
     }
 
     #[pyo3(signature = (path, attr, *, read=false, write=false, append=false, create=false, truncate=false, excl=false))]
+    #[allow(clippy::too_many_arguments)]
     fn open(
         &mut self,
         py: Python,
@@ -462,10 +463,7 @@ impl SFTPClient {
                 .write(true)
                 .create(true)
                 .truncate(true),
-            "r+" | "rb+" | "b+" => sftp::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true),
+            "r+" | "rb+" | "b+" => sftp::OpenOptions::new().read(true).write(true).create(true),
             "a+" | "ab+" => sftp::OpenOptions::new()
                 .read(true)
                 .write(true)

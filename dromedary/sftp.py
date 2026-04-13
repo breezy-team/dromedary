@@ -937,14 +937,10 @@ class SFTPTransport(ConnectedTransport):
             from dromedary.osutils import get_umask
 
             attr.st_mode = stat.S_IFREG | (0o666 & ~get_umask())
-        flags = (
-            _sftp_rs.SFTP_FLAG_WRITE
-            | _sftp_rs.SFTP_FLAG_CREAT
-            | _sftp_rs.SFTP_FLAG_EXCL
-            | _sftp_rs.SFTP_FLAG_TRUNC
-        )
         try:
-            return self._get_sftp().open(abspath, flags, attr)
+            return self._get_sftp().open(
+                abspath, attr, write=True, create=True, excl=True, truncate=True
+            )
         except (SFTPError, OSError) as e:
             self._translate_io_exception(
                 e, abspath, ": unable to open", failure_exc=FileExists
