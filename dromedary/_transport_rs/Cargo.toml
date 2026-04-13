@@ -10,7 +10,7 @@ crate-type = ["cdylib"]
 dromedary = { path = ".." }
 pyo3 = { workspace = true, features = ["extension-module"]}
 pyo3-filelike = { workspace = true }
-sftp = "0.2.0"
+sftp = "0.2.3"
 url = { workspace = true }
 log = { workspace = true }
 

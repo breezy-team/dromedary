@@ -111,8 +111,7 @@ struct PyWriteStream(Box<dyn WriteStream + Sync + Send>);
 #[pymethods]
 impl PyWriteStream {
     fn write(&mut self, py: Python, data: &[u8]) -> PyResult<usize> {
-        py.detach(|| self.0.write(data))
-            .map_err(|e| e.into())
+        py.detach(|| self.0.write(data)).map_err(|e| e.into())
     }
 
     #[pyo3(signature = (want_fdatasync=None))]
@@ -124,8 +123,7 @@ impl PyWriteStream {
     }
 
     fn fdatasync(&mut self, py: Python) -> PyResult<()> {
-        py.detach(|| self.0.sync_data())
-            .map_err(|e| e.into())
+        py.detach(|| self.0.sync_data()).map_err(|e| e.into())
     }
 
     fn __enter__(slf: PyRef<Self>) -> Py<Self> {
@@ -290,20 +288,18 @@ impl Transport {
         path: &'a str,
     ) -> PyResult<Bound<'a, PyBytes>> {
         let t = &slf.borrow().0;
-        let ret = py
-            .detach(|| t.get_bytes(path))
-            .map_err(|e| match e {
-                Error::IsADirectoryError(_) => {
-                    ReadError::new_err((path.to_string(), "Is a directory".to_string()))
-                }
-                Error::NotADirectoryError(_) => {
-                    NoSuchFile::new_err((path.to_string(), "Not a directory".to_string()))
-                }
-                e => {
-                    let obj = slf.unbind().into_any();
-                    map_transport_err_to_py_err(e, Some(obj), Some(path))
-                }
-            })?;
+        let ret = py.detach(|| t.get_bytes(path)).map_err(|e| match e {
+            Error::IsADirectoryError(_) => {
+                ReadError::new_err((path.to_string(), "Is a directory".to_string()))
+            }
+            Error::NotADirectoryError(_) => {
+                NoSuchFile::new_err((path.to_string(), "Not a directory".to_string()))
+            }
+            e => {
+                let obj = slf.unbind().into_any();
+                map_transport_err_to_py_err(e, Some(obj), Some(path))
+            }
+        })?;
 
         Ok(PyBytes::new(py, &ret))
     }
