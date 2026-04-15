@@ -488,30 +488,35 @@ impl Transport for PyTransport {
         adjust_for_latency: bool,
         upper_limit: Option<u64>,
     ) -> Box<dyn Iterator<Item = Result<(u64, Vec<u8>)>> + Send> {
-        let iter = Python::attach(|py| {
-            self.0.call_method1(
+        let iter = Python::attach(|py| -> Result<Py<PyAny>> {
+            let raw = self.0.call_method1(
                 py,
                 "readv",
                 (relpath, offsets, adjust_for_latency, upper_limit),
-            )
+            )?;
+            let it = raw.bind(py).try_iter().map_err(Error::from)?;
+            Ok(it.unbind().into_any())
         });
 
-        if let Err(e) = iter {
-            return Box::new(std::iter::once(Err(Error::from(e))));
-        }
+        let iter = match iter {
+            Ok(i) => i,
+            Err(e) => return Box::new(std::iter::once(Err(e))),
+        };
 
         Box::new(std::iter::from_fn(move || {
             Python::attach(|py| -> Option<Result<(u64, Vec<u8>)>> {
-                let iter = iter.as_ref().unwrap();
                 match iter.call_method0(py, "__next__") {
                     Ok(obj) => {
                         if obj.is_none(py) {
                             None
                         } else {
-                            let (offset, bytes) = obj.extract::<(u64, Vec<u8>)>(py).unwrap();
-                            Some(Ok((offset, bytes)))
+                            match obj.extract::<(u64, Vec<u8>)>(py) {
+                                Ok(pair) => Some(Ok(pair)),
+                                Err(e) => Some(Err(Error::from(e))),
+                            }
                         }
                     }
+                    Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => None,
                     Err(e) => Some(Err(Error::from(e))),
                 }
             })
@@ -576,24 +581,28 @@ impl Transport for PyTransport {
     }
 
     fn iter_files_recursive(&self) -> Box<dyn Iterator<Item = Result<String>>> {
-        let iter = Python::attach(|py| self.0.call_method0(py, "iter_files_recursive"));
+        let iter = Python::attach(|py| -> Result<Py<PyAny>> {
+            let raw = self.0.call_method0(py, "iter_files_recursive")?;
+            let it = raw.bind(py).try_iter().map_err(Error::from)?;
+            Ok(it.unbind().into_any())
+        });
 
-        if let Err(e) = iter {
-            return Box::new(std::iter::once(Err(Error::from(e))));
-        }
+        let iter = match iter {
+            Ok(i) => i,
+            Err(e) => return Box::new(std::iter::once(Err(e))),
+        };
 
         Box::new(std::iter::from_fn(move || {
             Python::attach(|py| -> Option<Result<String>> {
-                let iter = iter.as_ref().unwrap();
                 match iter.call_method0(py, "__next__") {
                     Ok(obj) => {
                         if obj.is_none(py) {
                             None
                         } else {
-                            let path = obj.extract::<String>(py).unwrap();
-                            Some(Ok(path))
+                            Some(obj.extract::<String>(py).map_err(Error::from))
                         }
                     }
+                    Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => None,
                     Err(e) => Some(Err(Error::from(e))),
                 }
             })
@@ -638,7 +647,11 @@ impl Transport for PyTransport {
     }
 
     fn copy_tree_to_transport(&self, _to_transport: &dyn Transport) -> Result<()> {
-        unimplemented!()
+        // TODO(jelmer): bridge copy_tree_to_transport across the Py↔Rust
+        // boundary. The Python side expects a Transport object, but we'd
+        // need to obtain its underlying Py wrapper. For now signal the
+        // caller that this transport can't perform the operation.
+        Err(Error::TransportNotPossible)
     }
 
     fn copy_to(
@@ -647,7 +660,10 @@ impl Transport for PyTransport {
         _to_transport: &dyn Transport,
         _permissions: Option<Permissions>,
     ) -> Result<usize> {
-        unimplemented!()
+        // TODO(jelmer): same blocker as copy_tree_to_transport — the
+        // destination transport isn't readily expressible as a Py object
+        // from inside the Rust adapter.
+        Err(Error::TransportNotPossible)
     }
 
     fn can_roundtrip_unix_modebits(&self) -> bool {
@@ -672,15 +688,21 @@ impl Transport for PyTransport {
     }
 
     fn list_dir(&self, relpath: &UrlFragment) -> Box<dyn Iterator<Item = Result<String>>> {
-        let iter = Python::attach(|py| self.0.call_method1(py, "list_dir", (relpath,)));
+        // Python list_dir may return a list, tuple, or iterator. Coerce via
+        // try_iter so __next__ always works.
+        let iter = Python::attach(|py| -> Result<Py<PyAny>> {
+            let raw = self.0.call_method1(py, "list_dir", (relpath,))?;
+            let it = raw.bind(py).try_iter().map_err(Error::from)?;
+            Ok(it.unbind().into_any())
+        });
 
-        if let Err(e) = iter {
-            return Box::new(std::iter::once(Err(Error::from(e))));
-        }
+        let iter = match iter {
+            Ok(i) => i,
+            Err(e) => return Box::new(std::iter::once(Err(e))),
+        };
 
         Box::new(std::iter::from_fn(move || {
             Python::attach(|py| -> Option<Result<String>> {
-                let iter = iter.as_ref().unwrap();
                 match iter.call_method0(py, "__next__") {
                     Ok(obj) => {
                         if obj.is_none(py) {
@@ -689,6 +711,7 @@ impl Transport for PyTransport {
                             Some(obj.extract::<String>(py).map_err(|e| e.into()))
                         }
                     }
+                    Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => None,
                     Err(e) => Some(Err(e.into())),
                 }
             })
