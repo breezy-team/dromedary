@@ -533,7 +533,11 @@ pub trait SmartMedium {}
 
 pub mod local;
 
+pub mod chroot;
+
 pub mod memory;
+
+pub mod pathfilter;
 
 pub mod readonly;
 
