@@ -35,9 +35,22 @@ class TestNotApplicable(
 TestSkipped = unittest.SkipTest
 
 
+def _iter_test_cases(suite_or_case):
+    """Yield individual TestCase leaves from a TestSuite or TestCase."""
+    if isinstance(suite_or_case, unittest.TestCase):
+        yield suite_or_case
+        return
+    for child in suite_or_case:
+        yield from _iter_test_cases(child)
+
+
 def multiply_tests(tests, scenarios, result):
-    """Multiply tests by scenarios, adding them to result."""
-    for test in tests:
+    """Multiply tests by scenarios, adding them to result.
+
+    `tests` may be a TestSuite (which can contain nested suites) or an
+    iterable of TestCase instances; suites are flattened before fan-out.
+    """
+    for test in _iter_test_cases(tests):
         for scenario_id, scenario_attrs in scenarios:
             new_test = clone_test(test, scenario_id)
             for name, value in scenario_attrs.items():

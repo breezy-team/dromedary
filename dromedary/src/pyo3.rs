@@ -711,11 +711,16 @@ impl Transport for PyTransport {
 
     fn get_smart_medium(&self) -> Result<Box<dyn SmartMedium>> {
         Python::attach(|py| {
-            let obj = self.0.call_method0(py, "get_smart_medium").unwrap();
+            let obj = match self.0.call_method0(py, "get_smart_medium") {
+                Ok(o) => o,
+                Err(e) if e.is_instance_of::<NoSmartMedium>(py) => {
+                    return Err(Error::NoSmartMedium);
+                }
+                Err(e) => return Err(Error::Io(std::io::Error::other(e.to_string()))),
+            };
             if obj.is_none(py) {
                 return Err(Error::NoSmartMedium);
             }
-            let obj = obj.extract::<Py<PyAny>>(py).unwrap();
             let medium = PySmartMedium(obj);
             Ok(Box::new(medium) as Box<dyn SmartMedium>)
         })

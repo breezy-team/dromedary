@@ -51,7 +51,7 @@ pub(crate) fn map_transport_err_to_py_err(
     match e {
         Error::InProcessTransport => InProcessTransport::new_err(()),
         Error::NotLocalUrl(url) => NotLocalUrl::new_err((url,)),
-        Error::NoSmartMedium => NoSmartMedium::new_err((t.unwrap(),)),
+        Error::NoSmartMedium => NoSmartMedium::new_err((t,)),
         Error::NoSuchFile(name) => NoSuchFile::new_err((pick_path(name),)),
         Error::FileExists(name) => FileExists::new_err((pick_path(name),)),
         Error::TransportNotPossible => TransportNotPossible::new_err(()),
