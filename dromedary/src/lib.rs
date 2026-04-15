@@ -7,6 +7,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::time::UNIX_EPOCH;
 use url::Url;
 
+#[derive(Debug)]
 pub enum Error {
     InProcessTransport,
 

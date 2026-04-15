@@ -128,8 +128,12 @@ impl MemoryTransport {
                 // skip
             } else {
                 r.push(part.to_string());
-                let joined = r.join("/");
-                let key = format!("/{}", joined);
+                // Match Python memory.py _abspath: look up by joined key
+                // without leading slash. Stored symlink keys include a leading
+                // slash, so this effectively never matches; symlink following
+                // happens in resolve_symlinks instead. Kept for byte-for-byte
+                // parity with the Python implementation.
+                let key = r.join("/");
                 if let Some(target) = store.symlinks.get(&key) {
                     r = target.clone();
                 }
@@ -600,5 +604,182 @@ impl Transport for MemoryTransport {
         let data = self.get_bytes(rel_from)?;
         let mut cur = Cursor::new(data);
         self.put_file(rel_to, &mut cur, None).map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn t() -> MemoryTransport {
+        MemoryTransport::new("memory:///").unwrap()
+    }
+
+    #[test]
+    fn new_defaults_and_normalises_url() {
+        let t = MemoryTransport::new("").unwrap();
+        assert_eq!(t.base().as_str(), "memory:///");
+        let t = MemoryTransport::new("memory:///foo").unwrap();
+        assert_eq!(t.base().as_str(), "memory:///foo/");
+    }
+
+    #[test]
+    fn put_get_has_and_stat_file() {
+        let t = t();
+        assert_eq!(t.has("hello").unwrap(), false);
+        t.put_bytes("hello", b"world", None).unwrap();
+        assert_eq!(t.has("hello").unwrap(), true);
+        assert_eq!(t.get_bytes("hello").unwrap(), b"world");
+        let st = t.stat("hello").unwrap();
+        assert_eq!(st.size, 5);
+        assert_eq!(st.kind, FileKind::File);
+    }
+
+    #[test]
+    fn get_missing_returns_no_such_file() {
+        let t = t();
+        match t.get_bytes("nope") {
+            Err(Error::NoSuchFile(_)) => {}
+            other => panic!("expected NoSuchFile, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn put_file_into_missing_parent_fails() {
+        let t = t();
+        match t.put_bytes("missing/child", b"x", None) {
+            Err(Error::NoSuchFile(_)) => {}
+            other => panic!("expected NoSuchFile, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn mkdir_and_list_dir() {
+        let t = t();
+        t.mkdir("d", None).unwrap();
+        t.put_bytes("d/a", b"1", None).unwrap();
+        t.put_bytes("d/b", b"22", None).unwrap();
+        let mut entries: Vec<String> = t.list_dir("d").filter_map(|r| r.ok()).collect();
+        entries.sort();
+        assert_eq!(entries, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(t.stat("d").unwrap().kind, FileKind::Dir);
+    }
+
+    #[test]
+    fn mkdir_existing_fails() {
+        let t = t();
+        t.mkdir("d", None).unwrap();
+        match t.mkdir("d", None) {
+            Err(Error::FileExists(_)) => {}
+            other => panic!("expected FileExists, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn delete_and_rmdir() {
+        let t = t();
+        t.mkdir("d", None).unwrap();
+        t.put_bytes("d/f", b"x", None).unwrap();
+        t.delete("d/f").unwrap();
+        assert_eq!(t.has("d/f").unwrap(), false);
+        t.rmdir("d").unwrap();
+        assert_eq!(t.has("d").unwrap(), false);
+    }
+
+    #[test]
+    fn rmdir_nonempty_fails() {
+        let t = t();
+        t.mkdir("d", None).unwrap();
+        t.put_bytes("d/f", b"x", None).unwrap();
+        match t.rmdir("d") {
+            Err(Error::DirectoryNotEmptyError(_)) => {}
+            other => panic!("expected DirectoryNotEmptyError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rename_file() {
+        let t = t();
+        t.put_bytes("a", b"hi", None).unwrap();
+        t.rename("a", "b").unwrap();
+        assert_eq!(t.has("a").unwrap(), false);
+        assert_eq!(t.get_bytes("b").unwrap(), b"hi");
+    }
+
+    #[test]
+    fn append_file_extends_content_and_returns_offset() {
+        let t = t();
+        t.put_bytes("f", b"abc", None).unwrap();
+        let mut more = Cursor::new(b"DEF".to_vec());
+        let offset = t.append_file("f", &mut more, None).unwrap();
+        assert_eq!(offset, 3);
+        assert_eq!(t.get_bytes("f").unwrap(), b"abcDEF");
+    }
+
+    #[test]
+    fn symlink_and_readlink() {
+        let t = t();
+        t.put_bytes("target", b"data", None).unwrap();
+        t.symlink("target", "link").unwrap();
+        assert_eq!(t.readlink("link").unwrap(), "target");
+        assert_eq!(t.stat("link").unwrap().kind, FileKind::Symlink);
+        assert_eq!(t.get_bytes("link").unwrap(), b"data");
+    }
+
+    #[test]
+    fn lock_read_contention() {
+        let t = t();
+        t.put_bytes("f", b"", None).unwrap();
+        let _l = t.lock_read("f").ok().expect("first lock");
+        match t.lock_read("f") {
+            Err(Error::LockContention(_)) => {}
+            Err(other) => panic!("expected LockContention, got {:?}", other),
+            Ok(_) => panic!("expected LockContention, got Ok"),
+        }
+    }
+
+    #[test]
+    fn lock_release_allows_reacquire() {
+        let t = t();
+        t.put_bytes("f", b"", None).unwrap();
+        {
+            let mut l = t.lock_read("f").ok().expect("first lock");
+            l.unlock().ok().expect("unlock");
+        }
+        let _l2 = t.lock_read("f").ok().expect("reacquire");
+    }
+
+    #[test]
+    fn clone_shares_storage() {
+        let t = t();
+        t.mkdir("sub", None).unwrap();
+        let c = t.clone(Some("sub")).unwrap();
+        t.put_bytes("sub/f", b"shared", None).unwrap();
+        assert_eq!(c.get_bytes("f").unwrap(), b"shared");
+    }
+
+    #[test]
+    fn external_url_errors_in_process() {
+        let t = t();
+        match t.external_url() {
+            Err(Error::InProcessTransport) => {}
+            other => panic!("expected InProcessTransport, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn iter_files_recursive_lists_files_and_symlinks() {
+        let t = t();
+        t.mkdir("d", None).unwrap();
+        t.put_bytes("d/a", b"1", None).unwrap();
+        t.put_bytes("d/b", b"2", None).unwrap();
+        t.symlink("d/a", "d/link").unwrap();
+        let sub = t.clone(Some("d")).unwrap();
+        let mut files: Vec<String> = sub.iter_files_recursive().filter_map(|r| r.ok()).collect();
+        files.sort();
+        assert_eq!(
+            files,
+            vec!["a".to_string(), "b".to_string(), "link".to_string()]
+        );
     }
 }
