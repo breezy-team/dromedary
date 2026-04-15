@@ -545,6 +545,9 @@ pub mod fakenfs;
 
 pub mod fakevfat;
 
+#[cfg(feature = "gio")]
+pub mod gio;
+
 pub mod memory;
 
 pub mod pathfilter;
