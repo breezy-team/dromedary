@@ -42,6 +42,10 @@ import_exception!(dromedary.errors, PathNotChild);
 import_exception!(dromedary.errors, ShortReadvError);
 import_exception!(dromedary.errors, LockContention);
 import_exception!(dromedary.errors, LockFailed);
+import_exception!(dromedary.errors, DirectoryNotEmpty);
+import_exception!(dromedary.errors, NotADirectory);
+import_exception!(dromedary.errors, ResourceBusy);
+import_exception!(dromedary.errors, ReadError);
 
 struct PySmartMedium(Py<PyAny>);
 
@@ -127,6 +131,14 @@ impl From<PyErr> for Error {
                 Error::PermissionDenied(arg(0))
             } else if e.is_instance_of::<PathNotChild>(py) {
                 Error::PathNotChild
+            } else if e.is_instance_of::<DirectoryNotEmpty>(py) {
+                Error::DirectoryNotEmptyError(arg(0))
+            } else if e.is_instance_of::<NotADirectory>(py) {
+                Error::NotADirectoryError(arg(0))
+            } else if e.is_instance_of::<ResourceBusy>(py) {
+                Error::ResourceBusy(arg(0))
+            } else if e.is_instance_of::<ReadError>(py) {
+                Error::IsADirectoryError(arg(0))
             } else if e.is_instance_of::<ShortReadvError>(py) {
                 let value = e.value(py);
                 Error::ShortReadvError(
@@ -444,7 +456,7 @@ impl Transport for PyTransport {
     fn recommended_page_size(&self) -> usize {
         Python::attach(|py| {
             self.0
-                .getattr(py, "recommended_page_size")
+                .call_method0(py, "recommended_page_size")
                 .unwrap()
                 .extract::<usize>(py)
                 .unwrap()
@@ -454,7 +466,7 @@ impl Transport for PyTransport {
     fn is_readonly(&self) -> bool {
         Python::attach(|py| {
             self.0
-                .getattr(py, "is_readonly")
+                .call_method0(py, "is_readonly")
                 .unwrap()
                 .extract::<bool>(py)
                 .unwrap()

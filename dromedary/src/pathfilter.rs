@@ -56,22 +56,15 @@ impl PathFilteringTransport {
         })
     }
 
-    fn relpath_from_server_root(&self, relpath: &str) -> Result<String> {
+    pub fn relpath_from_server_root(&self, relpath: &str) -> Result<String> {
         let unfiltered = combine_paths(&self.base_path, relpath);
         if !unfiltered.starts_with('/') {
-            return Err(Error::PathNotChild);
-        }
-        let base_trimmed = self.base_path.trim_end_matches('/');
-        if !base_trimmed.is_empty()
-            && unfiltered != base_trimmed
-            && !unfiltered.starts_with(&format!("{}/", base_trimmed))
-        {
             return Err(Error::PathNotChild);
         }
         Ok(unfiltered[1..].to_string())
     }
 
-    fn filter(&self, relpath: &str) -> Result<String> {
+    pub fn filter(&self, relpath: &str) -> Result<String> {
         let p = self.relpath_from_server_root(relpath)?;
         match &self.filter_func {
             Some(f) => Ok(f(&p)),

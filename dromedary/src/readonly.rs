@@ -52,6 +52,8 @@ impl Transport for ReadonlyTransport {
         true
     }
 
+    crate::fwd_listable!(decorated);
+
     fn get(&self, relpath: &UrlFragment) -> Result<Box<dyn ReadStream + Send + Sync>> {
         self.decorated.get(relpath)
     }

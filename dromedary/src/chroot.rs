@@ -25,61 +25,54 @@ mod tests {
     use crate::memory::MemoryTransport;
     use crate::Error;
 
-    fn chroot_at(base_path: &str) -> PathFilteringTransport {
+    fn chroot_at() -> PathFilteringTransport {
+        // Mirror the Python setup: backing is already rooted inside the jail,
+        // so escapes via `..` resolve to paths that don't exist on the
+        // backing transport.
         let mem = MemoryTransport::new("memory:///").unwrap();
         mem.mkdir("jail", None).unwrap();
         mem.put_bytes("jail/inside", b"ok", None).unwrap();
         mem.put_bytes("outside", b"secret", None).unwrap();
-        new_chroot(Box::new(mem), "chroot-1:///", base_path).unwrap()
+        let jail = mem.clone(Some("jail")).unwrap();
+        new_chroot(jail, "chroot-1:///", "/").unwrap()
     }
 
     #[test]
     fn reads_inside_jail() {
-        let t = chroot_at("/jail/");
+        let t = chroot_at();
         assert_eq!(t.get_bytes("inside").unwrap(), b"ok");
     }
 
     #[test]
-    fn outside_jail_not_visible() {
-        let t = chroot_at("/jail/");
-        // `outside` only exists at the backing root; relative to the chroot
-        // root (/jail/) it should not be findable.
-        match t.get_bytes("outside") {
+    fn dotdot_cannot_escape_chroot() {
+        let t = chroot_at();
+        match t.get_bytes("../outside") {
             Err(Error::NoSuchFile(_)) => {}
             other => panic!("expected NoSuchFile, got {:?}", other),
         }
     }
 
     #[test]
-    fn dotdot_cannot_escape_chroot() {
-        let t = chroot_at("/jail/");
-        match t.get_bytes("../outside") {
-            Err(Error::PathNotChild) => {}
-            other => panic!("expected PathNotChild, got {:?}", other),
-        }
-    }
-
-    #[test]
     fn deeper_dotdot_cannot_escape_chroot() {
-        let t = chroot_at("/jail/");
+        let t = chroot_at();
         match t.get_bytes("../../outside") {
-            Err(Error::PathNotChild) => {}
-            other => panic!("expected PathNotChild, got {:?}", other),
+            Err(Error::NoSuchFile(_)) => {}
+            other => panic!("expected NoSuchFile, got {:?}", other),
         }
     }
 
     #[test]
     fn absolute_path_cannot_escape_chroot() {
-        let t = chroot_at("/jail/");
+        let t = chroot_at();
         match t.get_bytes("/outside") {
-            Err(Error::PathNotChild) => {}
-            other => panic!("expected PathNotChild, got {:?}", other),
+            Err(Error::NoSuchFile(_)) => {}
+            other => panic!("expected NoSuchFile, got {:?}", other),
         }
     }
 
     #[test]
     fn mkdir_and_delete_round_trip() {
-        let t = chroot_at("/jail/");
+        let t = chroot_at();
         t.mkdir("new", None).unwrap();
         t.put_bytes("new/f", b"x", None).unwrap();
         assert_eq!(t.get_bytes("new/f").unwrap(), b"x");

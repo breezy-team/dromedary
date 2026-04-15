@@ -592,8 +592,8 @@ impl Transport for MemoryTransport {
         acquire_lock(&self.store, &abspath)
     }
 
-    fn local_abspath(&self, _relpath: &UrlFragment) -> Result<std::path::PathBuf> {
-        Err(Error::NotLocalUrl(self.base.to_string()))
+    fn local_abspath(&self, relpath: &UrlFragment) -> Result<std::path::PathBuf> {
+        Err(Error::NotLocalUrl(format!("{}{}", self.base, relpath)))
     }
 
     fn get_smart_medium(&self) -> Result<Box<dyn SmartMedium>> {
