@@ -254,4 +254,112 @@ mod tests {
         let t = ro();
         assert!(t.base().as_str().starts_with("readonly+"));
     }
+
+    fn expect_not_possible<T: std::fmt::Debug>(r: Result<T>, label: &str) {
+        match r {
+            Err(Error::TransportNotPossible) => {}
+            Err(other) => panic!("{}: expected TransportNotPossible, got {:?}", label, other),
+            Ok(ok) => panic!("{}: expected TransportNotPossible, got Ok({:?})", label, ok),
+        }
+    }
+
+    #[test]
+    fn rmdir_rejected() {
+        // Seed the inner store with a directory we could otherwise remove.
+        let mem = MemoryTransport::new("memory:///").unwrap();
+        mem.mkdir("d", None).unwrap();
+        let t = ReadonlyTransport::new(Box::new(mem));
+        expect_not_possible(t.rmdir("d"), "rmdir");
+    }
+
+    #[test]
+    fn delete_tree_rejected() {
+        expect_not_possible(ro().delete_tree("hello"), "delete_tree");
+    }
+
+    #[test]
+    fn symlink_rejected() {
+        expect_not_possible(ro().symlink("hello", "link"), "symlink");
+    }
+
+    #[test]
+    fn hardlink_rejected() {
+        expect_not_possible(ro().hardlink("hello", "link"), "hardlink");
+    }
+
+    #[test]
+    fn append_file_rejected() {
+        let mut cur = std::io::Cursor::new(b"more".to_vec());
+        expect_not_possible(ro().append_file("hello", &mut cur, None), "append_file");
+    }
+
+    #[test]
+    fn append_bytes_rejected() {
+        expect_not_possible(ro().append_bytes("hello", b"more", None), "append_bytes");
+    }
+
+    #[test]
+    fn open_write_stream_rejected() {
+        match ro().open_write_stream("hello", None) {
+            Err(Error::TransportNotPossible) => {}
+            Err(other) => panic!("expected TransportNotPossible, got {:?}", other),
+            Ok(_) => panic!("expected TransportNotPossible, got Ok"),
+        }
+    }
+
+    #[test]
+    fn move_rejected() {
+        expect_not_possible(ro().r#move("hello", "world"), "move");
+    }
+
+    #[test]
+    fn copy_rejected() {
+        expect_not_possible(ro().copy("hello", "world"), "copy");
+    }
+
+    #[test]
+    fn stat_passes_through() {
+        let st = ro().stat("hello").unwrap();
+        assert_eq!(st.size, 5);
+    }
+
+    #[test]
+    fn list_dir_passes_through() {
+        let mem = MemoryTransport::new("memory:///").unwrap();
+        mem.mkdir("d", None).unwrap();
+        mem.put_bytes("d/a", b"1", None).unwrap();
+        mem.put_bytes("d/b", b"2", None).unwrap();
+        let t = ReadonlyTransport::new(Box::new(mem));
+        let mut entries: Vec<String> = t.list_dir("d").filter_map(|r| r.ok()).collect();
+        entries.sort();
+        assert_eq!(entries, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn iter_files_recursive_passes_through() {
+        let mem = MemoryTransport::new("memory:///").unwrap();
+        mem.put_bytes("a", b"1", None).unwrap();
+        mem.put_bytes("b", b"2", None).unwrap();
+        let t = ReadonlyTransport::new(Box::new(mem));
+        let mut files: Vec<String> = t.iter_files_recursive().filter_map(|r| r.ok()).collect();
+        files.sort();
+        assert_eq!(files, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn external_url_forwards_error() {
+        // MemoryTransport returns InProcessTransport; readonly should forward it.
+        match ro().external_url() {
+            Err(Error::InProcessTransport) => {}
+            other => panic!("expected InProcessTransport, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn get_missing_forwards_no_such_file() {
+        match ro().get_bytes("nope") {
+            Err(Error::NoSuchFile(_)) => {}
+            other => panic!("expected NoSuchFile, got {:?}", other),
+        }
+    }
 }
