@@ -1230,6 +1230,8 @@ impl WriteLock {
 mod brokenrename;
 mod fakenfs;
 mod fakevfat;
+#[cfg(feature = "gio")]
+mod gio;
 mod memory;
 mod pathfilter;
 mod readonly;
@@ -1290,6 +1292,14 @@ fn _transport_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     memory::register(py, &memorym)?;
     m.add_submodule(&memorym)?;
 
+    #[cfg(feature = "gio")]
+    let giom = {
+        let giom = PyModule::new(py, "gio")?;
+        gio::register(py, &giom)?;
+        m.add_submodule(&giom)?;
+        giom
+    };
+
     // PyO3 submodule hack for proper import support
     let sys = py.import("sys")?;
     let modules = sys.getattr("modules")?;
@@ -1306,6 +1316,8 @@ fn _transport_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     modules.set_item(format!("{}.fakenfs", module_name), &fakenfsm)?;
     modules.set_item(format!("{}.pathfilter", module_name), &pathfilterm)?;
     modules.set_item(format!("{}.memory", module_name), &memorym)?;
+    #[cfg(feature = "gio")]
+    modules.set_item(format!("{}.gio", module_name), &giom)?;
 
     Ok(())
 }
