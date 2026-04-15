@@ -15,13 +15,16 @@
 
 use crate::lock::{Lock, LockError};
 use crate::urlutils::escape;
-use crate::{Error, FileKind, ReadStream, Result, SmartMedium, Stat, Transport, UrlFragment};
+use crate::{
+    Error, FileKind, ReadStream, Result, SmartMedium, Stat, Transport, UrlFragment, WriteStream,
+};
 use ::gio::prelude::*;
 use ::gio::{FileCopyFlags, FileQueryInfoFlags, IOErrorEnum};
 use std::collections::HashMap;
 use std::fs::Permissions;
 use std::io::{Cursor, Read};
-use std::sync::Mutex;
+use std::sync::mpsc;
+use std::thread;
 use url::Url;
 
 const GIO_BACKENDS: &[&str] = &["dav", "file", "ftp", "obex", "sftp", "ssh", "smb"];
@@ -127,6 +130,158 @@ impl std::io::Seek for GioReadStream {
 }
 
 impl ReadStream for GioReadStream {}
+
+/// Commands sent from the public `GioWriteStream` handle to the worker
+/// thread that owns the underlying `gio::FileOutputStream`. The worker
+/// is necessary because `FileOutputStream` is `!Send`, but `WriteStream`
+/// requires `Send + Sync`.
+enum WriterCmd {
+    Write(Vec<u8>),
+    Flush,
+    Close,
+}
+
+/// Reply payload returned over a one-shot reply channel for each command.
+/// `glib::Error` is `!Send`, so any error is converted to a string here.
+type WriterReply = std::result::Result<usize, String>;
+
+/// Send+Sync handle to a writer thread that owns a gvfs output stream.
+struct GioWriteStream {
+    tx: Option<mpsc::Sender<(WriterCmd, mpsc::Sender<WriterReply>)>>,
+    join: Option<thread::JoinHandle<()>>,
+}
+
+impl GioWriteStream {
+    fn spawn(url: String) -> Result<Self> {
+        // The worker creates the output stream itself so the !Send
+        // `gio::File` / `FileOutputStream` never crosses thread boundaries.
+        // Open synchronously via a one-shot channel so we can surface
+        // errors before returning the handle.
+        let (open_tx, open_rx) = mpsc::channel::<std::result::Result<(), String>>();
+        let (cmd_tx, cmd_rx) = mpsc::channel::<(WriterCmd, mpsc::Sender<WriterReply>)>();
+
+        let join = thread::spawn(move || {
+            let file = ::gio::File::for_uri(&url);
+            let stream = match file.replace(
+                None,
+                false,
+                ::gio::FileCreateFlags::REPLACE_DESTINATION,
+                ::gio::Cancellable::NONE,
+            ) {
+                Ok(s) => {
+                    if open_tx.send(Ok(())).is_err() {
+                        // Caller went away; clean up and exit.
+                        let _ = s.close(::gio::Cancellable::NONE);
+                        return;
+                    }
+                    s
+                }
+                Err(e) => {
+                    let _ = open_tx.send(Err(e.to_string()));
+                    return;
+                }
+            };
+
+            while let Ok((cmd, reply)) = cmd_rx.recv() {
+                match cmd {
+                    WriterCmd::Write(buf) => {
+                        let res = match stream.write_all(&buf, ::gio::Cancellable::NONE) {
+                            Ok((written, None)) => Ok(written),
+                            Ok((_, Some(e))) => Err(e.to_string()),
+                            Err(e) => Err(e.to_string()),
+                        };
+                        let _ = reply.send(res);
+                    }
+                    WriterCmd::Flush => {
+                        let res = stream
+                            .flush(::gio::Cancellable::NONE)
+                            .map(|_| 0usize)
+                            .map_err(|e| e.to_string());
+                        let _ = reply.send(res);
+                    }
+                    WriterCmd::Close => {
+                        let res = stream
+                            .close(::gio::Cancellable::NONE)
+                            .map(|_| 0usize)
+                            .map_err(|e| e.to_string());
+                        let _ = reply.send(res);
+                        return;
+                    }
+                }
+            }
+
+            // Sender dropped without an explicit Close — best-effort close.
+            let _ = stream.close(::gio::Cancellable::NONE);
+        });
+
+        match open_rx.recv() {
+            Ok(Ok(())) => Ok(GioWriteStream {
+                tx: Some(cmd_tx),
+                join: Some(join),
+            }),
+            Ok(Err(msg)) => {
+                let _ = join.join();
+                Err(Error::Io(std::io::Error::other(msg)))
+            }
+            Err(_) => {
+                let _ = join.join();
+                Err(Error::Io(std::io::Error::other(
+                    "gio writer thread exited before opening stream",
+                )))
+            }
+        }
+    }
+
+    fn dispatch(&self, cmd: WriterCmd) -> std::io::Result<usize> {
+        let tx = self
+            .tx
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("gio write stream already closed"))?;
+        let (reply_tx, reply_rx) = mpsc::channel();
+        tx.send((cmd, reply_tx))
+            .map_err(|_| std::io::Error::other("gio writer thread exited"))?;
+        match reply_rx.recv() {
+            Ok(Ok(n)) => Ok(n),
+            Ok(Err(msg)) => Err(std::io::Error::other(msg)),
+            Err(_) => Err(std::io::Error::other("gio writer thread exited")),
+        }
+    }
+}
+
+impl std::io::Write for GioWriteStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // write_all on the worker drains the whole buffer or returns an error.
+        self.dispatch(WriterCmd::Write(buf.to_vec()))?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.dispatch(WriterCmd::Flush).map(|_| ())
+    }
+}
+
+impl WriteStream for GioWriteStream {
+    fn sync_data(&self) -> std::io::Result<()> {
+        // gvfs has no fsync; OutputStream::flush is the strongest durability
+        // primitive available, matching what the Python port did.
+        self.dispatch(WriterCmd::Flush).map(|_| ())
+    }
+}
+
+impl Drop for GioWriteStream {
+    fn drop(&mut self) {
+        // Best-effort close. Errors here have nowhere to go.
+        if let Some(tx) = self.tx.take() {
+            let (reply_tx, reply_rx) = mpsc::channel();
+            if tx.send((WriterCmd::Close, reply_tx)).is_ok() {
+                let _ = reply_rx.recv();
+            }
+        }
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
 
 /// gvfs offers no real lock primitive, matching the Python implementation
 /// which returned a no-op lock. We do the same.
@@ -505,22 +660,21 @@ impl Transport for GioTransport {
 
     fn open_write_stream(
         &self,
-        _relpath: &UrlFragment,
+        relpath: &UrlFragment,
         _permissions: Option<Permissions>,
-    ) -> Result<Box<dyn crate::WriteStream + Send + Sync>> {
-        // The Python GioFileStream wraps gio::FileOutputStream; porting it
-        // requires a Send+Sync wrapper around a gio handle. TODO: add a
-        // dedicated wrapper that pins the stream to a worker thread.
-        Err(Error::TransportNotPossible)
+    ) -> Result<Box<dyn WriteStream + Send + Sync>> {
+        // gio::FileOutputStream is !Send. We dedicate one worker thread per
+        // open stream — the worker owns the underlying handle and we drive
+        // it via a synchronous command channel.
+        let url = self.child_url(relpath)?;
+        let stream = GioWriteStream::spawn(url)?;
+        Ok(Box::new(stream))
     }
 }
 
 // `gio::File` and friends are `!Send + !Sync`. Our struct only stores
-// owned `String`/`Url`, which are Send+Sync, so the trait bounds are
-// satisfied. Suppress the unused-import warning on builds where Mutex
-// isn't otherwise referenced.
-#[allow(dead_code)]
-const _: Option<Mutex<()>> = None;
+// owned `String`/`Url`, which are Send+Sync, and `GioWriteStream` keeps
+// its !Send `gio::FileOutputStream` pinned to a worker thread.
 
 #[cfg(test)]
 mod tests {
@@ -602,6 +756,43 @@ mod tests {
             Err(Error::NoSuchFile(_)) => {}
             other => panic!("expected NoSuchFile, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn open_write_stream_round_trip() {
+        use std::io::Write;
+        let (_dir, t) = temp_transport();
+        let mut stream = t.open_write_stream("w", None).unwrap();
+        stream.write_all(b"hello ").unwrap();
+        stream.write_all(b"world").unwrap();
+        stream.flush().unwrap();
+        drop(stream);
+        assert_eq!(t.get_bytes("w").unwrap(), b"hello world");
+    }
+
+    #[test]
+    fn open_write_stream_visible_after_flush() {
+        // After explicit flush, a concurrent read on the same path must see
+        // the buffered writes — this is what the per_transport
+        // test_get_with_open_write_stream_sees_all_content scenario asserts.
+        use std::io::Write;
+        let (_dir, t) = temp_transport();
+        let mut stream = t.open_write_stream("w", None).unwrap();
+        stream.write_all(b"bcd").unwrap();
+        stream.flush().unwrap();
+        assert_eq!(t.get_bytes("w").unwrap(), b"bcd");
+        drop(stream);
+    }
+
+    #[test]
+    fn open_write_stream_overwrites_existing() {
+        use std::io::Write;
+        let (_dir, t) = temp_transport();
+        t.put_bytes("w", b"old contents", None).unwrap();
+        let mut stream = t.open_write_stream("w", None).unwrap();
+        stream.write_all(b"new").unwrap();
+        drop(stream);
+        assert_eq!(t.get_bytes("w").unwrap(), b"new");
     }
 
     #[test]
