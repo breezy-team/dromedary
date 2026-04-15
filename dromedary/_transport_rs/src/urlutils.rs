@@ -80,6 +80,9 @@ fn map_urlutils_error_to_pyerr(e: dromedary::urlutils::Error) -> PyErr {
         dromedary::urlutils::Error::UrlTooShort(url) => {
             PyValueError::new_err(("URL too short", url))
         }
+        dromedary::urlutils::Error::InvalidUrlPort(url, port_str) => {
+            InvalidURL::new_err((format!("invalid port number {port_str} in url:\n{url}"),))
+        }
     }
 }
 
@@ -259,6 +262,182 @@ fn file_relpath(base: &str, path: &str) -> PyResult<String> {
     dromedary::urlutils::file_relpath(base, path).map_err(map_urlutils_error_to_pyerr)
 }
 
+/// Permissive percent-decode mirroring Python's urllib.parse.unquote:
+/// non-ASCII or undecodable input is returned unchanged.
+fn unquote_lossy(s: &str) -> String {
+    dromedary::urlutils::unescape(s).unwrap_or_else(|_| s.to_string())
+}
+
+/// Rust port of dromedary.urlutils.URL — a parsed URL with both
+/// quoted and unquoted forms of each component. Attributes are mutable
+/// to match the historical Python behaviour.
+#[pyclass(name = "URL", subclass, skip_from_py_object)]
+#[derive(Clone)]
+pub(crate) struct UrlObject {
+    #[pyo3(get, set)]
+    scheme: String,
+    #[pyo3(get, set)]
+    quoted_user: Option<String>,
+    #[pyo3(get, set)]
+    user: Option<String>,
+    #[pyo3(get, set)]
+    quoted_password: Option<String>,
+    #[pyo3(get, set)]
+    password: Option<String>,
+    #[pyo3(get, set)]
+    quoted_host: String,
+    #[pyo3(get, set)]
+    host: String,
+    #[pyo3(get, set)]
+    port: Option<u16>,
+    #[pyo3(get, set)]
+    quoted_path: String,
+    #[pyo3(get, set)]
+    path: String,
+}
+
+#[pymethods]
+impl UrlObject {
+    #[new]
+    fn new(
+        scheme: String,
+        quoted_user: Option<String>,
+        quoted_password: Option<String>,
+        quoted_host: String,
+        port: Option<u16>,
+        quoted_path: String,
+    ) -> Self {
+        let host = unquote_lossy(&quoted_host);
+        let user = quoted_user.as_deref().map(unquote_lossy);
+        let password = quoted_password.as_deref().map(unquote_lossy);
+        let normalized_path = dromedary::urlutils::normalize_quoted_path(&quoted_path);
+        let path = unquote_lossy(&normalized_path);
+        UrlObject {
+            scheme,
+            quoted_user,
+            user,
+            quoted_password,
+            password,
+            quoted_host,
+            host,
+            port,
+            quoted_path: normalized_path,
+            path,
+        }
+    }
+
+    #[classmethod]
+    fn from_string(_cls: &Bound<pyo3::types::PyType>, url: &str) -> PyResult<Self> {
+        let parsed = dromedary::urlutils::parse_url(url).map_err(map_urlutils_error_to_pyerr)?;
+        Ok(UrlObject::new(
+            parsed.scheme,
+            parsed.quoted_user,
+            parsed.quoted_password,
+            parsed.quoted_host,
+            parsed.port,
+            parsed.quoted_path,
+        ))
+    }
+
+    fn __eq__(&self, other: &Bound<PyAny>) -> bool {
+        // Match Python: compare scheme/host/user/password/path. Port is
+        // intentionally not compared (preserved from the original impl).
+        match other.extract::<PyRef<UrlObject>>() {
+            Ok(o) => {
+                self.scheme == o.scheme
+                    && self.host == o.host
+                    && self.user == o.user
+                    && self.password == o.password
+                    && self.path == o.path
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        // <URL('http', None, None, '1:2:3::40', 80, '/one')>
+        fn opt_repr<T: std::fmt::Display>(v: &Option<T>) -> String {
+            match v {
+                Some(s) => format!("'{}'", s),
+                None => "None".to_string(),
+            }
+        }
+        let port_repr = match self.port {
+            Some(p) => p.to_string(),
+            None => "None".to_string(),
+        };
+        format!(
+            "<URL('{}', {}, {}, '{}', {}, '{}')>",
+            self.scheme,
+            opt_repr(&self.quoted_user),
+            opt_repr(&self.quoted_password),
+            self.quoted_host,
+            port_repr,
+            self.quoted_path,
+        )
+    }
+
+    fn __str__(&self) -> String {
+        // Bracket the host if it looks like an IPv6 literal.
+        let mut netloc = if self.quoted_host.contains(':') {
+            format!("[{}]", self.quoted_host)
+        } else {
+            self.quoted_host.clone()
+        };
+        if let Some(user) = &self.quoted_user {
+            // Password is intentionally omitted to avoid accidental exposure.
+            netloc = format!("{}@{}", user, netloc);
+        }
+        if let Some(port) = self.port {
+            netloc = format!("{}:{}", netloc, port);
+        }
+        format!("{}://{}{}", self.scheme, netloc, self.quoted_path)
+    }
+
+    #[pyo3(signature = (offset = None))]
+    fn clone(&self, offset: Option<&str>) -> Self {
+        let path = match offset {
+            Some(off) => {
+                let relative = unquote_lossy(off);
+                let combined = dromedary::urlutils::combine_paths(&self.path, &relative);
+                dromedary::urlutils::escape(combined.as_bytes(), Some("/~"))
+            }
+            None => self.quoted_path.clone(),
+        };
+        UrlObject::new(
+            self.scheme.clone(),
+            self.quoted_user.clone(),
+            self.quoted_password.clone(),
+            self.quoted_host.clone(),
+            self.port,
+            path,
+        )
+    }
+}
+
+/// (scheme, user, password, host, port, path) — all unquoted.
+type ParsedUrlTuple = (
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    Option<u16>,
+    String,
+);
+
+#[pyfunction]
+fn parse_url(url: &str) -> PyResult<ParsedUrlTuple> {
+    let p = dromedary::urlutils::parse_url(url).map_err(map_urlutils_error_to_pyerr)?;
+    Ok((
+        p.scheme,
+        p.quoted_user.as_deref().map(unquote_lossy),
+        p.quoted_password.as_deref().map(unquote_lossy),
+        unquote_lossy(&p.quoted_host),
+        p.port,
+        unquote_lossy(&p.quoted_path),
+    ))
+}
+
 #[pymodule]
 pub fn _urlutils_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(is_url, m)?)?;
@@ -283,6 +462,8 @@ pub fn _urlutils_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(unescape, m)?)?;
     m.add_function(wrap_pyfunction!(derive_to_location, m)?)?;
     m.add_function(wrap_pyfunction!(file_relpath, m)?)?;
+    m.add_function(wrap_pyfunction!(parse_url, m)?)?;
+    m.add_class::<UrlObject>()?;
     let win32m = PyModule::new(py, "win32")?;
     win32m.add_function(wrap_pyfunction!(win32_local_path_to_url, &win32m)?)?;
     win32m.add_function(wrap_pyfunction!(win32_local_path_from_url, &win32m)?)?;
