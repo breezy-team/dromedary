@@ -226,9 +226,17 @@ impl Transport for PyTransport {
 
     fn base(&self) -> Url {
         Python::attach(|py| {
-            let obj = self.0.getattr(py, "base").unwrap();
-            let s = obj.extract::<String>(py).unwrap();
-            Url::parse(&s).unwrap()
+            // `.base` is a required attribute on every Transport. If the
+            // wrapped Python object can't produce one we have no choice but
+            // to fall back to a placeholder URL — none of the trait callers
+            // expect this to fail.
+            let url_str = self
+                .0
+                .getattr(py, "base")
+                .ok()
+                .and_then(|obj| obj.extract::<String>(py).ok())
+                .unwrap_or_default();
+            Url::parse(&url_str).unwrap_or_else(|_| Url::parse("file:///").unwrap())
         })
     }
 
@@ -265,7 +273,7 @@ impl Transport for PyTransport {
 
     fn stat(&self, path: &UrlFragment) -> Result<Stat> {
         Python::attach(|py| {
-            let stat_result = self.0.call_method1(py, "stat", (path,)).unwrap();
+            let stat_result = self.0.call_method1(py, "stat", (path,))?;
 
             let mtime = if let Ok(mtime) = stat_result.getattr(py, "mtime") {
                 Some(mtime.extract::<f64>(py)?)
@@ -457,9 +465,9 @@ impl Transport for PyTransport {
         Python::attach(|py| {
             self.0
                 .call_method0(py, "recommended_page_size")
-                .unwrap()
-                .extract::<usize>(py)
-                .unwrap()
+                .ok()
+                .and_then(|obj| obj.extract::<usize>(py).ok())
+                .unwrap_or(4 * 1024)
         })
     }
 
@@ -467,9 +475,9 @@ impl Transport for PyTransport {
         Python::attach(|py| {
             self.0
                 .call_method0(py, "is_readonly")
-                .unwrap()
-                .extract::<bool>(py)
-                .unwrap()
+                .ok()
+                .and_then(|obj| obj.extract::<bool>(py).ok())
+                .unwrap_or(false)
         })
     }
 
@@ -643,12 +651,16 @@ impl Transport for PyTransport {
     }
 
     fn can_roundtrip_unix_modebits(&self) -> bool {
+        // Python convention names this `_can_roundtrip_unix_modebits` (with
+        // a leading underscore) on every transport class; the unprefixed
+        // form does not exist on the Python side. Default to false if the
+        // wrapped object doesn't expose either spelling.
         Python::attach(|py| {
             self.0
-                .getattr(py, "can_roundtrip_unix_modebits")
-                .unwrap()
-                .extract::<bool>(py)
-                .unwrap()
+                .call_method0(py, "_can_roundtrip_unix_modebits")
+                .ok()
+                .and_then(|obj| obj.extract::<bool>(py).ok())
+                .unwrap_or(false)
         })
     }
 
@@ -687,9 +699,9 @@ impl Transport for PyTransport {
         Python::attach(|py| {
             self.0
                 .call_method0(py, "listable")
-                .unwrap()
-                .extract::<bool>(py)
-                .unwrap()
+                .ok()
+                .and_then(|obj| obj.extract::<bool>(py).ok())
+                .unwrap_or(false)
         })
     }
 
