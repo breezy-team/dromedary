@@ -46,6 +46,7 @@ import_exception!(dromedary.errors, DirectoryNotEmpty);
 import_exception!(dromedary.errors, NotADirectory);
 import_exception!(dromedary.errors, ResourceBusy);
 import_exception!(dromedary.errors, ReadError);
+import_exception!(dromedary.urlutils, InvalidURL);
 
 struct PySmartMedium(Py<PyAny>);
 
@@ -104,11 +105,12 @@ impl From<PyErr> for Error {
     fn from(e: PyErr) -> Self {
         Python::attach(|py| {
             let arg = |_i| -> Option<String> {
-                let args = e.value(py).getattr("args").unwrap();
-                match args.get_item(0) {
-                    Ok(a) if a.is_none() => None,
-                    Ok(a) => Some(a.extract::<String>().unwrap()),
-                    Err(_) => None,
+                let args = e.value(py).getattr("args").ok()?;
+                let item = args.get_item(0).ok()?;
+                if item.is_none() {
+                    None
+                } else {
+                    item.extract::<String>().ok()
                 }
             };
             if e.is_instance_of::<InProcessTransport>(py) {
@@ -139,6 +141,10 @@ impl From<PyErr> for Error {
                 Error::ResourceBusy(arg(0))
             } else if e.is_instance_of::<ReadError>(py) {
                 Error::IsADirectoryError(arg(0))
+            } else if e.is_instance_of::<InvalidURL>(py) {
+                Error::UrlutilsError(crate::urlutils::Error::UrlNotAscii(
+                    arg(0).unwrap_or_default(),
+                ))
             } else if e.is_instance_of::<ShortReadvError>(py) {
                 let value = e.value(py);
                 Error::ShortReadvError(
@@ -148,7 +154,11 @@ impl From<PyErr> for Error {
                     value.getattr("actual").unwrap().extract::<u64>().unwrap(),
                 )
             } else {
-                panic!("{}", e.to_string())
+                // Don't panic on unrecognised exception types — funnel them
+                // through Error::Io so the caller sees something useful and
+                // the worker stays alive. New variants should still be added
+                // explicitly above when they have a real semantic mapping.
+                Error::Io(std::io::Error::other(e.to_string()))
             }
         })
     }
