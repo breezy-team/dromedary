@@ -11,7 +11,7 @@ use crate::{
 };
 use std::collections::HashMap;
 use std::fs::Permissions;
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, Mutex};
@@ -182,6 +182,41 @@ impl std::io::Seek for MemoryReadStream {
 }
 
 impl ReadStream for MemoryReadStream {}
+
+/// Write stream that appends straight into the shared MemoryStore so a
+/// concurrent get_bytes on the same path sees the in-flight bytes
+/// without an explicit flush — matching the per_transport
+/// `get_with_open_write_stream_sees_all_content` contract.
+struct MemoryWriteStream {
+    store: Arc<Mutex<MemoryStore>>,
+    abspath: String,
+}
+
+impl Write for MemoryWriteStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut store = self.store.lock().unwrap();
+        match store.files.get_mut(&self.abspath) {
+            Some((data, _)) => {
+                data.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "memory file removed while write stream was open",
+            )),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl WriteStream for MemoryWriteStream {
+    fn sync_data(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 struct MemoryLock {
     path: String,
@@ -534,11 +569,22 @@ impl Transport for MemoryTransport {
 
     fn open_write_stream(
         &self,
-        _relpath: &UrlFragment,
-        _permissions: Option<Permissions>,
+        relpath: &UrlFragment,
+        permissions: Option<Permissions>,
     ) -> Result<Box<dyn WriteStream + Send + Sync>> {
-        // TODO: implement append-based file stream bound to this transport.
-        Err(Error::TransportNotPossible)
+        let abspath = self.resolve_symlinks(relpath)?;
+        let mode = perms_to_mode(permissions);
+        // Truncate any existing file and validate the parent exists; this
+        // matches LocalTransport semantics (write streams start empty).
+        {
+            let mut store = self.store.lock().unwrap();
+            Self::check_parent(&store, &abspath)?;
+            store.files.insert(abspath.clone(), (Vec::new(), mode));
+        }
+        Ok(Box::new(MemoryWriteStream {
+            store: Arc::clone(&self.store),
+            abspath,
+        }))
     }
 
     fn delete_tree(&self, _relpath: &UrlFragment) -> Result<()> {
@@ -781,5 +827,47 @@ mod tests {
             files,
             vec!["a".to_string(), "b".to_string(), "link".to_string()]
         );
+    }
+
+    #[test]
+    fn open_write_stream_round_trip() {
+        let t = t();
+        let mut stream = t.open_write_stream("w", None).unwrap();
+        stream.write_all(b"hello ").unwrap();
+        stream.write_all(b"world").unwrap();
+        drop(stream);
+        assert_eq!(t.get_bytes("w").unwrap(), b"hello world");
+    }
+
+    #[test]
+    fn open_write_stream_visible_without_flush() {
+        // The per_transport contract: a concurrent get_bytes after write
+        // (no explicit flush) sees the in-flight bytes.
+        let t = t();
+        let mut stream = t.open_write_stream("w", None).unwrap();
+        stream.write_all(b"abc").unwrap();
+        assert_eq!(t.get_bytes("w").unwrap(), b"abc");
+        stream.write_all(b"def").unwrap();
+        assert_eq!(t.get_bytes("w").unwrap(), b"abcdef");
+    }
+
+    #[test]
+    fn open_write_stream_truncates_existing() {
+        let t = t();
+        t.put_bytes("w", b"old contents", None).unwrap();
+        let mut stream = t.open_write_stream("w", None).unwrap();
+        stream.write_all(b"new").unwrap();
+        drop(stream);
+        assert_eq!(t.get_bytes("w").unwrap(), b"new");
+    }
+
+    #[test]
+    fn open_write_stream_rejects_missing_parent() {
+        let t = t();
+        match t.open_write_stream("missing/child", None) {
+            Ok(_) => panic!("expected NoSuchFile, got Ok"),
+            Err(Error::NoSuchFile(_)) => {}
+            Err(other) => panic!("expected NoSuchFile, got {:?}", other),
+        }
     }
 }
