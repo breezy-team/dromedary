@@ -535,6 +535,8 @@ pub mod local;
 
 pub mod memory;
 
+pub mod readonly;
+
 pub mod osutils;
 
 #[cfg(feature = "pyo3")]
