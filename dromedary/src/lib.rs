@@ -532,6 +532,8 @@ pub trait SmartMedium {}
 
 pub mod local;
 
+pub mod memory;
+
 pub mod osutils;
 
 #[cfg(feature = "pyo3")]
