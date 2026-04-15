@@ -44,6 +44,8 @@ pub enum Error {
     NotADirectoryError(Option<String>),
 
     DirectoryNotEmptyError(Option<String>),
+
+    ResourceBusy(Option<String>),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -533,13 +535,23 @@ pub trait SmartMedium {}
 
 pub mod local;
 
+pub mod brokenrename;
+
 pub mod chroot;
+
+pub mod decorator;
+
+pub mod fakenfs;
+
+pub mod fakevfat;
 
 pub mod memory;
 
 pub mod pathfilter;
 
 pub mod readonly;
+
+pub mod unlistable;
 
 pub mod osutils;
 
