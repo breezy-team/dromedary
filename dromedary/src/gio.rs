@@ -463,8 +463,44 @@ impl Transport for GioTransport {
         Err(Error::TransportNotPossible)
     }
 
-    fn delete_tree(&self, _relpath: &UrlFragment) -> Result<()> {
-        Err(Error::TransportNotPossible)
+    fn delete_tree(&self, relpath: &UrlFragment) -> Result<()> {
+        let st = self.stat(relpath)?;
+        if st.kind != FileKind::Dir {
+            return Err(Error::NotADirectoryError(Some(relpath.to_string())));
+        }
+        // Depth-first removal: enumerate entries, recurse into directories,
+        // delete files, then delete the now-empty directory.
+        let f = self.file_for(relpath)?;
+        let enumerator = f
+            .enumerate_children(
+                "standard::name,standard::type",
+                FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
+                ::gio::Cancellable::NONE,
+            )
+            .map_err(|e| Self::translate(e, Some(relpath)))?;
+        loop {
+            match enumerator.next_file(::gio::Cancellable::NONE) {
+                Ok(Some(info)) => {
+                    let name = info.name();
+                    let name_str = name.to_string_lossy();
+                    let child_rel = format!("{}/{}", relpath.trim_end_matches('/'), name_str);
+                    match info.file_type() {
+                        ::gio::FileType::Directory => self.delete_tree(&child_rel)?,
+                        _ => {
+                            let child = self.file_for(&child_rel)?;
+                            child
+                                .delete(::gio::Cancellable::NONE)
+                                .map_err(|e| Self::translate(e, Some(&child_rel)))?;
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => return Err(Self::translate(e, Some(relpath))),
+            }
+        }
+        let _ = enumerator.close(::gio::Cancellable::NONE);
+        f.delete(::gio::Cancellable::NONE)
+            .map_err(|e| Self::translate(e, Some(relpath)))
     }
 
     fn open_write_stream(
@@ -565,6 +601,27 @@ mod tests {
         match t.get_bytes("nope") {
             Err(Error::NoSuchFile(_)) => {}
             other => panic!("expected NoSuchFile, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn delete_tree_removes_nested() {
+        let (_dir, t) = temp_transport();
+        t.mkdir("d", None).unwrap();
+        t.put_bytes("d/a", b"1", None).unwrap();
+        t.mkdir("d/sub", None).unwrap();
+        t.put_bytes("d/sub/b", b"2", None).unwrap();
+        t.delete_tree("d").unwrap();
+        assert!(!t.has("d").unwrap());
+    }
+
+    #[test]
+    fn delete_tree_rejects_non_directory() {
+        let (_dir, t) = temp_transport();
+        t.put_bytes("f", b"x", None).unwrap();
+        match t.delete_tree("f") {
+            Err(Error::NotADirectoryError(_)) => {}
+            other => panic!("expected NotADirectoryError, got {:?}", other),
         }
     }
 
