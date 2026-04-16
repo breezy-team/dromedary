@@ -16,7 +16,6 @@
 
 """A collection of function for handling URL operations."""
 
-import re
 import sys
 from urllib import parse as urlparse
 
@@ -69,6 +68,7 @@ unquote = urlparse.unquote
 
 
 from ._transport_rs.urlutils import (  # noqa: F401
+    URL,
     _find_scheme_and_separator,
     basename,
     combine_paths,
@@ -84,6 +84,7 @@ from ._transport_rs.urlutils import (  # noqa: F401
     local_path_from_url,
     local_path_to_url,
     normalize_url,
+    parse_url,
     relative_url,
     split,
     split_segment_parameters,
@@ -106,22 +107,6 @@ WIN32_MIN_ABS_FILEURL_LENGTH = len("file:///C:/")
 
 if sys.platform == "win32":
     MIN_ABS_FILEURL_LENGTH = WIN32_MIN_ABS_FILEURL_LENGTH
-
-
-_url_hex_escapes_re = re.compile("(%[0-9a-fA-F]{2})")
-
-
-def _unescape_safe_chars(matchobj):
-    """re.sub callback to convert hex-escapes to plain characters (if safe).
-
-    e.g. '%7E' will be converted to '~'.
-    """
-    hex_digits = matchobj.group(0)[1:]
-    char = chr(int(hex_digits, 16))
-    if char in _url_dont_escape_characters:
-        return char
-    else:
-        return matchobj.group(0).upper()
 
 
 _win32_extract_drive_letter = win32_rs.extract_drive_letter
@@ -271,185 +256,3 @@ def determine_relative_path(from_path, to_path):
     if len(segments) == 0:
         return "."
     return pathjoin(*segments)
-
-
-class URL:
-    """Parsed URL."""
-
-    def __init__(
-        self, scheme, quoted_user, quoted_password, quoted_host, port, quoted_path
-    ):
-        """Initialize URL object with parsed components.
-
-        Args:
-            scheme: URL scheme (e.g., 'http', 'https', 'file').
-            quoted_user: URL-quoted username or None.
-            quoted_password: URL-quoted password or None.
-            quoted_host: URL-quoted hostname.
-            port: Port number as integer or None.
-            quoted_path: URL-quoted path component.
-        """
-        self.scheme = scheme
-        self.quoted_host = quoted_host
-        self.host = unquote(self.quoted_host)
-        self.quoted_user = quoted_user
-        if self.quoted_user is not None:
-            self.user = unquote(self.quoted_user)
-        else:
-            self.user = None
-        self.quoted_password = quoted_password
-        if self.quoted_password is not None:
-            self.password = unquote(self.quoted_password)
-        else:
-            self.password = None
-        self.port = port
-        self.quoted_path = _url_hex_escapes_re.sub(_unescape_safe_chars, quoted_path)
-        self.path = unquote(self.quoted_path)
-
-    def __eq__(self, other):
-        """Check if two URL objects are equal.
-
-        Args:
-            other: Another URL object to compare with.
-
-        Returns:
-            True if the URLs are equal, False otherwise.
-        """
-        return (
-            isinstance(other, self.__class__)
-            and self.scheme == other.scheme
-            and self.host == other.host
-            and self.user == other.user
-            and self.password == other.password
-            and self.path == other.path
-        )
-
-    def __repr__(self):
-        """Return a detailed string representation of the URL.
-
-        Returns:
-            String representation showing all URL components.
-        """
-        return "<{}({!r}, {!r}, {!r}, {!r}, {!r}, {!r})>".format(
-            self.__class__.__name__,
-            self.scheme,
-            self.quoted_user,
-            self.quoted_password,
-            self.quoted_host,
-            self.port,
-            self.quoted_path,
-        )
-
-    @classmethod
-    def from_string(cls, url):
-        """Create a URL object from a string.
-
-        Args:
-          url: URL as bytestring
-        """
-        # GZ 2017-06-09: Actually validate ascii-ness
-        # pad.lv/1696545: For the moment, accept both native strings and
-        # unicode.
-        if isinstance(url, str):
-            pass
-        elif isinstance(url, str):
-            try:
-                url = url.encode()
-            except UnicodeEncodeError as err:
-                raise InvalidURL(url) from err
-        else:
-            raise InvalidURL(url)
-        (scheme, netloc, path, _params, _query, _fragment) = urlparse.urlparse(
-            url, allow_fragments=False
-        )
-        user = password = host = port = None
-        if "@" in netloc:
-            user, host = netloc.rsplit("@", 1)
-            if ":" in user:
-                user, password = user.split(":", 1)
-        else:
-            host = netloc
-
-        if ":" in host and not (host[0] == "[" and host[-1] == "]"):
-            # there *is* port
-            host, port = host.rsplit(":", 1)
-            if port:
-                try:
-                    port = int(port)
-                except ValueError as err:
-                    raise InvalidURL(
-                        f"invalid port number {port} in url:\n{url}"
-                    ) from err
-            else:
-                port = None
-        if host != "" and host[0] == "[" and host[-1] == "]":  # IPv6
-            host = host[1:-1]
-
-        return cls(scheme, user, password, host, port, path)
-
-    def __str__(self):
-        """Return the URL as a string.
-
-        Note: The password is omitted from the string representation
-        for security reasons.
-
-        Returns:
-            String representation of the URL.
-        """
-        netloc = self.quoted_host
-        if ":" in netloc:
-            netloc = f"[{netloc}]"
-        if self.quoted_user is not None:
-            # Note that we don't put the password back even if we
-            # have one so that it doesn't get accidentally
-            # exposed.
-            netloc = f"{self.quoted_user}@{netloc}"
-        if self.port is not None:
-            netloc = "%s:%d" % (netloc, self.port)
-        return urlparse.urlunparse(
-            (self.scheme, netloc, self.quoted_path, None, None, None)
-        )
-
-    def clone(self, offset=None):
-        """Return a new URL for a path relative to this URL.
-
-        Args:
-          offset: A relative path, already urlencoded
-        Returns: `URL` instance
-        """
-        if offset is not None:
-            relative = unescape(offset)
-            path = combine_paths(self.path, relative)
-            path = quote(path, safe="/~")
-        else:
-            path = self.quoted_path
-        return self.__class__(
-            self.scheme,
-            self.quoted_user,
-            self.quoted_password,
-            self.quoted_host,
-            self.port,
-            path,
-        )
-
-
-def parse_url(url):
-    """Extract the server address, the credentials and the path from the url.
-
-    user, password, host and path should be quoted if they contain reserved
-    chars.
-
-    Args:
-      url: an quoted url
-    Returns: (scheme, user, password, host, port, path) tuple, all fields
-        are unquoted.
-    """
-    parsed_url = URL.from_string(url)
-    return (
-        parsed_url.scheme,
-        parsed_url.user,
-        parsed_url.password,
-        parsed_url.host,
-        parsed_url.port,
-        parsed_url.path,
-    )

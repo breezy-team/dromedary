@@ -30,12 +30,17 @@ import_exception!(dromedary.errors, ReadError);
 import_exception!(dromedary.errors, PathError);
 import_exception!(dromedary.errors, DirectoryNotEmpty);
 import_exception!(dromedary.errors, NotADirectory);
+import_exception!(dromedary.errors, ResourceBusy);
 import_exception!(dromedary.urlutils, InvalidURL);
 
 #[pyclass(subclass)]
-struct Transport(Box<dyn TransportTrait>);
+pub(crate) struct Transport(pub(crate) Box<dyn TransportTrait>);
 
-fn map_transport_err_to_py_err(e: Error, t: Option<Py<PyAny>>, p: Option<&UrlFragment>) -> PyErr {
+pub(crate) fn map_transport_err_to_py_err(
+    e: Error,
+    t: Option<Py<PyAny>>,
+    p: Option<&UrlFragment>,
+) -> PyErr {
     let pick_path = |n: Option<String>| {
         if n.is_none() {
             n
@@ -46,13 +51,15 @@ fn map_transport_err_to_py_err(e: Error, t: Option<Py<PyAny>>, p: Option<&UrlFra
     match e {
         Error::InProcessTransport => InProcessTransport::new_err(()),
         Error::NotLocalUrl(url) => NotLocalUrl::new_err((url,)),
-        Error::NoSmartMedium => NoSmartMedium::new_err((t.unwrap(),)),
+        Error::NoSmartMedium => NoSmartMedium::new_err((t,)),
         Error::NoSuchFile(name) => NoSuchFile::new_err((pick_path(name),)),
         Error::FileExists(name) => FileExists::new_err((pick_path(name),)),
         Error::TransportNotPossible => TransportNotPossible::new_err(()),
         Error::UrlError(_e) => InvalidURL::new_err((p.map(|p| p.to_string()),)),
         Error::PermissionDenied(name) => PermissionDenied::new_err((pick_path(name),)),
-        Error::PathNotChild => PathNotChild::new_err(()),
+        Error::PathNotChild => {
+            PathNotChild::new_err((p.map(|p| p.to_string()).unwrap_or_default(), "".to_string()))
+        }
         Error::UrlutilsError(_e) => InvalidURL::new_err((p.map(|p| p.to_string()),)),
         Error::Io(e) => e.into(),
         Error::UnexpectedEof => PyValueError::new_err("Unexpected EOF"),
@@ -64,6 +71,7 @@ fn map_transport_err_to_py_err(e: Error, t: Option<Py<PyAny>>, p: Option<&UrlFra
         Error::ShortReadvError(path, offset, expected, got) => {
             ShortReadvError::new_err((path, offset, expected, got))
         }
+        Error::ResourceBusy(name) => ResourceBusy::new_err((pick_path(name),)),
     }
 }
 
@@ -1219,7 +1227,16 @@ impl WriteLock {
     }
 }
 
+mod brokenrename;
+mod fakenfs;
+mod fakevfat;
+#[cfg(feature = "gio")]
+mod gio;
+mod memory;
+mod pathfilter;
+mod readonly;
 mod sftp;
+mod unlistable;
 mod urlutils;
 
 #[pymodule]
@@ -1247,6 +1264,42 @@ fn _transport_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     urlutils::_urlutils_rs(py, &urlutilsm)?;
     m.add_submodule(&urlutilsm)?;
 
+    let unlistablem = PyModule::new(py, "unlistable")?;
+    unlistable::register(py, &unlistablem)?;
+    m.add_submodule(&unlistablem)?;
+
+    let readonlym = PyModule::new(py, "readonly")?;
+    readonly::register(py, &readonlym)?;
+    m.add_submodule(&readonlym)?;
+
+    let brokenrenamem = PyModule::new(py, "brokenrename")?;
+    brokenrename::register(py, &brokenrenamem)?;
+    m.add_submodule(&brokenrenamem)?;
+
+    let fakevfatm = PyModule::new(py, "fakevfat")?;
+    fakevfat::register(py, &fakevfatm)?;
+    m.add_submodule(&fakevfatm)?;
+
+    let fakenfsm = PyModule::new(py, "fakenfs")?;
+    fakenfs::register(py, &fakenfsm)?;
+    m.add_submodule(&fakenfsm)?;
+
+    let pathfilterm = PyModule::new(py, "pathfilter")?;
+    pathfilter::register(py, &pathfilterm)?;
+    m.add_submodule(&pathfilterm)?;
+
+    let memorym = PyModule::new(py, "memory")?;
+    memory::register(py, &memorym)?;
+    m.add_submodule(&memorym)?;
+
+    #[cfg(feature = "gio")]
+    let giom = {
+        let giom = PyModule::new(py, "gio")?;
+        gio::register(py, &giom)?;
+        m.add_submodule(&giom)?;
+        giom
+    };
+
     // PyO3 submodule hack for proper import support
     let sys = py.import("sys")?;
     let modules = sys.getattr("modules")?;
@@ -1256,6 +1309,15 @@ fn _transport_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     modules.set_item(format!("{}.local", module_name), &localm)?;
     modules.set_item(format!("{}.sftp", module_name), &sftpm)?;
     modules.set_item(format!("{}.urlutils", module_name), &urlutilsm)?;
+    modules.set_item(format!("{}.unlistable", module_name), &unlistablem)?;
+    modules.set_item(format!("{}.readonly", module_name), &readonlym)?;
+    modules.set_item(format!("{}.brokenrename", module_name), &brokenrenamem)?;
+    modules.set_item(format!("{}.fakevfat", module_name), &fakevfatm)?;
+    modules.set_item(format!("{}.fakenfs", module_name), &fakenfsm)?;
+    modules.set_item(format!("{}.pathfilter", module_name), &pathfilterm)?;
+    modules.set_item(format!("{}.memory", module_name), &memorym)?;
+    #[cfg(feature = "gio")]
+    modules.set_item(format!("{}.gio", module_name), &giom)?;
 
     Ok(())
 }

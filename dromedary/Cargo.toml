@@ -23,10 +23,13 @@ log = { workspace = true }
 libc = "0.2"
 regex = "1.5.4"
 percent-encoding = "2.1.0"
+gio = { version = "0.22", optional = true }
+glib = { version = "0.22", optional = true }
 
 [features]
 default = ["pyo3"]
 pyo3 = ["dep:pyo3", "dep:pyo3-filelike"]
+gio = ["dep:gio", "dep:glib"]
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["fs", "uio"] }

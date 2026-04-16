@@ -24,6 +24,7 @@ pub enum Error {
     InvalidWin32Path(String),
     UrlTooShort(String),
     PathNotChild(String, String),
+    InvalidUrlPort(String, String),
 }
 
 type Result<K> = std::result::Result<K, Error>;
@@ -791,4 +792,160 @@ pub fn file_relpath(base: &str, path: &str) -> Result<String> {
         relpath.unwrap().as_os_str().as_encoded_bytes(),
         None,
     ))
+}
+
+/// Run the URL_HEX_ESCAPES_RE pass over a path, decoding "safe" hex
+/// escapes (alphanumerics + `-._~`) and uppercasing the rest. Mirrors
+/// the `_url_hex_escapes_re.sub(_unescape_safe_chars, ...)` used by the
+/// Python URL.__init__.
+pub fn normalize_quoted_path(path: &str) -> String {
+    URL_HEX_ESCAPES_RE
+        .replace_all(path, unescape_safe_chars)
+        .to_string()
+}
+
+/// Decoded URL components, mirroring dromedary.urlutils.URL.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParsedUrl {
+    pub scheme: String,
+    pub quoted_user: Option<String>,
+    pub quoted_password: Option<String>,
+    pub quoted_host: String,
+    pub port: Option<u16>,
+    pub quoted_path: String,
+}
+
+/// Split a URL into (scheme, netloc, path), matching urlparse.urlparse
+/// with `allow_fragments=False`. The path includes the leading `/`.
+fn split_scheme_netloc_path(url: &str) -> (String, String, String) {
+    // Find scheme: characters up to the first ':' followed by '//'.
+    let scheme_end = url.find(':');
+    let (scheme, rest) = match scheme_end {
+        Some(i) if url[i + 1..].starts_with("//") => (url[..i].to_string(), &url[i + 3..]),
+        _ => return (String::new(), String::new(), url.to_string()),
+    };
+    // After ://, netloc runs up to the next '/' (or end).
+    match rest.find('/') {
+        Some(j) => (scheme, rest[..j].to_string(), rest[j..].to_string()),
+        None => (scheme, rest.to_string(), String::new()),
+    }
+}
+
+/// Parse a URL into its quoted components. Mirrors
+/// dromedary.urlutils.URL.from_string and parse_url. Quoted forms are
+/// preserved verbatim — no percent decoding is done here.
+pub fn parse_url(url: &str) -> Result<ParsedUrl> {
+    let (scheme, netloc, path) = split_scheme_netloc_path(url);
+
+    // Pull out user[:password]@ if present.
+    let (user, password, host_part) = if let Some(at) = netloc.rfind('@') {
+        let user_part = &netloc[..at];
+        let host_part = &netloc[at + 1..];
+        let (u, p) = match user_part.find(':') {
+            Some(c) => (&user_part[..c], Some(&user_part[c + 1..])),
+            None => (user_part, None),
+        };
+        (Some(u.to_string()), p.map(|s| s.to_string()), host_part)
+    } else {
+        (None, None, netloc.as_str())
+    };
+
+    // Extract port if there's a `:` in the host portion AND the host
+    // isn't a bracketed IPv6 literal (which itself contains colons).
+    let mut host = host_part.to_string();
+    let mut port: Option<u16> = None;
+    let bracketed = host.starts_with('[') && host.ends_with(']');
+    if host.contains(':') && !bracketed {
+        if let Some(c) = host.rfind(':') {
+            let port_str = host[c + 1..].to_string();
+            host.truncate(c);
+            if !port_str.is_empty() {
+                port = Some(
+                    port_str
+                        .parse::<u16>()
+                        .map_err(|_| Error::InvalidUrlPort(url.to_string(), port_str.clone()))?,
+                );
+            }
+        }
+    }
+
+    // Strip the brackets off an IPv6 literal once port handling is done.
+    if host.starts_with('[') && host.ends_with(']') && host.len() >= 2 {
+        host = host[1..host.len() - 1].to_string();
+    }
+
+    Ok(ParsedUrl {
+        scheme,
+        quoted_user: user,
+        quoted_password: password,
+        quoted_host: host,
+        port,
+        quoted_path: path,
+    })
+}
+
+#[cfg(test)]
+mod parse_url_tests {
+    use super::*;
+
+    #[test]
+    fn simple() {
+        let p = parse_url("http://example.com:80/one").unwrap();
+        assert_eq!(p.scheme, "http");
+        assert_eq!(p.quoted_user, None);
+        assert_eq!(p.quoted_password, None);
+        assert_eq!(p.quoted_host, "example.com");
+        assert_eq!(p.port, Some(80));
+        assert_eq!(p.quoted_path, "/one");
+    }
+
+    #[test]
+    fn ipv6() {
+        let p = parse_url("http://[1:2:3::40]/one").unwrap();
+        assert_eq!(p.quoted_host, "1:2:3::40");
+        assert_eq!(p.port, None);
+        assert_eq!(p.quoted_path, "/one");
+    }
+
+    #[test]
+    fn ipv6_with_port() {
+        let p = parse_url("http://[1:2:3::40]:80/one").unwrap();
+        assert_eq!(p.quoted_host, "1:2:3::40");
+        assert_eq!(p.port, Some(80));
+    }
+
+    #[test]
+    fn user_password() {
+        let p = parse_url("http://ro%62ey:h%40t@ex%41mple.com:2222/path").unwrap();
+        assert_eq!(p.quoted_user.as_deref(), Some("ro%62ey"));
+        assert_eq!(p.quoted_password.as_deref(), Some("h%40t"));
+        assert_eq!(p.quoted_host, "ex%41mple.com");
+        assert_eq!(p.port, Some(2222));
+        assert_eq!(p.quoted_path, "/path");
+    }
+
+    #[test]
+    fn empty_port() {
+        let p = parse_url("http://example.com:/one").unwrap();
+        assert_eq!(p.quoted_host, "example.com");
+        assert_eq!(p.port, None);
+    }
+
+    #[test]
+    fn invalid_port() {
+        match parse_url("http://example.com:abc/one") {
+            Err(Error::InvalidUrlPort(_, port_str)) => assert_eq!(port_str, "abc"),
+            other => panic!("expected InvalidUrlPort, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn normalize_quoted_path_unescapes_safe_chars() {
+        // %7E is ~, which is unreserved → unescape to literal.
+        assert_eq!(normalize_quoted_path("/foo%7Ebar"), "/foo~bar");
+        // %40 is @, which is reserved → keep as %40 (uppercased).
+        assert_eq!(normalize_quoted_path("/foo%40bar"), "/foo%40bar");
+        // Lowercase hex → uppercase.
+        assert_eq!(normalize_quoted_path("/foo%2fbar"), "/foo%2Fbar");
+    }
 }

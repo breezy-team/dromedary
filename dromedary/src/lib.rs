@@ -7,6 +7,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::time::UNIX_EPOCH;
 use url::Url;
 
+#[derive(Debug)]
 pub enum Error {
     InProcessTransport,
 
@@ -43,6 +44,8 @@ pub enum Error {
     NotADirectoryError(Option<String>),
 
     DirectoryNotEmptyError(Option<String>),
+
+    ResourceBusy(Option<String>),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -391,7 +394,7 @@ pub trait Transport: std::fmt::Debug + 'static + Send + Sync {
                                 relpath.to_owned(),
                                 offset,
                                 length as u64,
-                                file.position() - offset,
+                                file.position().saturating_sub(offset),
                             )),
                             _ => Err(map_io_err_to_transport_err(err, Some(relpath))),
                         },
@@ -531,6 +534,27 @@ pub fn copy_to<T: Transport + ?Sized>(
 pub trait SmartMedium {}
 
 pub mod local;
+
+pub mod brokenrename;
+
+pub mod chroot;
+
+pub mod decorator;
+
+pub mod fakenfs;
+
+pub mod fakevfat;
+
+#[cfg(feature = "gio")]
+pub mod gio;
+
+pub mod memory;
+
+pub mod pathfilter;
+
+pub mod readonly;
+
+pub mod unlistable;
 
 pub mod osutils;
 

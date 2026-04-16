@@ -42,6 +42,11 @@ import_exception!(dromedary.errors, PathNotChild);
 import_exception!(dromedary.errors, ShortReadvError);
 import_exception!(dromedary.errors, LockContention);
 import_exception!(dromedary.errors, LockFailed);
+import_exception!(dromedary.errors, DirectoryNotEmpty);
+import_exception!(dromedary.errors, NotADirectory);
+import_exception!(dromedary.errors, ResourceBusy);
+import_exception!(dromedary.errors, ReadError);
+import_exception!(dromedary.urlutils, InvalidURL);
 
 struct PySmartMedium(Py<PyAny>);
 
@@ -100,11 +105,12 @@ impl From<PyErr> for Error {
     fn from(e: PyErr) -> Self {
         Python::attach(|py| {
             let arg = |_i| -> Option<String> {
-                let args = e.value(py).getattr("args").unwrap();
-                match args.get_item(0) {
-                    Ok(a) if a.is_none() => None,
-                    Ok(a) => Some(a.extract::<String>().unwrap()),
-                    Err(_) => None,
+                let args = e.value(py).getattr("args").ok()?;
+                let item = args.get_item(0).ok()?;
+                if item.is_none() {
+                    None
+                } else {
+                    item.extract::<String>().ok()
                 }
             };
             if e.is_instance_of::<InProcessTransport>(py) {
@@ -127,6 +133,18 @@ impl From<PyErr> for Error {
                 Error::PermissionDenied(arg(0))
             } else if e.is_instance_of::<PathNotChild>(py) {
                 Error::PathNotChild
+            } else if e.is_instance_of::<DirectoryNotEmpty>(py) {
+                Error::DirectoryNotEmptyError(arg(0))
+            } else if e.is_instance_of::<NotADirectory>(py) {
+                Error::NotADirectoryError(arg(0))
+            } else if e.is_instance_of::<ResourceBusy>(py) {
+                Error::ResourceBusy(arg(0))
+            } else if e.is_instance_of::<ReadError>(py) {
+                Error::IsADirectoryError(arg(0))
+            } else if e.is_instance_of::<InvalidURL>(py) {
+                Error::UrlutilsError(crate::urlutils::Error::UrlNotAscii(
+                    arg(0).unwrap_or_default(),
+                ))
             } else if e.is_instance_of::<ShortReadvError>(py) {
                 let value = e.value(py);
                 Error::ShortReadvError(
@@ -136,7 +154,11 @@ impl From<PyErr> for Error {
                     value.getattr("actual").unwrap().extract::<u64>().unwrap(),
                 )
             } else {
-                panic!("{}", e.to_string())
+                // Don't panic on unrecognised exception types — funnel them
+                // through Error::Io so the caller sees something useful and
+                // the worker stays alive. New variants should still be added
+                // explicitly above when they have a real semantic mapping.
+                Error::Io(std::io::Error::other(e.to_string()))
             }
         })
     }
@@ -214,9 +236,17 @@ impl Transport for PyTransport {
 
     fn base(&self) -> Url {
         Python::attach(|py| {
-            let obj = self.0.getattr(py, "base").unwrap();
-            let s = obj.extract::<String>(py).unwrap();
-            Url::parse(&s).unwrap()
+            // `.base` is a required attribute on every Transport. If the
+            // wrapped Python object can't produce one we have no choice but
+            // to fall back to a placeholder URL — none of the trait callers
+            // expect this to fail.
+            let url_str = self
+                .0
+                .getattr(py, "base")
+                .ok()
+                .and_then(|obj| obj.extract::<String>(py).ok())
+                .unwrap_or_default();
+            Url::parse(&url_str).unwrap_or_else(|_| Url::parse("file:///").unwrap())
         })
     }
 
@@ -253,7 +283,7 @@ impl Transport for PyTransport {
 
     fn stat(&self, path: &UrlFragment) -> Result<Stat> {
         Python::attach(|py| {
-            let stat_result = self.0.call_method1(py, "stat", (path,)).unwrap();
+            let stat_result = self.0.call_method1(py, "stat", (path,))?;
 
             let mtime = if let Ok(mtime) = stat_result.getattr(py, "mtime") {
                 Some(mtime.extract::<f64>(py)?)
@@ -444,20 +474,20 @@ impl Transport for PyTransport {
     fn recommended_page_size(&self) -> usize {
         Python::attach(|py| {
             self.0
-                .getattr(py, "recommended_page_size")
-                .unwrap()
-                .extract::<usize>(py)
-                .unwrap()
+                .call_method0(py, "recommended_page_size")
+                .ok()
+                .and_then(|obj| obj.extract::<usize>(py).ok())
+                .unwrap_or(4 * 1024)
         })
     }
 
     fn is_readonly(&self) -> bool {
         Python::attach(|py| {
             self.0
-                .getattr(py, "is_readonly")
-                .unwrap()
-                .extract::<bool>(py)
-                .unwrap()
+                .call_method0(py, "is_readonly")
+                .ok()
+                .and_then(|obj| obj.extract::<bool>(py).ok())
+                .unwrap_or(false)
         })
     }
 
@@ -468,30 +498,35 @@ impl Transport for PyTransport {
         adjust_for_latency: bool,
         upper_limit: Option<u64>,
     ) -> Box<dyn Iterator<Item = Result<(u64, Vec<u8>)>> + Send> {
-        let iter = Python::attach(|py| {
-            self.0.call_method1(
+        let iter = Python::attach(|py| -> Result<Py<PyAny>> {
+            let raw = self.0.call_method1(
                 py,
                 "readv",
                 (relpath, offsets, adjust_for_latency, upper_limit),
-            )
+            )?;
+            let it = raw.bind(py).try_iter().map_err(Error::from)?;
+            Ok(it.unbind().into_any())
         });
 
-        if let Err(e) = iter {
-            return Box::new(std::iter::once(Err(Error::from(e))));
-        }
+        let iter = match iter {
+            Ok(i) => i,
+            Err(e) => return Box::new(std::iter::once(Err(e))),
+        };
 
         Box::new(std::iter::from_fn(move || {
             Python::attach(|py| -> Option<Result<(u64, Vec<u8>)>> {
-                let iter = iter.as_ref().unwrap();
                 match iter.call_method0(py, "__next__") {
                     Ok(obj) => {
                         if obj.is_none(py) {
                             None
                         } else {
-                            let (offset, bytes) = obj.extract::<(u64, Vec<u8>)>(py).unwrap();
-                            Some(Ok((offset, bytes)))
+                            match obj.extract::<(u64, Vec<u8>)>(py) {
+                                Ok(pair) => Some(Ok(pair)),
+                                Err(e) => Some(Err(Error::from(e))),
+                            }
                         }
                     }
+                    Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => None,
                     Err(e) => Some(Err(Error::from(e))),
                 }
             })
@@ -556,24 +591,28 @@ impl Transport for PyTransport {
     }
 
     fn iter_files_recursive(&self) -> Box<dyn Iterator<Item = Result<String>>> {
-        let iter = Python::attach(|py| self.0.call_method0(py, "iter_files_recursive"));
+        let iter = Python::attach(|py| -> Result<Py<PyAny>> {
+            let raw = self.0.call_method0(py, "iter_files_recursive")?;
+            let it = raw.bind(py).try_iter().map_err(Error::from)?;
+            Ok(it.unbind().into_any())
+        });
 
-        if let Err(e) = iter {
-            return Box::new(std::iter::once(Err(Error::from(e))));
-        }
+        let iter = match iter {
+            Ok(i) => i,
+            Err(e) => return Box::new(std::iter::once(Err(e))),
+        };
 
         Box::new(std::iter::from_fn(move || {
             Python::attach(|py| -> Option<Result<String>> {
-                let iter = iter.as_ref().unwrap();
                 match iter.call_method0(py, "__next__") {
                     Ok(obj) => {
                         if obj.is_none(py) {
                             None
                         } else {
-                            let path = obj.extract::<String>(py).unwrap();
-                            Some(Ok(path))
+                            Some(obj.extract::<String>(py).map_err(Error::from))
                         }
                     }
+                    Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => None,
                     Err(e) => Some(Err(Error::from(e))),
                 }
             })
@@ -618,7 +657,11 @@ impl Transport for PyTransport {
     }
 
     fn copy_tree_to_transport(&self, _to_transport: &dyn Transport) -> Result<()> {
-        unimplemented!()
+        // TODO(jelmer): bridge copy_tree_to_transport across the Py↔Rust
+        // boundary. The Python side expects a Transport object, but we'd
+        // need to obtain its underlying Py wrapper. For now signal the
+        // caller that this transport can't perform the operation.
+        Err(Error::TransportNotPossible)
     }
 
     fn copy_to(
@@ -627,16 +670,23 @@ impl Transport for PyTransport {
         _to_transport: &dyn Transport,
         _permissions: Option<Permissions>,
     ) -> Result<usize> {
-        unimplemented!()
+        // TODO(jelmer): same blocker as copy_tree_to_transport — the
+        // destination transport isn't readily expressible as a Py object
+        // from inside the Rust adapter.
+        Err(Error::TransportNotPossible)
     }
 
     fn can_roundtrip_unix_modebits(&self) -> bool {
+        // Python convention names this `_can_roundtrip_unix_modebits` (with
+        // a leading underscore) on every transport class; the unprefixed
+        // form does not exist on the Python side. Default to false if the
+        // wrapped object doesn't expose either spelling.
         Python::attach(|py| {
             self.0
-                .getattr(py, "can_roundtrip_unix_modebits")
-                .unwrap()
-                .extract::<bool>(py)
-                .unwrap()
+                .call_method0(py, "_can_roundtrip_unix_modebits")
+                .ok()
+                .and_then(|obj| obj.extract::<bool>(py).ok())
+                .unwrap_or(false)
         })
     }
 
@@ -648,15 +698,21 @@ impl Transport for PyTransport {
     }
 
     fn list_dir(&self, relpath: &UrlFragment) -> Box<dyn Iterator<Item = Result<String>>> {
-        let iter = Python::attach(|py| self.0.call_method1(py, "list_dir", (relpath,)));
+        // Python list_dir may return a list, tuple, or iterator. Coerce via
+        // try_iter so __next__ always works.
+        let iter = Python::attach(|py| -> Result<Py<PyAny>> {
+            let raw = self.0.call_method1(py, "list_dir", (relpath,))?;
+            let it = raw.bind(py).try_iter().map_err(Error::from)?;
+            Ok(it.unbind().into_any())
+        });
 
-        if let Err(e) = iter {
-            return Box::new(std::iter::once(Err(Error::from(e))));
-        }
+        let iter = match iter {
+            Ok(i) => i,
+            Err(e) => return Box::new(std::iter::once(Err(e))),
+        };
 
         Box::new(std::iter::from_fn(move || {
             Python::attach(|py| -> Option<Result<String>> {
-                let iter = iter.as_ref().unwrap();
                 match iter.call_method0(py, "__next__") {
                     Ok(obj) => {
                         if obj.is_none(py) {
@@ -665,6 +721,7 @@ impl Transport for PyTransport {
                             Some(obj.extract::<String>(py).map_err(|e| e.into()))
                         }
                     }
+                    Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => None,
                     Err(e) => Some(Err(e.into())),
                 }
             })
@@ -675,9 +732,9 @@ impl Transport for PyTransport {
         Python::attach(|py| {
             self.0
                 .call_method0(py, "listable")
-                .unwrap()
-                .extract::<bool>(py)
-                .unwrap()
+                .ok()
+                .and_then(|obj| obj.extract::<bool>(py).ok())
+                .unwrap_or(false)
         })
     }
 
@@ -699,11 +756,16 @@ impl Transport for PyTransport {
 
     fn get_smart_medium(&self) -> Result<Box<dyn SmartMedium>> {
         Python::attach(|py| {
-            let obj = self.0.call_method0(py, "get_smart_medium").unwrap();
+            let obj = match self.0.call_method0(py, "get_smart_medium") {
+                Ok(o) => o,
+                Err(e) if e.is_instance_of::<NoSmartMedium>(py) => {
+                    return Err(Error::NoSmartMedium);
+                }
+                Err(e) => return Err(Error::Io(std::io::Error::other(e.to_string()))),
+            };
             if obj.is_none(py) {
                 return Err(Error::NoSmartMedium);
             }
-            let obj = obj.extract::<Py<PyAny>>(py).unwrap();
             let medium = PySmartMedium(obj);
             Ok(Box::new(medium) as Box<dyn SmartMedium>)
         })
