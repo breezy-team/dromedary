@@ -60,7 +60,6 @@ impl Transport for FakeVfatTransport {
     crate::fwd_lock_read!(inner);
     crate::fwd_lock_write!(inner);
     crate::fwd_local_abspath!(inner);
-    crate::fwd_get_smart_medium!(inner);
     crate::fwd_copy!(inner);
 
     fn base(&self) -> Url {

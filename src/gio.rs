@@ -15,9 +15,7 @@
 
 use crate::lock::{Lock, LockError};
 use crate::urlutils::escape;
-use crate::{
-    Error, FileKind, ReadStream, Result, SmartMedium, Stat, Transport, UrlFragment, WriteStream,
-};
+use crate::{Error, FileKind, ReadStream, Result, Stat, Transport, UrlFragment, WriteStream};
 use ::gio::prelude::*;
 use ::gio::{FileCopyFlags, FileQueryInfoFlags, IOErrorEnum};
 use std::collections::HashMap;
@@ -585,10 +583,6 @@ impl Transport for GioTransport {
 
     fn local_abspath(&self, relpath: &UrlFragment) -> Result<std::path::PathBuf> {
         Err(Error::NotLocalUrl(format!("{}{}", self.base, relpath)))
-    }
-
-    fn get_smart_medium(&self) -> Result<Box<dyn SmartMedium>> {
-        Err(Error::NoSmartMedium)
     }
 
     fn listable(&self) -> bool {

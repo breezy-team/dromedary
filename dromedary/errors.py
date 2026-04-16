@@ -183,19 +183,6 @@ class NotLocalUrl(TransportError):
         TransportError.__init__(self)
 
 
-class NoSmartMedium(TransportError):
-    """Raised when a transport cannot tunnel the smart protocol."""
-
-    _fmt = "The transport '%(transport)s' cannot tunnel the smart protocol."
-
-    internal_error = True
-
-    def __init__(self, transport):
-        """Initialize with the transport that lacks smart-protocol support."""
-        self.transport = transport
-        TransportError.__init__(self)
-
-
 class DependencyNotPresent(TransportError):
     """A required dependency for a transport is not present."""
 

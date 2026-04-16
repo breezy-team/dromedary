@@ -743,16 +743,6 @@ class Transport:
         finally:
             f.close()
 
-    def get_smart_medium(self):
-        """Return a smart client medium for this transport if possible.
-
-        A smart medium doesn't imply the presence of a smart server: it implies
-        that the smart protocol can be tunnelled via this transport.
-
-        :raises errors.NoSmartMedium: if no smart server medium is available.
-        """
-        raise errors.NoSmartMedium(self)
-
     def readv(self, relpath, offsets, adjust_for_latency=False, upper_limit=None):
         """Get parts of the file at the given relative path.
 

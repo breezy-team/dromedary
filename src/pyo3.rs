@@ -1,6 +1,5 @@
 use crate::{
-    Error, Lock, LockError, ReadStream, Result, SmartMedium, Stat, Transport, Url, UrlFragment,
-    WriteStream,
+    Error, Lock, LockError, ReadStream, Result, Stat, Transport, Url, UrlFragment, WriteStream,
 };
 use pyo3::import_exception;
 use pyo3::prelude::*;
@@ -30,7 +29,6 @@ fn perms_to_py_mode(perms: Option<&Permissions>) -> Option<u32> {
 }
 
 import_exception!(dromedary.errors, TransportError);
-import_exception!(dromedary.errors, NoSmartMedium);
 import_exception!(dromedary.errors, InProcessTransport);
 import_exception!(dromedary.errors, NotLocalUrl);
 import_exception!(dromedary.errors, NoSuchFile);
@@ -47,10 +45,6 @@ import_exception!(dromedary.errors, NotADirectory);
 import_exception!(dromedary.errors, ResourceBusy);
 import_exception!(dromedary.errors, ReadError);
 import_exception!(dromedary.urlutils, InvalidURL);
-
-struct PySmartMedium(Py<PyAny>);
-
-impl SmartMedium for PySmartMedium {}
 
 pub struct PyTransport(Py<PyAny>);
 
@@ -751,23 +745,6 @@ impl Transport for PyTransport {
             let obj = self.0.call_method1(py, "lock_read", (relpath,))?;
             let file: Box<dyn Lock + Send + Sync> = Box::new(PyLock(obj));
             Ok(file)
-        })
-    }
-
-    fn get_smart_medium(&self) -> Result<Box<dyn SmartMedium>> {
-        Python::attach(|py| {
-            let obj = match self.0.call_method0(py, "get_smart_medium") {
-                Ok(o) => o,
-                Err(e) if e.is_instance_of::<NoSmartMedium>(py) => {
-                    return Err(Error::NoSmartMedium);
-                }
-                Err(e) => return Err(Error::Io(std::io::Error::other(e.to_string()))),
-            };
-            if obj.is_none(py) {
-                return Err(Error::NoSmartMedium);
-            }
-            let medium = PySmartMedium(obj);
-            Ok(Box::new(medium) as Box<dyn SmartMedium>)
         })
     }
 

@@ -303,14 +303,6 @@ macro_rules! fwd_local_abspath {
     };
 }
 #[macro_export]
-macro_rules! fwd_get_smart_medium {
-    ($field:ident) => {
-        fn get_smart_medium(&self) -> $crate::Result<Box<dyn $crate::SmartMedium>> {
-            self.$field.get_smart_medium()
-        }
-    };
-}
-#[macro_export]
 macro_rules! fwd_copy {
     ($field:ident) => {
         fn copy(
@@ -359,7 +351,6 @@ macro_rules! fwd_all {
         $crate::fwd_lock_read!($field);
         $crate::fwd_lock_write!($field);
         $crate::fwd_local_abspath!($field);
-        $crate::fwd_get_smart_medium!($field);
         $crate::fwd_copy!($field);
     };
 }

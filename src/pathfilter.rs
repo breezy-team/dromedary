@@ -7,7 +7,7 @@
 
 use crate::lock::Lock;
 use crate::urlutils::combine_paths;
-use crate::{Error, ReadStream, Result, SmartMedium, Stat, Transport, UrlFragment, WriteStream};
+use crate::{Error, ReadStream, Result, Stat, Transport, UrlFragment, WriteStream};
 use std::collections::HashMap;
 use std::fs::Permissions;
 use url::Url;
@@ -249,10 +249,6 @@ impl Transport for PathFilteringTransport {
 
     fn local_abspath(&self, relpath: &UrlFragment) -> Result<std::path::PathBuf> {
         self.backing.local_abspath(&self.filter(relpath)?)
-    }
-
-    fn get_smart_medium(&self) -> Result<Box<dyn SmartMedium>> {
-        self.backing.get_smart_medium()
     }
 
     fn copy(&self, rel_from: &UrlFragment, rel_to: &UrlFragment) -> Result<()> {

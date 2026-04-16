@@ -6,8 +6,8 @@
 use crate::lock::{Lock, LockError};
 use crate::urlutils::{escape, unescape};
 use crate::{
-    map_io_err_to_transport_err, Error, FileKind, ReadStream, Result, SmartMedium, Stat, Transport,
-    UrlFragment, WriteStream,
+    map_io_err_to_transport_err, Error, FileKind, ReadStream, Result, Stat, Transport, UrlFragment,
+    WriteStream,
 };
 use std::collections::HashMap;
 use std::fs::Permissions;
@@ -640,10 +640,6 @@ impl Transport for MemoryTransport {
 
     fn local_abspath(&self, relpath: &UrlFragment) -> Result<std::path::PathBuf> {
         Err(Error::NotLocalUrl(format!("{}{}", self.base, relpath)))
-    }
-
-    fn get_smart_medium(&self) -> Result<Box<dyn SmartMedium>> {
-        Err(Error::NoSmartMedium)
     }
 
     fn copy(&self, rel_from: &UrlFragment, rel_to: &UrlFragment) -> Result<()> {
