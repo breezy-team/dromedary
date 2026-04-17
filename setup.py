@@ -27,7 +27,7 @@ if os.environ.get("DROMEDARY_GIO"):
 rust_extensions = [
     RustExtension(
         "dromedary._transport_rs",
-        "dromedary/_transport_rs/Cargo.toml",
+        "_transport_rs/Cargo.toml",
         binding=Binding.PyO3,
         features=rust_features,
     ),
