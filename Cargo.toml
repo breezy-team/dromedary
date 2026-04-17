@@ -1,8 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-    "dromedary",
-    "dromedary/_transport_rs",
+    "_transport_rs",
 ]
 
 [workspace.package]
@@ -14,3 +13,39 @@ pyo3 = "0.28"
 pyo3-filelike = "0.5.2"
 url = "2"
 log = "0.4"
+
+[package]
+name = "dromedary"
+version = { workspace = true }
+edition = "2018"
+description = "Transport layer for Breezy"
+license = "GPL-2.0+"
+repository = "https://github.com/breezy-team/dromedary"
+homepage = "https://www.breezy-vcs.org/"
+documentation = "https://www.breezy-vcs.org/doc/"
+authors = [ "Martin Packman <gzlist@googlemail.com>", "Jelmer Vernooij <jelmer@jelmer.uk>"]
+
+[lib]
+
+[dependencies]
+url = { workspace = true }
+tempfile = "3"
+pyo3 = { workspace = true, optional = true }
+pyo3-filelike = { workspace = true, optional = true }
+path-clean = "1"
+walkdir = "2.3"
+lazy_static = "1"
+log = { workspace = true }
+libc = "0.2"
+regex = "1.5.4"
+percent-encoding = "2.1.0"
+gio = { version = "0.22", optional = true }
+glib = { version = "0.22", optional = true }
+
+[features]
+default = ["pyo3"]
+pyo3 = ["dep:pyo3", "dep:pyo3-filelike"]
+gio = ["dep:gio", "dep:glib"]
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["fs", "uio"] }
