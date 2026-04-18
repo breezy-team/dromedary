@@ -843,6 +843,12 @@ class TestLocalTransports(tests.TestCase):
         t = transport.get_transport_from_path(here)
         self.assertEqual(t.local_abspath(""), here)
 
+    def test_from_abspath(self):
+        here = osutils.abspath(".")
+        t = local.LocalTransport.from_abspath(here)
+        self.assertIsInstance(t, local.LocalTransport)
+        self.assertEqual(t.base, urlutils.local_path_to_url(here) + "/")
+
 
 class TestLocalTransportMutation(tests.TestCaseInTempDir):
     def test_local_transport_mkdir(self):

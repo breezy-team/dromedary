@@ -883,6 +883,17 @@ impl LocalTransport {
         ))
     }
 
+    #[pyo3(signature = (abspath,))]
+    #[classmethod]
+    fn from_abspath<'a>(cls: &'a Bound<'a, PyType>, abspath: &'a str) -> PyResult<Bound<'a, Self>> {
+        let ret = dromedary::local::LocalTransport::from_abspath(Path::new(abspath))
+            .map_err(|e| map_transport_err_to_py_err(e, None, Some(abspath)))?;
+
+        let init = PyClassInitializer::from(Transport(Box::new(ret)));
+        let init = init.add_subclass(Self {});
+        Bound::new(cls.py(), init)
+    }
+
     #[pyo3(signature = (offset=None))]
     fn clone<'a>(
         slf: PyRef<'a, Self>,

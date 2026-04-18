@@ -69,6 +69,13 @@ impl LocalTransport {
         Ok(LocalTransport { base, path })
     }
 
+    pub fn from_abspath(path: &Path) -> Result<Self> {
+        let url = crate::urlutils::local_path_to_url(path).map_err(|e| {
+            map_io_err_to_transport_err(e, Some(path.to_path_buf().to_str().unwrap()))
+        })?;
+        LocalTransport::new(&url)
+    }
+
     fn _abspath(&self, relative_reference: &str) -> Result<PathBuf> {
         if relative_reference == "." || relative_reference.is_empty() {
             Ok(self.path.clone())
