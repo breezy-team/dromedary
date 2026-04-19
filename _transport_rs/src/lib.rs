@@ -1232,6 +1232,7 @@ mod fakenfs;
 mod fakevfat;
 #[cfg(feature = "gio")]
 mod gio;
+mod http;
 mod memory;
 mod pathfilter;
 mod readonly;
@@ -1292,6 +1293,10 @@ fn _transport_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     memory::register(py, &memorym)?;
     m.add_submodule(&memorym)?;
 
+    let httpm = PyModule::new(py, "http")?;
+    http::register(py, &httpm)?;
+    m.add_submodule(&httpm)?;
+
     #[cfg(feature = "gio")]
     let giom = {
         let giom = PyModule::new(py, "gio")?;
@@ -1316,6 +1321,7 @@ fn _transport_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     modules.set_item(format!("{}.fakenfs", module_name), &fakenfsm)?;
     modules.set_item(format!("{}.pathfilter", module_name), &pathfilterm)?;
     modules.set_item(format!("{}.memory", module_name), &memorym)?;
+    modules.set_item(format!("{}.http", module_name), &httpm)?;
     #[cfg(feature = "gio")]
     modules.set_item(format!("{}.gio", module_name), &giom)?;
 

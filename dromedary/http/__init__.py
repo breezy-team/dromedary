@@ -21,10 +21,11 @@ There are separate implementation modules for each http client implementation.
 
 DEBUG = 0
 
-import os
 import sys
 
 from dromedary.version import version_string as dromedary_version
+
+from .._transport_rs import http as _http_rs
 
 _user_agent_prefix = f"Dromedary/{dromedary_version}"
 
@@ -74,47 +75,14 @@ def default_user_agent():
     return _user_agent_prefix
 
 
-# Note for packagers: if there is no package providing certs for your platform,
-# the curl project produces http://curl.haxx.se/ca/cacert.pem weekly.
-_ssl_ca_certs_known_locations = [
-    "/etc/ssl/certs/ca-certificates.crt",  # Ubuntu/debian/gentoo
-    "/etc/pki/tls/certs/ca-bundle.crt",  # Fedora/CentOS/RH
-    "/etc/ssl/ca-bundle.pem",  # OpenSuse
-    "/etc/ssl/cert.pem",  # OpenSuse
-    "/usr/local/share/certs/ca-root-nss.crt",  # FreeBSD
-    # XXX: Needs checking, can't trust the interweb ;) -- vila 2012-01-25
-    "/etc/openssl/certs/ca-certificates.crt",  # Solaris
-]
+# Known CA bundle locations. Exported for compatibility; the authoritative
+# list lives in the Rust `dromedary::http` module.
+_ssl_ca_certs_known_locations = list(_http_rs.SSL_CA_CERTS_KNOWN_LOCATIONS)
 
 
 def default_ca_certs():
-    """Get the default path to CA certificates for SSL verification.
-
-    Searches for CA certificate bundles in platform-specific locations.
-    On Windows, looks for cacert.pem in the executable's directory.
-    On other platforms, searches a list of known locations and returns
-    the first existing path.
-
-    Returns:
-        str: Path to the CA certificate bundle. If no bundle is found,
-            returns the first known location as a default.
-    """
-    if sys.platform == "win32":
-        return os.path.join(os.path.dirname(sys.executable), "cacert.pem")
-    elif sys.platform == "darwin":
-        # FIXME: Needs some default value for osx, waiting for osx installers
-        # guys feedback -- vila 2012-01-25
-        pass
-    else:
-        # Try known locations for friendly OSes providing the root certificates
-        # without making them hard to use for any https client.
-        for path in _ssl_ca_certs_known_locations:
-            if os.path.exists(path):
-                # First found wins
-                return path
-    # A default path that makes sense and will be mentioned in the error
-    # presented to the user, even if not correct for all platforms
-    return _ssl_ca_certs_known_locations[0]
+    """Get the default path to CA certificates for SSL verification."""
+    return _http_rs.default_ca_certs()
 
 
 def default_cert_reqs():
