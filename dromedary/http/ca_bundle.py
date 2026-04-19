@@ -14,65 +14,25 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
 
-"""Auto-detect of CA bundle for SSL connections."""
+"""Auto-detect of CA bundle for SSL connections.
 
-import logging
-import os
-import sys
+The lookup logic lives in the Rust `_transport_rs.http` module; this file
+re-exports a thin wrapper so that existing callers keep working.
+"""
 
-logger = logging.getLogger("dromedary.http.ca_bundle")
-
-_ca_path = None
+from .._transport_rs import http as _http_rs
 
 
 def get_ca_path(use_cache=True):
-    """Return location of CA bundle."""
-    global _ca_path
+    """Return location of CA bundle.
 
-    if _ca_path is not None and use_cache:
-        return _ca_path
+    Honours the ``CURL_CA_BUNDLE`` environment variable and, on Windows,
+    searches the application directory and ``PATH`` for ``curl-ca-bundle.crt``.
+    Returns an empty string when no bundle can be located.
+    """
+    return _http_rs.get_ca_path(use_cache)
 
-    # Find CA bundle for SSL
-    # Reimplementation in Python the magic of curl command line tool
-    # from "Details on Server SSL Certificates"
-    # http://curl.haxx.se/docs/sslcerts.html
-    #
-    # 4. If you're using the curl command line tool, you can specify your own
-    #    CA cert path by setting the environment variable CURL_CA_BUNDLE to the
-    #    path of your choice.
-    #
-    #    If you're using the curl command line tool on Windows, curl will
-    #    search for a CA cert file named "curl-ca-bundle.crt" in these
-    #    directories and in this order:
-    #      1. application's directory
-    #      2. current working directory
-    #      3. Windows System directory (e.g. C:\windows\system32)
-    #      4. Windows Directory (e.g. C:\windows)
-    #      5. all directories along %PATH%
-    #
-    # NOTES:
-    #   bialix: Windows directories usually listed in PATH env variable
-    #   j-a-meinel: bzr should not look in current working dir
 
-    path = os.environ.get("CURL_CA_BUNDLE")
-    if not path and sys.platform == "win32":
-        dirs = [os.path.realpath(os.path.dirname(sys.argv[0]))]  # app dir
-        paths = os.environ.get("PATH")
-        if paths:
-            # don't include the cwd in the search
-            paths = [i for i in paths.split(os.pathsep) if i not in ("", ".")]
-            dirs.extend(paths)
-        for d in dirs:
-            fname = os.path.join(d, "curl-ca-bundle.crt")
-            if os.path.isfile(fname):
-                path = fname
-                break
-    if path:
-        logger.debug("using CA bundle: %r", path)
-    else:
-        path = ""
-
-    if use_cache:
-        _ca_path = path
-
-    return path
+def _clear_cache():
+    """Clear the cached CA path (for tests)."""
+    _http_rs.clear_ca_path_cache()

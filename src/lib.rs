@@ -542,6 +542,8 @@ pub mod fakevfat;
 #[cfg(feature = "gio")]
 pub mod gio;
 
+pub mod http;
+
 pub mod memory;
 
 pub mod pathfilter;
