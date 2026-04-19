@@ -47,23 +47,15 @@ def _iter_test_cases(suite_or_case):
 def multiply_tests(tests, scenarios, result):
     """Multiply tests by scenarios, adding them to result.
 
-    `tests` may be a TestSuite (which can contain nested suites) or an
-    iterable of TestCase instances; suites are flattened before fan-out.
+    Uses ``testscenarios.apply_scenarios`` to produce the per-scenario
+    clones with properly-suffixed test ids.
     """
+    from testscenarios.scenarios import apply_scenarios
+
     for test in _iter_test_cases(tests):
-        for scenario_id, scenario_attrs in scenarios:
-            new_test = clone_test(test, scenario_id)
-            for name, value in scenario_attrs.items():
-                setattr(new_test, name, value)
-            result.addTest(new_test)
+        for scenario_test in apply_scenarios(scenarios, test):
+            result.addTest(scenario_test)
     return result
-
-
-def clone_test(test, new_id):
-    """Clone a test case with a new id suffix."""
-    new_test = test.__class__(test._testMethodName)
-    new_test._scenario_suffix = "(" + new_id + ")"
-    return new_test
 
 
 class Feature:
