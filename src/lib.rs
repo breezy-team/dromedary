@@ -11,8 +11,6 @@ use url::Url;
 pub enum Error {
     InProcessTransport,
 
-    NoSmartMedium,
-
     NotLocalUrl(String),
 
     NoSuchFile(Option<String>),
@@ -508,8 +506,6 @@ pub trait Transport: std::fmt::Debug + 'static + Send + Sync {
 
     fn local_abspath(&self, relpath: &UrlFragment) -> Result<std::path::PathBuf>;
 
-    fn get_smart_medium(&self) -> Result<Box<dyn SmartMedium>>;
-
     fn copy(&self, rel_from: &UrlFragment, rel_to: &UrlFragment) -> Result<()>;
 }
 
@@ -530,8 +526,6 @@ pub fn copy_to<T: Transport + ?Sized>(
     })?;
     Ok(count)
 }
-
-pub trait SmartMedium {}
 
 pub mod local;
 

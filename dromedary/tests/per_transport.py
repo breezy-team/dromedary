@@ -1713,19 +1713,6 @@ class TransportTests(TestTransportImplementation):
                 [(0, b"b"), (2, b"d")], list(t.readv("foo", ((0, 1), (2, 1))))
             )
 
-    def test_get_smart_medium(self):
-        """All transports must either give a smart medium, or know they can't."""
-        transport = self.get_transport()
-        try:
-            transport.get_smart_medium()
-        except errors.NoSmartMedium:
-            # as long as we got it we're fine
-            pass
-        # dromedary doesn't know about the breezy SmartClientMedium type, so
-        # we just check that get_smart_medium either returns something or
-        # raises NoSmartMedium. Subclasses (e.g. in breezy) override this to
-        # also check the medium implementation type.
-
     def test_readv_short_read(self):
         transport = self.get_transport()
         if transport.is_readonly():
@@ -1826,11 +1813,7 @@ class TransportTests(TestTransportImplementation):
         t = self.get_transport()
         self.assertEqual([], log)
         t.has("non-existant")
-        # Smart-protocol transports (e.g. breezy's RemoteTransport) fire the
-        # hook on their smart medium rather than on the transport itself.
-        if hasattr(t, "get_smart_medium"):
-            self.assertEqual([t.get_smart_medium()], log)
-        elif isinstance(t, ConnectedTransport):
+        if isinstance(t, ConnectedTransport):
             self.assertEqual([t], log)
         else:
             self.assertEqual([], log)
@@ -1846,9 +1829,7 @@ class TransportTests(TestTransportImplementation):
         t1.has("x")
         t2.has("x")
         t3.has("x")
-        if hasattr(t1, "get_smart_medium"):
-            self.assertEqual([t.get_smart_medium() for t in [t1, t3]], log)
-        elif isinstance(t1, ConnectedTransport):
+        if isinstance(t1, ConnectedTransport):
             self.assertEqual([t1, t3], log)
         else:
             self.assertEqual([], log)

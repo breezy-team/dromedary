@@ -4,7 +4,7 @@
 //! forwarding read-only operations unchanged.
 
 use crate::lock::Lock;
-use crate::{Error, ReadStream, Result, SmartMedium, Stat, Transport, UrlFragment, WriteStream};
+use crate::{Error, ReadStream, Result, Stat, Transport, UrlFragment, WriteStream};
 use std::collections::HashMap;
 use std::fs::Permissions;
 use url::Url;
@@ -173,10 +173,6 @@ impl Transport for ReadonlyTransport {
 
     fn local_abspath(&self, relpath: &UrlFragment) -> Result<std::path::PathBuf> {
         self.decorated.local_abspath(relpath)
-    }
-
-    fn get_smart_medium(&self) -> Result<Box<dyn SmartMedium>> {
-        Err(Error::NoSmartMedium)
     }
 
     fn copy(&self, _rel_from: &UrlFragment, _rel_to: &UrlFragment) -> Result<()> {

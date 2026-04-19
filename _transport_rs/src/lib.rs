@@ -15,7 +15,6 @@ use std::path::{Path, PathBuf};
 use url::Url;
 
 import_exception!(dromedary.errors, TransportError);
-import_exception!(dromedary.errors, NoSmartMedium);
 import_exception!(dromedary.errors, NotLocalUrl);
 import_exception!(dromedary.errors, InProcessTransport);
 import_exception!(dromedary.errors, NoSuchFile);
@@ -38,7 +37,7 @@ pub(crate) struct Transport(pub(crate) Box<dyn TransportTrait>);
 
 pub(crate) fn map_transport_err_to_py_err(
     e: Error,
-    t: Option<Py<PyAny>>,
+    _t: Option<Py<PyAny>>,
     p: Option<&UrlFragment>,
 ) -> PyErr {
     let pick_path = |n: Option<String>| {
@@ -51,7 +50,6 @@ pub(crate) fn map_transport_err_to_py_err(
     match e {
         Error::InProcessTransport => InProcessTransport::new_err(()),
         Error::NotLocalUrl(url) => NotLocalUrl::new_err((url,)),
-        Error::NoSmartMedium => NoSmartMedium::new_err((t,)),
         Error::NoSuchFile(name) => NoSuchFile::new_err((pick_path(name),)),
         Error::FileExists(name) => FileExists::new_err((pick_path(name),)),
         Error::TransportNotPossible => TransportNotPossible::new_err(()),
@@ -394,15 +392,6 @@ impl Transport {
             }
         })?;
         Bound::new(py, PyBufReadStream::new(ret, Path::new(path)))
-    }
-
-    fn get_smart_medium(slf: &Bound<Self>, py: Python) -> PyResult<Py<PyAny>> {
-        slf.borrow()
-            .0
-            .get_smart_medium()
-            .map_err(|e| Transport::map_to_py_err(slf.borrow(), py, e, None))?;
-        // TODO(jelmer)
-        Ok(py.None())
     }
 
     fn stat<'a>(&self, py: Python<'a>, path: &str) -> PyResult<Bound<'a, PyStat>> {

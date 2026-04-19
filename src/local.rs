@@ -1,8 +1,8 @@
 use crate::lock::LockError;
 use crate::urlutils::{escape, unescape};
 use crate::{
-    map_io_err_to_transport_err, Error, Lock, ReadStream, Result, SmartMedium, Stat, Transport,
-    UrlFragment, WriteStream,
+    map_io_err_to_transport_err, Error, Lock, ReadStream, Result, Stat, Transport, UrlFragment,
+    WriteStream,
 };
 
 use std::collections::HashMap;
@@ -458,10 +458,6 @@ impl Transport for LocalTransport {
 
     fn listable(&self) -> bool {
         true
-    }
-
-    fn get_smart_medium(&self) -> Result<Box<dyn SmartMedium>> {
-        Err(Error::NoSmartMedium)
     }
 
     fn lock_read(&self, relpath: &UrlFragment) -> Result<Box<dyn Lock + Send + Sync>> {
