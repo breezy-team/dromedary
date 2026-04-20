@@ -85,6 +85,27 @@ impl From<crate::urlutils::Error> for Error {
     }
 }
 
+/// Compute a relative path for `abspath` against `base`.
+///
+/// Mirrors the Python `Transport.relpath` base-class implementation:
+/// accepts `base` with or without its trailing slash, and strips any
+/// trailing slash from the returned relpath. Transports whose URL
+/// scheme doesn't need special handling can call this directly from
+/// their `relpath` impl.
+pub fn relpath_against_base(base: &Url, abspath: &Url) -> Result<String> {
+    let base_str = base.as_str();
+    let target = abspath.as_str();
+    // Accept the exact base, or the base with its trailing slash stripped.
+    let base_no_slash = base_str.strip_suffix('/').unwrap_or(base_str);
+    if target == base_no_slash {
+        return Ok(String::new());
+    }
+    match target.strip_prefix(base_str) {
+        Some(rest) => Ok(rest.trim_end_matches('/').to_string()),
+        None => Err(Error::PathNotChild),
+    }
+}
+
 /// Coarse file kind. Mirrors `std::fs::FileType` but is cross-platform and
 /// sidesteps the Unix-only mode-bit parsing the old implementation relied on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -434,7 +455,22 @@ pub trait Transport: std::fmt::Debug + 'static + Send + Sync {
 
     fn delete_tree(&self, relpath: &UrlFragment) -> Result<()>;
 
-    fn r#move(&self, rel_from: &UrlFragment, rel_to: &UrlFragment) -> Result<()>;
+    /// Move an entry, overwriting the destination if it exists.
+    ///
+    /// Mirrors Python's Transport.move default: delegates to copy/copy_tree
+    /// then delete/delete_tree, which handles overwrite via copy's
+    /// replace-on-write semantics. Transports with a native atomic move
+    /// should override.
+    fn r#move(&self, rel_from: &UrlFragment, rel_to: &UrlFragment) -> Result<()> {
+        if self.stat(rel_from)?.is_dir() {
+            self.copy_tree(rel_from, rel_to)?;
+            self.delete_tree(rel_from)?;
+        } else {
+            self.copy(rel_from, rel_to)?;
+            self.delete(rel_from)?;
+        }
+        Ok(())
+    }
 
     fn copy_tree(&self, from_relpath: &UrlFragment, to_relpath: &UrlFragment) -> Result<()> {
         let source = self.clone(Some(from_relpath))?;
@@ -543,6 +579,8 @@ pub mod fakevfat;
 pub mod gio;
 
 pub mod http;
+
+pub mod log;
 
 pub mod memory;
 

@@ -64,14 +64,67 @@ class TestTransportLog(TestCaseWithMemoryTransport):
         next(result)
 
         result = logging_transport.readv("foo", [(0, 10)])
-        self.assertEqual(list(result), [(0, "abcdefghij")])
+        self.assertEqual(list(result), [(0, b"abcdefghij")])
+
+    def test_url_prefix(self):
+        self.assertEqual("log+", TransportLogDecorator._get_url_prefix())
+
+    def test_decorated_attribute(self):
+        base_transport = self.get_transport("")
+        logging_transport = transport.get_transport_from_url(
+            "log+" + base_transport.base
+        )
+        self.assertEqual(base_transport.base, logging_transport._decorated.base)
+
+    def test_log_has_true_and_false(self):
+        base_transport = self.get_transport("")
+        logging_transport = transport.get_transport_from_url(
+            "log+" + base_transport.base
+        )
+        base_transport.mkdir("exists")
+        self.assertTrue(logging_transport.has("exists"))
+        self.assertFalse(logging_transport.has("missing"))
+        log = self.get_log()
+        self.assertContainsRe(log, r"has exists")
+        self.assertContainsRe(log, r"has missing")
+        self.assertContainsRe(log, r"--> True")
+        self.assertContainsRe(log, r"--> False")
+
+    def test_log_error_path(self):
+        base_transport = self.get_transport("")
+        logging_transport = transport.get_transport_from_url(
+            "log+" + base_transport.base
+        )
+        from dromedary.errors import NoSuchFile
+
+        self.assertRaises(NoSuchFile, logging_transport.get_bytes, "missing")
+        log = self.get_log()
+        # The error summary should be logged after the call line.
+        self.assertContainsRe(log, r"get missing")
+        self.assertContainsRe(log, r"--> ")
+
+    def test_clone_returns_logged_transport(self):
+        base_transport = self.get_transport("")
+        base_transport.mkdir("sub")
+        logging_transport = transport.get_transport_from_url(
+            "log+" + base_transport.base
+        )
+        cloned = logging_transport.clone("sub")
+        # The cloned handle must still carry the log+ prefix so that it
+        # behaves as a logging decorator rather than the bare inner transport.
+        self.assertTrue(cloned.base.startswith("log+"))
 
 
 class DummyReadvTransport:
     base = "dummy:///"
 
-    def readv(self, filename, offset_length_pairs):
-        yield (0, "abcdefghij")
+    # The Rust-backed decorator forwards the full readv signature, so this
+    # stub accepts the latency/upper_limit arguments as well as the core
+    # (relpath, offsets) pair.
+    def readv(
+        self, filename, offset_length_pairs, adjust_for_latency=False, upper_limit=None
+    ):
+        yield (0, b"abcdefghij")
 
     def abspath(self, path):
         return self.base + path

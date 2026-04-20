@@ -2,10 +2,11 @@ use crate::{map_transport_err_to_py_err, Transport};
 use dromedary::pathfilter::FilterFunc;
 use dromedary::pyo3::PyTransport;
 use pyo3::prelude::*;
+use std::sync::Arc;
 
 fn make_filter_func(filter_py: Option<Py<PyAny>>) -> Option<FilterFunc> {
     let f = filter_py?;
-    Some(Box::new(move |p: &str| -> String {
+    Some(Arc::new(move |p: &str| -> String {
         Python::attach(|py| {
             f.call1(py, (p,))
                 .and_then(|r| r.extract::<String>(py))

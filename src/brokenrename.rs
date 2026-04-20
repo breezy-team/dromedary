@@ -8,21 +8,19 @@ use url::Url;
 
 pub struct BrokenRenameTransport {
     inner: Box<dyn Transport + Send + Sync>,
-    base: Url,
 }
 
 impl BrokenRenameTransport {
     pub const PREFIX: &'static str = "brokenrename+";
 
     pub fn new(inner: Box<dyn Transport + Send + Sync>) -> Self {
-        let base = crate::decorator::prefixed_base(Self::PREFIX, inner.as_ref());
-        Self { inner, base }
+        Self { inner }
     }
 }
 
 impl std::fmt::Debug for BrokenRenameTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "BrokenRenameTransport({})", self.base)
+        write!(f, "BrokenRenameTransport({})", self.base())
     }
 }
 
@@ -34,10 +32,11 @@ impl Transport for BrokenRenameTransport {
     crate::fwd_get!(inner);
     crate::fwd_has!(inner);
     crate::fwd_stat!(inner);
-    crate::fwd_clone!(inner);
-    crate::fwd_abspath!(inner);
-    crate::fwd_relpath!(inner);
+    crate::fwd_decorator_url!(inner, BrokenRenameTransport);
     crate::fwd_put_file!(inner);
+    crate::fwd_put_bytes!(inner);
+    crate::fwd_put_file_non_atomic!(inner);
+    crate::fwd_put_bytes_non_atomic!(inner);
     crate::fwd_mkdir!(inner);
     crate::fwd_delete!(inner);
     crate::fwd_rmdir!(inner);
@@ -58,16 +57,18 @@ impl Transport for BrokenRenameTransport {
     crate::fwd_copy!(inner);
 
     fn base(&self) -> Url {
-        self.base.clone()
+        crate::decorator::prefixed_base(Self::PREFIX, self.inner.as_ref())
     }
 
     fn rename(&self, rel_from: &UrlFragment, rel_to: &UrlFragment) -> Result<()> {
         match self.inner.rename(rel_from, rel_to) {
             Ok(()) => Ok(()),
-            // Absorb clashes silently — that's the whole point.
-            Err(crate::Error::FileExists(_)) | Err(crate::Error::DirectoryNotEmptyError(_)) => {
-                Ok(())
-            }
+            // Absorb file-exists clashes silently — that's the whole point.
+            // Directory-not-empty clashes still propagate: the decorator
+            // simulates a transport that misses file rename conflicts, not
+            // one that also silently succeeds when renaming over populated
+            // directories.
+            Err(crate::Error::FileExists(_)) => Ok(()),
             Err(e) => Err(e),
         }
     }

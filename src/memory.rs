@@ -357,13 +357,7 @@ impl Transport for MemoryTransport {
     }
 
     fn relpath(&self, abspath: &Url) -> Result<String> {
-        let base = self.base.as_str();
-        let target = abspath.as_str();
-        if let Some(rest) = target.strip_prefix(base) {
-            Ok(rest.to_string())
-        } else {
-            Err(Error::PathNotChild)
-        }
+        crate::relpath_against_base(&self.base, abspath)
     }
 
     fn put_file(
@@ -373,6 +367,14 @@ impl Transport for MemoryTransport {
         permissions: Option<Permissions>,
     ) -> Result<u64> {
         let abspath = self.resolve_symlinks(relpath)?;
+        // Validate the parent directory exists *before* reading the stream
+        // so that a failed put_file leaves the reader untouched. This lets
+        // the default put_file_non_atomic retry with the same stream after
+        // creating the missing parent.
+        {
+            let store = self.store.lock().unwrap();
+            Self::check_parent(&store, &abspath)?;
+        }
         let mut buf = Vec::new();
         f.read_to_end(&mut buf)
             .map_err(|e| map_io_err_to_transport_err(e, Some(relpath)))?;
@@ -493,12 +495,23 @@ impl Transport for MemoryTransport {
         Ok(())
     }
 
-    fn set_segment_parameter(&mut self, _key: &str, _value: Option<&str>) -> Result<()> {
-        Err(Error::TransportNotPossible)
+    fn set_segment_parameter(&mut self, key: &str, value: Option<&str>) -> Result<()> {
+        let (raw, mut params) = crate::urlutils::split_segment_parameters(self.base.as_str())?;
+        if let Some(value) = value {
+            params.insert(key, value);
+        } else {
+            params.remove(key);
+        }
+        self.base = Url::parse(&crate::urlutils::join_segment_parameters(raw, &params)?)?;
+        Ok(())
     }
 
     fn get_segment_parameters(&self) -> Result<HashMap<String, String>> {
-        Ok(HashMap::new())
+        let (_, params) = crate::urlutils::split_segment_parameters(self.base.as_str())?;
+        Ok(params
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect())
     }
 
     fn append_file(
@@ -589,10 +602,6 @@ impl Transport for MemoryTransport {
 
     fn delete_tree(&self, _relpath: &UrlFragment) -> Result<()> {
         Err(Error::TransportNotPossible)
-    }
-
-    fn r#move(&self, rel_from: &UrlFragment, rel_to: &UrlFragment) -> Result<()> {
-        self.rename(rel_from, rel_to)
     }
 
     fn list_dir(&self, relpath: &UrlFragment) -> Box<dyn Iterator<Item = Result<String>>> {

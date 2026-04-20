@@ -10,15 +10,13 @@ use url::Url;
 
 pub struct FakeVfatTransport {
     inner: Box<dyn Transport + Send + Sync>,
-    base: Url,
 }
 
 impl FakeVfatTransport {
     pub const PREFIX: &'static str = "vfat+";
 
     pub fn new(inner: Box<dyn Transport + Send + Sync>) -> Self {
-        let base = crate::decorator::prefixed_base(Self::PREFIX, inner.as_ref());
-        Self { inner, base }
+        Self { inner }
     }
 
     fn squash_name(name: &str) -> Result<String> {
@@ -31,7 +29,7 @@ impl FakeVfatTransport {
 
 impl std::fmt::Debug for FakeVfatTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "FakeVfatTransport({})", self.base)
+        write!(f, "FakeVfatTransport({})", self.base())
     }
 }
 
@@ -40,9 +38,7 @@ impl Transport for FakeVfatTransport {
     crate::fwd_is_readonly!(inner);
     crate::fwd_listable!(inner);
     crate::fwd_stat!(inner);
-    crate::fwd_clone!(inner);
-    crate::fwd_abspath!(inner);
-    crate::fwd_relpath!(inner);
+    crate::fwd_decorator_url!(inner, FakeVfatTransport);
     crate::fwd_delete!(inner);
     crate::fwd_rmdir!(inner);
     crate::fwd_rename!(inner);
@@ -63,7 +59,7 @@ impl Transport for FakeVfatTransport {
     crate::fwd_copy!(inner);
 
     fn base(&self) -> Url {
-        self.base.clone()
+        crate::decorator::prefixed_base(Self::PREFIX, self.inner.as_ref())
     }
 
     fn can_roundtrip_unix_modebits(&self) -> bool {
@@ -86,6 +82,50 @@ impl Transport for FakeVfatTransport {
     ) -> Result<u64> {
         self.inner
             .put_file(&Self::squash_name(relpath)?, f, permissions)
+    }
+
+    fn put_bytes(
+        &self,
+        relpath: &UrlFragment,
+        data: &[u8],
+        permissions: Option<Permissions>,
+    ) -> Result<()> {
+        self.inner
+            .put_bytes(&Self::squash_name(relpath)?, data, permissions)
+    }
+
+    fn put_file_non_atomic(
+        &self,
+        relpath: &UrlFragment,
+        f: &mut dyn std::io::Read,
+        permissions: Option<Permissions>,
+        create_parent_dir: Option<bool>,
+        dir_permissions: Option<Permissions>,
+    ) -> Result<()> {
+        self.inner.put_file_non_atomic(
+            &Self::squash_name(relpath)?,
+            f,
+            permissions,
+            create_parent_dir,
+            dir_permissions,
+        )
+    }
+
+    fn put_bytes_non_atomic(
+        &self,
+        relpath: &UrlFragment,
+        data: &[u8],
+        permissions: Option<Permissions>,
+        create_parent_dir: Option<bool>,
+        dir_permissions: Option<Permissions>,
+    ) -> Result<()> {
+        self.inner.put_bytes_non_atomic(
+            &Self::squash_name(relpath)?,
+            data,
+            permissions,
+            create_parent_dir,
+            dir_permissions,
+        )
     }
 
     fn mkdir(&self, relpath: &UrlFragment, _permissions: Option<Permissions>) -> Result<()> {

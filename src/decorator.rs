@@ -16,6 +16,34 @@ pub fn prefixed_base(prefix: &str, inner: &dyn crate::Transport) -> ::url::Url {
     ::url::Url::parse(&url).unwrap_or(inner_base)
 }
 
+/// Compute the decorator-level abspath: inner's abspath with `prefix`
+/// prepended. Mirrors Python's `TransportDecorator.abspath`.
+pub fn prefixed_abspath(
+    prefix: &str,
+    inner: &dyn crate::Transport,
+    relpath: &crate::UrlFragment,
+) -> crate::Result<::url::Url> {
+    let inner_abs = inner.abspath(relpath)?;
+    let prefixed = format!("{}{}", prefix, inner_abs);
+    ::url::Url::parse(&prefixed).map_err(crate::Error::from)
+}
+
+/// Compute the decorator-level relpath: strip `prefix` from `abspath` if
+/// present, then delegate to the inner transport. The Python base class's
+/// default `relpath` implementation works directly against `self.base`
+/// (which already has the prefix), so this matches its observable behaviour
+/// while keeping the inner transport ignorant of the decoration.
+pub fn stripped_relpath(
+    prefix: &str,
+    inner: &dyn crate::Transport,
+    abspath: &::url::Url,
+) -> crate::Result<String> {
+    let as_str = abspath.as_str();
+    let stripped = as_str.strip_prefix(prefix).unwrap_or(as_str);
+    let stripped_url = ::url::Url::parse(stripped).map_err(crate::Error::from)?;
+    inner.relpath(&stripped_url)
+}
+
 #[macro_export]
 macro_rules! fwd_external_url {
     ($field:ident) => {
@@ -112,6 +140,61 @@ macro_rules! fwd_put_file {
             permissions: Option<::std::fs::Permissions>,
         ) -> $crate::Result<u64> {
             self.$field.put_file(relpath, f, permissions)
+        }
+    };
+}
+#[macro_export]
+macro_rules! fwd_put_bytes {
+    ($field:ident) => {
+        fn put_bytes(
+            &self,
+            relpath: &$crate::UrlFragment,
+            data: &[u8],
+            permissions: Option<::std::fs::Permissions>,
+        ) -> $crate::Result<()> {
+            self.$field.put_bytes(relpath, data, permissions)
+        }
+    };
+}
+#[macro_export]
+macro_rules! fwd_put_file_non_atomic {
+    ($field:ident) => {
+        fn put_file_non_atomic(
+            &self,
+            relpath: &$crate::UrlFragment,
+            f: &mut dyn ::std::io::Read,
+            permissions: Option<::std::fs::Permissions>,
+            create_parent_dir: Option<bool>,
+            dir_permissions: Option<::std::fs::Permissions>,
+        ) -> $crate::Result<()> {
+            self.$field.put_file_non_atomic(
+                relpath,
+                f,
+                permissions,
+                create_parent_dir,
+                dir_permissions,
+            )
+        }
+    };
+}
+#[macro_export]
+macro_rules! fwd_put_bytes_non_atomic {
+    ($field:ident) => {
+        fn put_bytes_non_atomic(
+            &self,
+            relpath: &$crate::UrlFragment,
+            data: &[u8],
+            permissions: Option<::std::fs::Permissions>,
+            create_parent_dir: Option<bool>,
+            dir_permissions: Option<::std::fs::Permissions>,
+        ) -> $crate::Result<()> {
+            self.$field.put_bytes_non_atomic(
+                relpath,
+                data,
+                permissions,
+                create_parent_dir,
+                dir_permissions,
+            )
         }
     };
 }
@@ -315,6 +398,34 @@ macro_rules! fwd_copy {
     };
 }
 
+/// Emit the three URL-aware forwarders (`abspath`, `relpath`, `clone`) that
+/// a plain prefix decorator wants. Requires the outer type to expose an
+/// associated `PREFIX: &'static str` and a `fn new(inner: Box<dyn
+/// Transport + Send + Sync>) -> Self` constructor. Pass the field that
+/// holds the inner transport plus the decorator's own type name:
+///
+/// ```ignore
+/// crate::fwd_decorator_url!(inner, MyDecorator);
+/// ```
+#[macro_export]
+macro_rules! fwd_decorator_url {
+    ($field:ident, $ty:ident) => {
+        fn abspath(&self, relpath: &$crate::UrlFragment) -> $crate::Result<::url::Url> {
+            $crate::decorator::prefixed_abspath(Self::PREFIX, self.$field.as_ref(), relpath)
+        }
+        fn relpath(&self, abspath: &::url::Url) -> $crate::Result<String> {
+            $crate::decorator::stripped_relpath(Self::PREFIX, self.$field.as_ref(), abspath)
+        }
+        fn clone(
+            &self,
+            offset: Option<&$crate::UrlFragment>,
+        ) -> $crate::Result<Box<dyn $crate::Transport>> {
+            let inner_clone = self.$field.clone(offset)?;
+            Ok(Box::new($ty::new(inner_clone)))
+        }
+    };
+}
+
 /// Forward every Transport method to `self.$field`. The caller must still
 /// define `fn base(&self) -> Url`. Use this when no methods need to be
 /// overridden; decorators that override a few methods should invoke the
@@ -353,4 +464,35 @@ macro_rules! fwd_all {
         $crate::fwd_local_abspath!($field);
         $crate::fwd_copy!($field);
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::MemoryTransport;
+
+    #[test]
+    fn prefixed_abspath_prepends_prefix() {
+        let mem = MemoryTransport::new("memory:///").unwrap();
+        let abs = prefixed_abspath("readonly+", &mem, "foo").unwrap();
+        assert_eq!(abs.as_str(), "readonly+memory:///foo");
+    }
+
+    #[test]
+    fn stripped_relpath_removes_prefix_before_delegating() {
+        let mem = MemoryTransport::new("memory:///").unwrap();
+        let decorated_abs = ::url::Url::parse("readonly+memory:///sub/file").unwrap();
+        let rel = stripped_relpath("readonly+", &mem, &decorated_abs).unwrap();
+        assert_eq!(rel, "sub/file");
+    }
+
+    #[test]
+    fn stripped_relpath_passes_through_when_prefix_absent() {
+        // If the caller hands us a url without the prefix (e.g. because
+        // they've already stripped it) we should still delegate safely.
+        let mem = MemoryTransport::new("memory:///").unwrap();
+        let bare = ::url::Url::parse("memory:///x").unwrap();
+        let rel = stripped_relpath("readonly+", &mem, &bare).unwrap();
+        assert_eq!(rel, "x");
+    }
 }

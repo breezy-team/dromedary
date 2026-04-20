@@ -9,21 +9,19 @@ use url::Url;
 
 pub struct FakeNfsTransport {
     inner: Box<dyn Transport + Send + Sync>,
-    base: Url,
 }
 
 impl FakeNfsTransport {
     pub const PREFIX: &'static str = "fakenfs+";
 
     pub fn new(inner: Box<dyn Transport + Send + Sync>) -> Self {
-        let base = crate::decorator::prefixed_base(Self::PREFIX, inner.as_ref());
-        Self { inner, base }
+        Self { inner }
     }
 }
 
 impl std::fmt::Debug for FakeNfsTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "FakeNfsTransport({})", self.base)
+        write!(f, "FakeNfsTransport({})", self.base())
     }
 }
 
@@ -42,10 +40,11 @@ impl Transport for FakeNfsTransport {
     crate::fwd_get!(inner);
     crate::fwd_has!(inner);
     crate::fwd_stat!(inner);
-    crate::fwd_clone!(inner);
-    crate::fwd_abspath!(inner);
-    crate::fwd_relpath!(inner);
+    crate::fwd_decorator_url!(inner, FakeNfsTransport);
     crate::fwd_put_file!(inner);
+    crate::fwd_put_bytes!(inner);
+    crate::fwd_put_file_non_atomic!(inner);
+    crate::fwd_put_bytes_non_atomic!(inner);
     crate::fwd_mkdir!(inner);
     crate::fwd_rmdir!(inner);
     crate::fwd_set_segment_parameter!(inner);
@@ -65,7 +64,7 @@ impl Transport for FakeNfsTransport {
     crate::fwd_copy!(inner);
 
     fn base(&self) -> Url {
-        self.base.clone()
+        crate::decorator::prefixed_base(Self::PREFIX, self.inner.as_ref())
     }
 
     fn rename(&self, rel_from: &UrlFragment, rel_to: &UrlFragment) -> Result<()> {

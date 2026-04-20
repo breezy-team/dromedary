@@ -10,9 +10,12 @@ use crate::urlutils::combine_paths;
 use crate::{Error, ReadStream, Result, Stat, Transport, UrlFragment, WriteStream};
 use std::collections::HashMap;
 use std::fs::Permissions;
+use std::sync::Arc;
 use url::Url;
 
-pub type FilterFunc = Box<dyn Fn(&str) -> String + Send + Sync>;
+/// Shared filter callback. Wrapped in `Arc` so clone() can hand a copy to
+/// the cloned transport without moving ownership.
+pub type FilterFunc = Arc<dyn Fn(&str) -> String + Send + Sync>;
 
 pub struct PathFilteringTransport {
     backing: Box<dyn Transport + Send + Sync>,
@@ -113,16 +116,31 @@ impl Transport for PathFilteringTransport {
     }
 
     fn clone(&self, offset: Option<&UrlFragment>) -> Result<Box<dyn Transport>> {
-        // Clone of a path-filtering transport returns a backing-transport clone
-        // rebased to the filtered offset. This matches Python's
-        // `self.__class__(self.server, self.abspath(relpath))` well enough for
-        // in-process use, but loses the filter wrapping. Callers that need a
-        // filtered clone should reconstruct one.
-        let target_relpath = match offset {
-            Some(o) => self.relpath_from_server_root(o)?,
-            None => self.relpath_from_server_root("")?,
+        // Mirror the Python constructor:
+        //   __class__(self.server, self.abspath(relpath))
+        // The filter_func and backing stay identical; only base_path
+        // changes so that future relpath-to-backing resolutions rebase
+        // against the new root. Cloning the backing too would
+        // double-apply the filter on the next operation.
+        let offset_s = offset.unwrap_or("");
+        let new_base_path = self.relpath_from_server_root(offset_s)?;
+        let path_for_new = if new_base_path.starts_with('/') {
+            new_base_path
+        } else {
+            format!("/{}", new_base_path)
         };
-        self.backing.clone(Some(&target_relpath))
+        // Clone the backing at its current root ("."), so the new
+        // PathFilteringTransport sees the same underlying store but we
+        // still produce a fresh Send+Sync handle rather than aliasing
+        // self.backing (which we don't own).
+        let backing_clone = self.backing.clone(None)?;
+        let wrapped = PathFilteringTransport::new(
+            backing_clone,
+            self.scheme.clone(),
+            path_for_new,
+            self.filter_func.as_ref().map(Arc::clone),
+        )?;
+        Ok(Box::new(wrapped))
     }
 
     fn abspath(&self, relpath: &UrlFragment) -> Result<Url> {
@@ -134,12 +152,7 @@ impl Transport for PathFilteringTransport {
     }
 
     fn relpath(&self, abspath: &Url) -> Result<String> {
-        let base = self.base.as_str();
-        let target = abspath.as_str();
-        target
-            .strip_prefix(base)
-            .map(|s| s.to_string())
-            .ok_or(Error::PathNotChild)
+        crate::relpath_against_base(&self.base, abspath)
     }
 
     fn put_file(
@@ -150,6 +163,50 @@ impl Transport for PathFilteringTransport {
     ) -> Result<u64> {
         self.backing
             .put_file(&self.filter(relpath)?, f, permissions)
+    }
+
+    fn put_bytes(
+        &self,
+        relpath: &UrlFragment,
+        data: &[u8],
+        permissions: Option<Permissions>,
+    ) -> Result<()> {
+        self.backing
+            .put_bytes(&self.filter(relpath)?, data, permissions)
+    }
+
+    fn put_file_non_atomic(
+        &self,
+        relpath: &UrlFragment,
+        f: &mut dyn std::io::Read,
+        permissions: Option<Permissions>,
+        create_parent_dir: Option<bool>,
+        dir_permissions: Option<Permissions>,
+    ) -> Result<()> {
+        self.backing.put_file_non_atomic(
+            &self.filter(relpath)?,
+            f,
+            permissions,
+            create_parent_dir,
+            dir_permissions,
+        )
+    }
+
+    fn put_bytes_non_atomic(
+        &self,
+        relpath: &UrlFragment,
+        data: &[u8],
+        permissions: Option<Permissions>,
+        create_parent_dir: Option<bool>,
+        dir_permissions: Option<Permissions>,
+    ) -> Result<()> {
+        self.backing.put_bytes_non_atomic(
+            &self.filter(relpath)?,
+            data,
+            permissions,
+            create_parent_dir,
+            dir_permissions,
+        )
     }
 
     fn mkdir(&self, relpath: &UrlFragment, permissions: Option<Permissions>) -> Result<()> {
@@ -170,11 +227,26 @@ impl Transport for PathFilteringTransport {
     }
 
     fn set_segment_parameter(&mut self, key: &str, value: Option<&str>) -> Result<()> {
-        self.backing.set_segment_parameter(key, value)
+        // Segment parameters live on the filter's own URL rather than the
+        // backing transport: the backing has its own scheme (file://, etc.)
+        // and mutating its base would drop the filter's scheme on the next
+        // base() read.
+        let (raw, mut params) = crate::urlutils::split_segment_parameters(self.base.as_str())?;
+        if let Some(value) = value {
+            params.insert(key, value);
+        } else {
+            params.remove(key);
+        }
+        self.base = Url::parse(&crate::urlutils::join_segment_parameters(raw, &params)?)?;
+        Ok(())
     }
 
     fn get_segment_parameters(&self) -> Result<HashMap<String, String>> {
-        self.backing.get_segment_parameters()
+        let (_, params) = crate::urlutils::split_segment_parameters(self.base.as_str())?;
+        Ok(params
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect())
     }
 
     fn append_file(
@@ -248,7 +320,12 @@ impl Transport for PathFilteringTransport {
     }
 
     fn local_abspath(&self, relpath: &UrlFragment) -> Result<std::path::PathBuf> {
-        self.backing.local_abspath(&self.filter(relpath)?)
+        // Matches Python's base Transport.local_abspath: filtered transports
+        // don't expose a local path because the filter can hide or rewrite
+        // the on-disk location. Callers that want the backing's view should
+        // use the backing transport directly.
+        let _ = relpath;
+        Err(Error::NotLocalUrl(self.base().to_string()))
     }
 
     fn copy(&self, rel_from: &UrlFragment, rel_to: &UrlFragment) -> Result<()> {
@@ -303,7 +380,7 @@ mod tests {
     fn filter_func_rewrites_path() {
         // Filter prepends "sub/" to every relpath; starting from root that
         // means every get effectively reads from /sub/...
-        let filter: FilterFunc = Box::new(|p: &str| format!("sub/{}", p));
+        let filter: FilterFunc = Arc::new(|p: &str| format!("sub/{}", p));
         let t = make("/", Some(filter));
         assert_eq!(t.get_bytes("b").unwrap(), b"B");
     }
@@ -337,7 +414,7 @@ mod tests {
 
     #[test]
     fn abspath_is_not_filtered() {
-        let filter: FilterFunc = Box::new(|p: &str| format!("sub/{}", p));
+        let filter: FilterFunc = Arc::new(|p: &str| format!("sub/{}", p));
         let t = make("/", Some(filter));
         let u = t.abspath("x").unwrap();
         assert!(u.as_str().ends_with("/x"), "got {}", u);

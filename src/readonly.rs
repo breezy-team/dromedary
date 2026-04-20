@@ -11,23 +11,19 @@ use url::Url;
 
 pub struct ReadonlyTransport {
     decorated: Box<dyn Transport + Send + Sync>,
-    base: Url,
 }
 
 impl ReadonlyTransport {
     const PREFIX: &'static str = "readonly+";
 
     pub fn new(decorated: Box<dyn Transport + Send + Sync>) -> Self {
-        let inner_base = decorated.base();
-        let base =
-            Url::parse(&format!("{}{}", Self::PREFIX, inner_base)).unwrap_or(inner_base.clone());
-        Self { decorated, base }
+        Self { decorated }
     }
 }
 
 impl std::fmt::Debug for ReadonlyTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "ReadonlyTransport({})", self.base)
+        write!(f, "ReadonlyTransport({})", self.base())
     }
 }
 
@@ -45,7 +41,10 @@ impl Transport for ReadonlyTransport {
     }
 
     fn base(&self) -> Url {
-        self.base.clone()
+        // Recompute each call from the inner's current base so that updates
+        // like set_segment_parameter (which mutate the inner) are reflected
+        // in the decorator's base.
+        crate::decorator::prefixed_base(Self::PREFIX, self.decorated.as_ref())
     }
 
     fn is_readonly(&self) -> bool {
@@ -67,19 +66,16 @@ impl Transport for ReadonlyTransport {
     }
 
     fn clone(&self, offset: Option<&UrlFragment>) -> Result<Box<dyn Transport>> {
-        // NB: once a trait upcast to Send+Sync decorator stacking is needed we
-        // will revisit; for now a cloned ReadonlyTransport is Send+Sync but
-        // the cloned inner handle is plain Box<dyn Transport>, so we return
-        // the inner transport's clone directly and let callers re-wrap.
-        self.decorated.clone(offset)
+        let inner_clone = self.decorated.clone(offset)?;
+        Ok(Box::new(ReadonlyTransport::new(inner_clone)))
     }
 
     fn abspath(&self, relpath: &UrlFragment) -> Result<Url> {
-        self.decorated.abspath(relpath)
+        crate::decorator::prefixed_abspath(Self::PREFIX, self.decorated.as_ref(), relpath)
     }
 
     fn relpath(&self, abspath: &Url) -> Result<String> {
-        self.decorated.relpath(abspath)
+        crate::decorator::stripped_relpath(Self::PREFIX, self.decorated.as_ref(), abspath)
     }
 
     fn put_file(
@@ -251,6 +247,35 @@ mod tests {
     fn base_has_readonly_prefix() {
         let t = ro();
         assert!(t.base().as_str().starts_with("readonly+"));
+    }
+
+    #[test]
+    fn abspath_carries_prefix() {
+        // The Python decorator contract is: decorator.base + relpath ==
+        // decorator.abspath(relpath). Regression guard for a bug where
+        // abspath used to forward straight to the inner transport and
+        // dropped the `readonly+` prefix.
+        let t = ro();
+        let abs = t.abspath("relpath").unwrap();
+        assert_eq!(abs.as_str(), "readonly+memory:///relpath");
+    }
+
+    #[test]
+    fn relpath_round_trips_through_abspath() {
+        let t = ro();
+        let abs = t.abspath("sub/file").unwrap();
+        assert_eq!(t.relpath(&abs).unwrap(), "sub/file");
+    }
+
+    #[test]
+    fn clone_keeps_readonly_wrapping() {
+        // Cloning must return another readonly transport rather than
+        // silently dropping down to the inner, otherwise callers can bypass
+        // readonly enforcement just by cloning.
+        let t = ro();
+        let cloned = t.clone(Some("subdir")).unwrap();
+        assert!(cloned.base().as_str().starts_with("readonly+"));
+        assert!(cloned.is_readonly());
     }
 
     fn expect_not_possible<T: std::fmt::Debug>(r: Result<T>, label: &str) {

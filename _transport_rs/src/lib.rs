@@ -1,6 +1,6 @@
+use ::log::debug;
 use dromedary::lock::{FileLock, Lock as LockTrait, LockError};
 use dromedary::{Error, ReadStream, Transport as TransportTrait, UrlFragment, WriteStream};
-use log::debug;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::import_exception;
 use pyo3::prelude::*;
@@ -37,18 +37,12 @@ pub(crate) struct Transport(pub(crate) Box<dyn TransportTrait>);
 
 pub(crate) fn map_transport_err_to_py_err(
     e: Error,
-    _t: Option<Py<PyAny>>,
+    t: Option<Py<PyAny>>,
     p: Option<&UrlFragment>,
 ) -> PyErr {
-    let pick_path = |n: Option<String>| {
-        if n.is_none() {
-            n
-        } else {
-            p.map(|p| p.to_string())
-        }
-    };
+    let pick_path = |n: Option<String>| n.or_else(|| p.map(|p| p.to_string()));
     match e {
-        Error::InProcessTransport => InProcessTransport::new_err(()),
+        Error::InProcessTransport => InProcessTransport::new_err((t,)),
         Error::NotLocalUrl(url) => NotLocalUrl::new_err((url,)),
         Error::NoSuchFile(name) => NoSuchFile::new_err((pick_path(name),)),
         Error::FileExists(name) => FileExists::new_err((pick_path(name),)),
@@ -295,12 +289,11 @@ impl Transport {
 
 #[pymethods]
 impl Transport {
-    fn external_url(&self) -> PyResult<String> {
-        Ok(self
-            .0
-            .external_url()
-            .map_err(|e| map_transport_err_to_py_err(e, None, None))?
-            .to_string())
+    fn external_url(slf: PyRef<Self>, py: Python) -> PyResult<String> {
+        match slf.0.external_url() {
+            Ok(url) => Ok(url.to_string()),
+            Err(e) => Err(Self::map_to_py_err(slf, py, e, None)),
+        }
     }
 
     fn __repr__(&self) -> PyResult<String> {
@@ -1233,6 +1226,7 @@ mod fakevfat;
 #[cfg(feature = "gio")]
 mod gio;
 mod http;
+mod log;
 mod memory;
 mod pathfilter;
 mod readonly;
@@ -1297,6 +1291,10 @@ fn _transport_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     http::register(py, &httpm)?;
     m.add_submodule(&httpm)?;
 
+    let logm = PyModule::new(py, "log")?;
+    log::register(py, &logm)?;
+    m.add_submodule(&logm)?;
+
     #[cfg(feature = "gio")]
     let giom = {
         let giom = PyModule::new(py, "gio")?;
@@ -1322,6 +1320,7 @@ fn _transport_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     modules.set_item(format!("{}.pathfilter", module_name), &pathfilterm)?;
     modules.set_item(format!("{}.memory", module_name), &memorym)?;
     modules.set_item(format!("{}.http", module_name), &httpm)?;
+    modules.set_item(format!("{}.log", module_name), &logm)?;
     #[cfg(feature = "gio")]
     modules.set_item(format!("{}.gio", module_name), &giom)?;
 
