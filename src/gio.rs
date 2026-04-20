@@ -695,7 +695,7 @@ mod tests {
 
     #[test]
     fn requires_gio_prefix() {
-        match GioTransport::new("file:///tmp/") {
+        match GioTransport::new("file:///does/not/matter/") {
             Err(Error::NotLocalUrl(_)) => {}
             other => panic!("expected NotLocalUrl, got {:?}", other),
         }

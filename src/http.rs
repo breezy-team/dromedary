@@ -151,14 +151,18 @@ pub fn format_user_agent(product: &str, version: &str) -> String {
 mod tests {
     use super::*;
 
+    // Tests in this module mutate the shared `CURL_CA_BUNDLE` environment
+    // variable and the module-level cache, so they must not run in parallel
+    // with each other.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn ca_path_honours_env_var() {
-        // Use a unique sentinel so a stale cache from a previous test in the
-        // same process doesn't leak in.
+        let _guard = ENV_LOCK.lock().unwrap();
         clear_ca_path_cache();
-        let sentinel = "/tmp/dromedary-test-ca-bundle.pem";
-        // SAFETY: single-threaded test section; std::env::set_var is unsafe
-        // only under concurrent access.
+        let sentinel = "dromedary-test-ca-bundle.pem";
+        // SAFETY: serialised against the other tests in this module via
+        // `ENV_LOCK`; std::env::set_var is unsafe only under concurrent access.
         unsafe { std::env::set_var("CURL_CA_BUNDLE", sentinel) };
         let got = get_ca_path(false);
         unsafe { std::env::remove_var("CURL_CA_BUNDLE") };
@@ -167,14 +171,17 @@ mod tests {
 
     #[test]
     fn ca_path_caches_when_requested() {
+        let _guard = ENV_LOCK.lock().unwrap();
         clear_ca_path_cache();
-        unsafe { std::env::set_var("CURL_CA_BUNDLE", "/tmp/first") };
+        // SAFETY: serialised against the other tests in this module via
+        // `ENV_LOCK`.
+        unsafe { std::env::set_var("CURL_CA_BUNDLE", "first-sentinel") };
         let first = get_ca_path(true);
-        unsafe { std::env::set_var("CURL_CA_BUNDLE", "/tmp/second") };
+        unsafe { std::env::set_var("CURL_CA_BUNDLE", "second-sentinel") };
         let second = get_ca_path(true);
         unsafe { std::env::remove_var("CURL_CA_BUNDLE") };
-        assert_eq!(first, "/tmp/first");
-        assert_eq!(second, "/tmp/first");
+        assert_eq!(first, "first-sentinel");
+        assert_eq!(second, "first-sentinel");
         clear_ca_path_cache();
     }
 
