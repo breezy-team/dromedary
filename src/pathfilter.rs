@@ -170,11 +170,26 @@ impl Transport for PathFilteringTransport {
     }
 
     fn set_segment_parameter(&mut self, key: &str, value: Option<&str>) -> Result<()> {
-        self.backing.set_segment_parameter(key, value)
+        // Segment parameters live on the filter's own URL rather than the
+        // backing transport: the backing has its own scheme (file://, etc.)
+        // and mutating its base would drop the filter's scheme on the next
+        // base() read.
+        let (raw, mut params) = crate::urlutils::split_segment_parameters(self.base.as_str())?;
+        if let Some(value) = value {
+            params.insert(key, value);
+        } else {
+            params.remove(key);
+        }
+        self.base = Url::parse(&crate::urlutils::join_segment_parameters(raw, &params)?)?;
+        Ok(())
     }
 
     fn get_segment_parameters(&self) -> Result<HashMap<String, String>> {
-        self.backing.get_segment_parameters()
+        let (_, params) = crate::urlutils::split_segment_parameters(self.base.as_str())?;
+        Ok(params
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect())
     }
 
     fn append_file(

@@ -501,12 +501,23 @@ impl Transport for MemoryTransport {
         Ok(())
     }
 
-    fn set_segment_parameter(&mut self, _key: &str, _value: Option<&str>) -> Result<()> {
-        Err(Error::TransportNotPossible)
+    fn set_segment_parameter(&mut self, key: &str, value: Option<&str>) -> Result<()> {
+        let (raw, mut params) = crate::urlutils::split_segment_parameters(self.base.as_str())?;
+        if let Some(value) = value {
+            params.insert(key, value);
+        } else {
+            params.remove(key);
+        }
+        self.base = Url::parse(&crate::urlutils::join_segment_parameters(raw, &params)?)?;
+        Ok(())
     }
 
     fn get_segment_parameters(&self) -> Result<HashMap<String, String>> {
-        Ok(HashMap::new())
+        let (_, params) = crate::urlutils::split_segment_parameters(self.base.as_str())?;
+        Ok(params
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect())
     }
 
     fn append_file(
