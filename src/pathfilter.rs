@@ -10,9 +10,12 @@ use crate::urlutils::combine_paths;
 use crate::{Error, ReadStream, Result, Stat, Transport, UrlFragment, WriteStream};
 use std::collections::HashMap;
 use std::fs::Permissions;
+use std::sync::Arc;
 use url::Url;
 
-pub type FilterFunc = Box<dyn Fn(&str) -> String + Send + Sync>;
+/// Shared filter callback. Wrapped in `Arc` so clone() can hand a copy to
+/// the cloned transport without moving ownership.
+pub type FilterFunc = Arc<dyn Fn(&str) -> String + Send + Sync>;
 
 pub struct PathFilteringTransport {
     backing: Box<dyn Transport + Send + Sync>,
@@ -113,16 +116,31 @@ impl Transport for PathFilteringTransport {
     }
 
     fn clone(&self, offset: Option<&UrlFragment>) -> Result<Box<dyn Transport>> {
-        // Clone of a path-filtering transport returns a backing-transport clone
-        // rebased to the filtered offset. This matches Python's
-        // `self.__class__(self.server, self.abspath(relpath))` well enough for
-        // in-process use, but loses the filter wrapping. Callers that need a
-        // filtered clone should reconstruct one.
-        let target_relpath = match offset {
-            Some(o) => self.relpath_from_server_root(o)?,
-            None => self.relpath_from_server_root("")?,
+        // Mirror the Python constructor:
+        //   __class__(self.server, self.abspath(relpath))
+        // The filter_func and backing stay identical; only base_path
+        // changes so that future relpath-to-backing resolutions rebase
+        // against the new root. Cloning the backing too would
+        // double-apply the filter on the next operation.
+        let offset_s = offset.unwrap_or("");
+        let new_base_path = self.relpath_from_server_root(offset_s)?;
+        let path_for_new = if new_base_path.starts_with('/') {
+            new_base_path
+        } else {
+            format!("/{}", new_base_path)
         };
-        self.backing.clone(Some(&target_relpath))
+        // Clone the backing at its current root ("."), so the new
+        // PathFilteringTransport sees the same underlying store but we
+        // still produce a fresh Send+Sync handle rather than aliasing
+        // self.backing (which we don't own).
+        let backing_clone = self.backing.clone(None)?;
+        let wrapped = PathFilteringTransport::new(
+            backing_clone,
+            self.scheme.clone(),
+            path_for_new,
+            self.filter_func.as_ref().map(Arc::clone),
+        )?;
+        Ok(Box::new(wrapped))
     }
 
     fn abspath(&self, relpath: &UrlFragment) -> Result<Url> {
@@ -357,7 +375,7 @@ mod tests {
     fn filter_func_rewrites_path() {
         // Filter prepends "sub/" to every relpath; starting from root that
         // means every get effectively reads from /sub/...
-        let filter: FilterFunc = Box::new(|p: &str| format!("sub/{}", p));
+        let filter: FilterFunc = Arc::new(|p: &str| format!("sub/{}", p));
         let t = make("/", Some(filter));
         assert_eq!(t.get_bytes("b").unwrap(), b"B");
     }
@@ -391,7 +409,7 @@ mod tests {
 
     #[test]
     fn abspath_is_not_filtered() {
-        let filter: FilterFunc = Box::new(|p: &str| format!("sub/{}", p));
+        let filter: FilterFunc = Arc::new(|p: &str| format!("sub/{}", p));
         let t = make("/", Some(filter));
         let u = t.abspath("x").unwrap();
         assert!(u.as_str().ends_with("/x"), "got {}", u);
