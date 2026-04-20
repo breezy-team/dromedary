@@ -320,7 +320,12 @@ impl Transport for PathFilteringTransport {
     }
 
     fn local_abspath(&self, relpath: &UrlFragment) -> Result<std::path::PathBuf> {
-        self.backing.local_abspath(&self.filter(relpath)?)
+        // Matches Python's base Transport.local_abspath: filtered transports
+        // don't expose a local path because the filter can hide or rewrite
+        // the on-disk location. Callers that want the backing's view should
+        // use the backing transport directly.
+        let _ = relpath;
+        Err(Error::NotLocalUrl(self.base().to_string()))
     }
 
     fn copy(&self, rel_from: &UrlFragment, rel_to: &UrlFragment) -> Result<()> {
