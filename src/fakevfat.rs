@@ -40,9 +40,7 @@ impl Transport for FakeVfatTransport {
     crate::fwd_is_readonly!(inner);
     crate::fwd_listable!(inner);
     crate::fwd_stat!(inner);
-    crate::fwd_clone!(inner);
-    crate::fwd_abspath!(inner);
-    crate::fwd_relpath!(inner);
+    crate::fwd_decorator_url!(inner, FakeVfatTransport);
     crate::fwd_delete!(inner);
     crate::fwd_rmdir!(inner);
     crate::fwd_rename!(inner);

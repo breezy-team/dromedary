@@ -39,7 +39,7 @@ fn python_debug_sink(py: Python, logger_name: &str) -> PyResult<LogSink> {
     let logging = py.import("logging")?;
     let logger = logging.call_method1("getLogger", (logger_name,))?.unbind();
     let logger = Arc::new(logger);
-    Ok(Box::new(move |msg: &str| {
+    Ok(Arc::new(move |msg: &str| {
         Python::attach(|py| {
             // Ignore errors — logging failures should not propagate and break
             // the transport method. If the logger is gone we silently drop

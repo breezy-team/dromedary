@@ -12,9 +12,13 @@ use crate::lock::Lock;
 use crate::{Error, ReadStream, Result, Stat, Transport, UrlFragment, WriteStream};
 use std::fs::Permissions;
 use std::io::Read;
+use std::sync::Arc;
 use url::Url;
 
-pub type LogSink = Box<dyn Fn(&str) + Send + Sync>;
+/// Message sink for a LogTransport. Wrapped in `Arc` so that clones of a
+/// LogTransport (produced via `Transport::clone`) can continue logging
+/// through the same sink as the original.
+pub type LogSink = Arc<dyn Fn(&str) + Send + Sync>;
 
 pub struct LogTransport {
     inner: Box<dyn Transport + Send + Sync>,
@@ -111,8 +115,6 @@ impl Transport for LogTransport {
     crate::fwd_can_roundtrip_unix_modebits!(inner);
     crate::fwd_is_readonly!(inner);
     crate::fwd_listable!(inner);
-    crate::fwd_abspath!(inner);
-    crate::fwd_relpath!(inner);
     crate::fwd_set_segment_parameter!(inner);
     crate::fwd_get_segment_parameters!(inner);
     crate::fwd_readlink!(inner);
@@ -124,13 +126,20 @@ impl Transport for LogTransport {
         self.base.clone()
     }
 
+    fn abspath(&self, relpath: &UrlFragment) -> Result<Url> {
+        crate::decorator::prefixed_abspath(Self::PREFIX, self.inner.as_ref(), relpath)
+    }
+
+    fn relpath(&self, abspath: &Url) -> Result<String> {
+        crate::decorator::stripped_relpath(Self::PREFIX, self.inner.as_ref(), abspath)
+    }
+
     fn clone(&self, offset: Option<&UrlFragment>) -> Result<Box<dyn Transport>> {
-        // A cloned LogTransport would need its own sink, but sinks aren't
-        // cloneable in general. Callers that need to clone through the log
-        // layer should reconstruct via `LogTransport::new` with a fresh
-        // sink; for now return the inner clone so behaviour stays sensible
-        // if something walks through clone() without relying on logging.
-        self.inner.clone(offset)
+        let inner_clone = self.inner.clone(offset)?;
+        Ok(Box::new(LogTransport::new(
+            inner_clone,
+            Arc::clone(&self.sink),
+        )))
     }
 
     fn get(&self, relpath: &UrlFragment) -> Result<Box<dyn ReadStream + Send + Sync>> {
@@ -446,7 +455,7 @@ mod tests {
     fn capturing_sink() -> (Arc<Mutex<Vec<String>>>, LogSink) {
         let buf: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let buf_cl = Arc::clone(&buf);
-        let sink: LogSink = Box::new(move |msg| buf_cl.lock().unwrap().push(msg.to_string()));
+        let sink: LogSink = Arc::new(move |msg: &str| buf_cl.lock().unwrap().push(msg.to_string()));
         (buf, sink)
     }
 
@@ -535,5 +544,27 @@ mod tests {
         let log = buf.lock().unwrap().clone();
         assert!(log.iter().any(|l| l.starts_with("list_dir d")));
         assert!(log.iter().any(|l| l == "  --> 2 entries"));
+    }
+
+    #[test]
+    fn abspath_carries_prefix() {
+        let (_buf, t) = wrap();
+        assert_eq!(
+            t.abspath("relpath").unwrap().as_str(),
+            "log+memory:///relpath"
+        );
+    }
+
+    #[test]
+    fn clone_keeps_log_wrapping_and_shares_sink() {
+        // The clone should continue emitting through the original sink so
+        // that a single logger captures both the parent and cloned
+        // transport's activity.
+        let (buf, t) = wrap();
+        let cloned = t.clone(Some("sub")).unwrap();
+        assert!(cloned.base().as_str().starts_with("log+"));
+        let _ = cloned.has("anything");
+        let log = buf.lock().unwrap().clone();
+        assert!(log.iter().any(|l| l.starts_with("has anything")));
     }
 }

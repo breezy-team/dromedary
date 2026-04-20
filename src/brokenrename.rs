@@ -34,9 +34,7 @@ impl Transport for BrokenRenameTransport {
     crate::fwd_get!(inner);
     crate::fwd_has!(inner);
     crate::fwd_stat!(inner);
-    crate::fwd_clone!(inner);
-    crate::fwd_abspath!(inner);
-    crate::fwd_relpath!(inner);
+    crate::fwd_decorator_url!(inner, BrokenRenameTransport);
     crate::fwd_put_file!(inner);
     crate::fwd_mkdir!(inner);
     crate::fwd_delete!(inner);

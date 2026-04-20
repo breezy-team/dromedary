@@ -34,9 +34,7 @@ impl Transport for UnlistableTransport {
     crate::fwd_get!(inner);
     crate::fwd_has!(inner);
     crate::fwd_stat!(inner);
-    crate::fwd_clone!(inner);
-    crate::fwd_abspath!(inner);
-    crate::fwd_relpath!(inner);
+    crate::fwd_decorator_url!(inner, UnlistableTransport);
     crate::fwd_put_file!(inner);
     crate::fwd_mkdir!(inner);
     crate::fwd_delete!(inner);
@@ -121,5 +119,22 @@ mod tests {
     fn reads_pass_through() {
         let t = wrap();
         assert_eq!(t.get_bytes("a").unwrap(), b"1");
+    }
+
+    #[test]
+    fn abspath_carries_prefix() {
+        let t = wrap();
+        assert_eq!(
+            t.abspath("relpath").unwrap().as_str(),
+            "unlistable+memory:///relpath"
+        );
+    }
+
+    #[test]
+    fn clone_keeps_unlistable_wrapping() {
+        let t = wrap();
+        let cloned = t.clone(Some("sub")).unwrap();
+        assert!(cloned.base().as_str().starts_with("unlistable+"));
+        assert_eq!(cloned.listable(), false);
     }
 }
