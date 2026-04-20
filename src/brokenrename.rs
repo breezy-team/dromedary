@@ -63,10 +63,12 @@ impl Transport for BrokenRenameTransport {
     fn rename(&self, rel_from: &UrlFragment, rel_to: &UrlFragment) -> Result<()> {
         match self.inner.rename(rel_from, rel_to) {
             Ok(()) => Ok(()),
-            // Absorb clashes silently — that's the whole point.
-            Err(crate::Error::FileExists(_)) | Err(crate::Error::DirectoryNotEmptyError(_)) => {
-                Ok(())
-            }
+            // Absorb file-exists clashes silently — that's the whole point.
+            // Directory-not-empty clashes still propagate: the decorator
+            // simulates a transport that misses file rename conflicts, not
+            // one that also silently succeeds when renaming over populated
+            // directories.
+            Err(crate::Error::FileExists(_)) => Ok(()),
             Err(e) => Err(e),
         }
     }
