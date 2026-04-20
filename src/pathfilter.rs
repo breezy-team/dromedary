@@ -147,6 +147,50 @@ impl Transport for PathFilteringTransport {
             .put_file(&self.filter(relpath)?, f, permissions)
     }
 
+    fn put_bytes(
+        &self,
+        relpath: &UrlFragment,
+        data: &[u8],
+        permissions: Option<Permissions>,
+    ) -> Result<()> {
+        self.backing
+            .put_bytes(&self.filter(relpath)?, data, permissions)
+    }
+
+    fn put_file_non_atomic(
+        &self,
+        relpath: &UrlFragment,
+        f: &mut dyn std::io::Read,
+        permissions: Option<Permissions>,
+        create_parent_dir: Option<bool>,
+        dir_permissions: Option<Permissions>,
+    ) -> Result<()> {
+        self.backing.put_file_non_atomic(
+            &self.filter(relpath)?,
+            f,
+            permissions,
+            create_parent_dir,
+            dir_permissions,
+        )
+    }
+
+    fn put_bytes_non_atomic(
+        &self,
+        relpath: &UrlFragment,
+        data: &[u8],
+        permissions: Option<Permissions>,
+        create_parent_dir: Option<bool>,
+        dir_permissions: Option<Permissions>,
+    ) -> Result<()> {
+        self.backing.put_bytes_non_atomic(
+            &self.filter(relpath)?,
+            data,
+            permissions,
+            create_parent_dir,
+            dir_permissions,
+        )
+    }
+
     fn mkdir(&self, relpath: &UrlFragment, permissions: Option<Permissions>) -> Result<()> {
         self.backing.mkdir(&self.filter(relpath)?, permissions)
     }
