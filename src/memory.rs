@@ -357,13 +357,7 @@ impl Transport for MemoryTransport {
     }
 
     fn relpath(&self, abspath: &Url) -> Result<String> {
-        let base = self.base.as_str();
-        let target = abspath.as_str();
-        if let Some(rest) = target.strip_prefix(base) {
-            Ok(rest.to_string())
-        } else {
-            Err(Error::PathNotChild)
-        }
+        crate::relpath_against_base(&self.base, abspath)
     }
 
     fn put_file(

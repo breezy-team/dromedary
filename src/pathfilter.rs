@@ -134,12 +134,7 @@ impl Transport for PathFilteringTransport {
     }
 
     fn relpath(&self, abspath: &Url) -> Result<String> {
-        let base = self.base.as_str();
-        let target = abspath.as_str();
-        target
-            .strip_prefix(base)
-            .map(|s| s.to_string())
-            .ok_or(Error::PathNotChild)
+        crate::relpath_against_base(&self.base, abspath)
     }
 
     fn put_file(
