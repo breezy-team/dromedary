@@ -1,6 +1,6 @@
+use ::log::debug;
 use dromedary::lock::{FileLock, Lock as LockTrait, LockError};
 use dromedary::{Error, ReadStream, Transport as TransportTrait, UrlFragment, WriteStream};
-use log::debug;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::import_exception;
 use pyo3::prelude::*;
@@ -1233,6 +1233,7 @@ mod fakevfat;
 #[cfg(feature = "gio")]
 mod gio;
 mod http;
+mod log;
 mod memory;
 mod pathfilter;
 mod readonly;
@@ -1297,6 +1298,10 @@ fn _transport_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     http::register(py, &httpm)?;
     m.add_submodule(&httpm)?;
 
+    let logm = PyModule::new(py, "log")?;
+    log::register(py, &logm)?;
+    m.add_submodule(&logm)?;
+
     #[cfg(feature = "gio")]
     let giom = {
         let giom = PyModule::new(py, "gio")?;
@@ -1322,6 +1327,7 @@ fn _transport_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     modules.set_item(format!("{}.pathfilter", module_name), &pathfilterm)?;
     modules.set_item(format!("{}.memory", module_name), &memorym)?;
     modules.set_item(format!("{}.http", module_name), &httpm)?;
+    modules.set_item(format!("{}.log", module_name), &logm)?;
     #[cfg(feature = "gio")]
     modules.set_item(format!("{}.gio", module_name), &giom)?;
 

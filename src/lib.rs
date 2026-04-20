@@ -544,6 +544,8 @@ pub mod gio;
 
 pub mod http;
 
+pub mod log;
+
 pub mod memory;
 
 pub mod pathfilter;
