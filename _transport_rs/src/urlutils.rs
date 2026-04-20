@@ -395,23 +395,27 @@ impl UrlObject {
     }
 
     #[pyo3(signature = (offset = None))]
-    fn clone(&self, offset: Option<&str>) -> Self {
+    fn clone(&self, offset: Option<&str>) -> PyResult<Self> {
         let path = match offset {
             Some(off) => {
-                let relative = unquote_lossy(off);
+                // offset must already be url-encoded. Non-ASCII input means
+                // the caller forgot to escape — surface that as InvalidURL
+                // rather than silently passing the raw bytes through.
+                let relative = dromedary::urlutils::unescape(off)
+                    .map_err(|_| InvalidURL::new_err((off.to_string(),)))?;
                 let combined = dromedary::urlutils::combine_paths(&self.path, &relative);
                 dromedary::urlutils::escape(combined.as_bytes(), Some("/~"))
             }
             None => self.quoted_path.clone(),
         };
-        UrlObject::new(
+        Ok(UrlObject::new(
             self.scheme.clone(),
             self.quoted_user.clone(),
             self.quoted_password.clone(),
             self.quoted_host.clone(),
             self.port,
             path,
-        )
+        ))
     }
 }
 
