@@ -11,23 +11,19 @@ use url::Url;
 
 pub struct ReadonlyTransport {
     decorated: Box<dyn Transport + Send + Sync>,
-    base: Url,
 }
 
 impl ReadonlyTransport {
     const PREFIX: &'static str = "readonly+";
 
     pub fn new(decorated: Box<dyn Transport + Send + Sync>) -> Self {
-        let inner_base = decorated.base();
-        let base =
-            Url::parse(&format!("{}{}", Self::PREFIX, inner_base)).unwrap_or(inner_base.clone());
-        Self { decorated, base }
+        Self { decorated }
     }
 }
 
 impl std::fmt::Debug for ReadonlyTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "ReadonlyTransport({})", self.base)
+        write!(f, "ReadonlyTransport({})", self.base())
     }
 }
 
@@ -45,7 +41,10 @@ impl Transport for ReadonlyTransport {
     }
 
     fn base(&self) -> Url {
-        self.base.clone()
+        // Recompute each call from the inner's current base so that updates
+        // like set_segment_parameter (which mutate the inner) are reflected
+        // in the decorator's base.
+        crate::decorator::prefixed_base(Self::PREFIX, self.decorated.as_ref())
     }
 
     fn is_readonly(&self) -> bool {

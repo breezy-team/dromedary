@@ -10,15 +10,13 @@ use url::Url;
 
 pub struct FakeVfatTransport {
     inner: Box<dyn Transport + Send + Sync>,
-    base: Url,
 }
 
 impl FakeVfatTransport {
     pub const PREFIX: &'static str = "vfat+";
 
     pub fn new(inner: Box<dyn Transport + Send + Sync>) -> Self {
-        let base = crate::decorator::prefixed_base(Self::PREFIX, inner.as_ref());
-        Self { inner, base }
+        Self { inner }
     }
 
     fn squash_name(name: &str) -> Result<String> {
@@ -31,7 +29,7 @@ impl FakeVfatTransport {
 
 impl std::fmt::Debug for FakeVfatTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "FakeVfatTransport({})", self.base)
+        write!(f, "FakeVfatTransport({})", self.base())
     }
 }
 
@@ -61,7 +59,7 @@ impl Transport for FakeVfatTransport {
     crate::fwd_copy!(inner);
 
     fn base(&self) -> Url {
-        self.base.clone()
+        crate::decorator::prefixed_base(Self::PREFIX, self.inner.as_ref())
     }
 
     fn can_roundtrip_unix_modebits(&self) -> bool {

@@ -9,21 +9,19 @@ use url::Url;
 
 pub struct UnlistableTransport {
     inner: Box<dyn Transport + Send + Sync>,
-    base: Url,
 }
 
 impl UnlistableTransport {
     pub const PREFIX: &'static str = "unlistable+";
 
     pub fn new(inner: Box<dyn Transport + Send + Sync>) -> Self {
-        let base = crate::decorator::prefixed_base(Self::PREFIX, inner.as_ref());
-        Self { inner, base }
+        Self { inner }
     }
 }
 
 impl std::fmt::Debug for UnlistableTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "UnlistableTransport({})", self.base)
+        write!(f, "UnlistableTransport({})", self.base())
     }
 }
 
@@ -58,7 +56,7 @@ impl Transport for UnlistableTransport {
     crate::fwd_copy!(inner);
 
     fn base(&self) -> Url {
-        self.base.clone()
+        crate::decorator::prefixed_base(Self::PREFIX, self.inner.as_ref())
     }
 
     fn listable(&self) -> bool {

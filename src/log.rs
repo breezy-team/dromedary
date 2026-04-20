@@ -22,7 +22,6 @@ pub type LogSink = Arc<dyn Fn(&str) + Send + Sync>;
 
 pub struct LogTransport {
     inner: Box<dyn Transport + Send + Sync>,
-    base: Url,
     sink: LogSink,
 }
 
@@ -30,8 +29,7 @@ impl LogTransport {
     pub const PREFIX: &'static str = "log+";
 
     pub fn new(inner: Box<dyn Transport + Send + Sync>, sink: LogSink) -> Self {
-        let base = crate::decorator::prefixed_base(Self::PREFIX, inner.as_ref());
-        Self { inner, base, sink }
+        Self { inner, sink }
     }
 
     fn log_call(&self, method: &str, relpath: &str, extra: &str) {
@@ -54,7 +52,7 @@ impl LogTransport {
 
 impl std::fmt::Debug for LogTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "LogTransport({})", self.base)
+        write!(f, "LogTransport({})", self.base())
     }
 }
 
@@ -123,7 +121,7 @@ impl Transport for LogTransport {
     crate::fwd_local_abspath!(inner);
 
     fn base(&self) -> Url {
-        self.base.clone()
+        crate::decorator::prefixed_base(Self::PREFIX, self.inner.as_ref())
     }
 
     fn abspath(&self, relpath: &UrlFragment) -> Result<Url> {
@@ -280,7 +278,7 @@ impl Transport for LogTransport {
 
     fn iter_files_recursive(&self) -> Box<dyn Iterator<Item = Result<String>>> {
         // Mirrors the Python override that logs without a relpath.
-        (self.sink)(&format!("iter_files_recursive {}", self.base));
+        (self.sink)(&format!("iter_files_recursive {}", self.base()));
         let results: Vec<Result<String>> = self.inner.iter_files_recursive().collect();
         let summary = format!("{} entries", results.len());
         self.log_result(&summary);

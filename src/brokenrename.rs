@@ -8,21 +8,19 @@ use url::Url;
 
 pub struct BrokenRenameTransport {
     inner: Box<dyn Transport + Send + Sync>,
-    base: Url,
 }
 
 impl BrokenRenameTransport {
     pub const PREFIX: &'static str = "brokenrename+";
 
     pub fn new(inner: Box<dyn Transport + Send + Sync>) -> Self {
-        let base = crate::decorator::prefixed_base(Self::PREFIX, inner.as_ref());
-        Self { inner, base }
+        Self { inner }
     }
 }
 
 impl std::fmt::Debug for BrokenRenameTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "BrokenRenameTransport({})", self.base)
+        write!(f, "BrokenRenameTransport({})", self.base())
     }
 }
 
@@ -59,7 +57,7 @@ impl Transport for BrokenRenameTransport {
     crate::fwd_copy!(inner);
 
     fn base(&self) -> Url {
-        self.base.clone()
+        crate::decorator::prefixed_base(Self::PREFIX, self.inner.as_ref())
     }
 
     fn rename(&self, rel_from: &UrlFragment, rel_to: &UrlFragment) -> Result<()> {
