@@ -604,10 +604,6 @@ impl Transport for MemoryTransport {
         Err(Error::TransportNotPossible)
     }
 
-    fn r#move(&self, rel_from: &UrlFragment, rel_to: &UrlFragment) -> Result<()> {
-        self.rename(rel_from, rel_to)
-    }
-
     fn list_dir(&self, relpath: &UrlFragment) -> Box<dyn Iterator<Item = Result<String>>> {
         let abspath = match self.resolve_symlinks(relpath) {
             Ok(p) => p,

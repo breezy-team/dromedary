@@ -455,7 +455,22 @@ pub trait Transport: std::fmt::Debug + 'static + Send + Sync {
 
     fn delete_tree(&self, relpath: &UrlFragment) -> Result<()>;
 
-    fn r#move(&self, rel_from: &UrlFragment, rel_to: &UrlFragment) -> Result<()>;
+    /// Move an entry, overwriting the destination if it exists.
+    ///
+    /// Mirrors Python's Transport.move default: delegates to copy/copy_tree
+    /// then delete/delete_tree, which handles overwrite via copy's
+    /// replace-on-write semantics. Transports with a native atomic move
+    /// should override.
+    fn r#move(&self, rel_from: &UrlFragment, rel_to: &UrlFragment) -> Result<()> {
+        if self.stat(rel_from)?.is_dir() {
+            self.copy_tree(rel_from, rel_to)?;
+            self.delete_tree(rel_from)?;
+        } else {
+            self.copy(rel_from, rel_to)?;
+            self.delete(rel_from)?;
+        }
+        Ok(())
+    }
 
     fn copy_tree(&self, from_relpath: &UrlFragment, to_relpath: &UrlFragment) -> Result<()> {
         let source = self.clone(Some(from_relpath))?;
