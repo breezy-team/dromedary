@@ -373,6 +373,14 @@ impl Transport for MemoryTransport {
         permissions: Option<Permissions>,
     ) -> Result<u64> {
         let abspath = self.resolve_symlinks(relpath)?;
+        // Validate the parent directory exists *before* reading the stream
+        // so that a failed put_file leaves the reader untouched. This lets
+        // the default put_file_non_atomic retry with the same stream after
+        // creating the missing parent.
+        {
+            let store = self.store.lock().unwrap();
+            Self::check_parent(&store, &abspath)?;
+        }
         let mut buf = Vec::new();
         f.read_to_end(&mut buf)
             .map_err(|e| map_io_err_to_transport_err(e, Some(relpath)))?;

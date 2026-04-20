@@ -444,6 +444,66 @@ impl Transport for LogTransport {
             }
         }
     }
+
+    // Forward the *_non_atomic variants to the inner transport rather than
+    // relying on the trait default. The default retries self.put_file after
+    // a NoSuchFile, which would log twice and — when the inner is a
+    // PyTransport — also consume the caller's stream on the first attempt,
+    // leaving the retry with an empty reader. Delegating keeps the
+    // non-atomic operation atomic from the inner's perspective.
+    fn put_file_non_atomic(
+        &self,
+        relpath: &UrlFragment,
+        f: &mut dyn Read,
+        permissions: Option<Permissions>,
+        create_parent_dir: Option<bool>,
+        dir_permissions: Option<Permissions>,
+    ) -> Result<()> {
+        self.log_call("put_file_non_atomic", relpath, "");
+        match self.inner.put_file_non_atomic(
+            relpath,
+            f,
+            permissions,
+            create_parent_dir,
+            dir_permissions,
+        ) {
+            Ok(()) => {
+                self.log_result("None");
+                Ok(())
+            }
+            Err(e) => {
+                self.log_error(&e);
+                Err(e)
+            }
+        }
+    }
+
+    fn put_bytes_non_atomic(
+        &self,
+        relpath: &UrlFragment,
+        data: &[u8],
+        permissions: Option<Permissions>,
+        create_parent_dir: Option<bool>,
+        dir_permissions: Option<Permissions>,
+    ) -> Result<()> {
+        self.log_call("put_bytes_non_atomic", relpath, "");
+        match self.inner.put_bytes_non_atomic(
+            relpath,
+            data,
+            permissions,
+            create_parent_dir,
+            dir_permissions,
+        ) {
+            Ok(()) => {
+                self.log_result("None");
+                Ok(())
+            }
+            Err(e) => {
+                self.log_error(&e);
+                Err(e)
+            }
+        }
+    }
 }
 
 #[cfg(test)]

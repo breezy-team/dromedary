@@ -44,6 +44,9 @@ impl Transport for FakeNfsTransport {
     crate::fwd_stat!(inner);
     crate::fwd_decorator_url!(inner, FakeNfsTransport);
     crate::fwd_put_file!(inner);
+    crate::fwd_put_bytes!(inner);
+    crate::fwd_put_file_non_atomic!(inner);
+    crate::fwd_put_bytes_non_atomic!(inner);
     crate::fwd_mkdir!(inner);
     crate::fwd_rmdir!(inner);
     crate::fwd_set_segment_parameter!(inner);

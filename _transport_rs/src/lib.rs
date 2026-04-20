@@ -37,18 +37,12 @@ pub(crate) struct Transport(pub(crate) Box<dyn TransportTrait>);
 
 pub(crate) fn map_transport_err_to_py_err(
     e: Error,
-    _t: Option<Py<PyAny>>,
+    t: Option<Py<PyAny>>,
     p: Option<&UrlFragment>,
 ) -> PyErr {
-    let pick_path = |n: Option<String>| {
-        if n.is_none() {
-            n
-        } else {
-            p.map(|p| p.to_string())
-        }
-    };
+    let pick_path = |n: Option<String>| n.or_else(|| p.map(|p| p.to_string()));
     match e {
-        Error::InProcessTransport => InProcessTransport::new_err(()),
+        Error::InProcessTransport => InProcessTransport::new_err((t,)),
         Error::NotLocalUrl(url) => NotLocalUrl::new_err((url,)),
         Error::NoSuchFile(name) => NoSuchFile::new_err((pick_path(name),)),
         Error::FileExists(name) => FileExists::new_err((pick_path(name),)),
@@ -295,12 +289,11 @@ impl Transport {
 
 #[pymethods]
 impl Transport {
-    fn external_url(&self) -> PyResult<String> {
-        Ok(self
-            .0
-            .external_url()
-            .map_err(|e| map_transport_err_to_py_err(e, None, None))?
-            .to_string())
+    fn external_url(slf: PyRef<Self>, py: Python) -> PyResult<String> {
+        match slf.0.external_url() {
+            Ok(url) => Ok(url.to_string()),
+            Err(e) => Err(Self::map_to_py_err(slf, py, e, None)),
+        }
     }
 
     fn __repr__(&self) -> PyResult<String> {

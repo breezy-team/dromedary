@@ -144,6 +144,61 @@ macro_rules! fwd_put_file {
     };
 }
 #[macro_export]
+macro_rules! fwd_put_bytes {
+    ($field:ident) => {
+        fn put_bytes(
+            &self,
+            relpath: &$crate::UrlFragment,
+            data: &[u8],
+            permissions: Option<::std::fs::Permissions>,
+        ) -> $crate::Result<()> {
+            self.$field.put_bytes(relpath, data, permissions)
+        }
+    };
+}
+#[macro_export]
+macro_rules! fwd_put_file_non_atomic {
+    ($field:ident) => {
+        fn put_file_non_atomic(
+            &self,
+            relpath: &$crate::UrlFragment,
+            f: &mut dyn ::std::io::Read,
+            permissions: Option<::std::fs::Permissions>,
+            create_parent_dir: Option<bool>,
+            dir_permissions: Option<::std::fs::Permissions>,
+        ) -> $crate::Result<()> {
+            self.$field.put_file_non_atomic(
+                relpath,
+                f,
+                permissions,
+                create_parent_dir,
+                dir_permissions,
+            )
+        }
+    };
+}
+#[macro_export]
+macro_rules! fwd_put_bytes_non_atomic {
+    ($field:ident) => {
+        fn put_bytes_non_atomic(
+            &self,
+            relpath: &$crate::UrlFragment,
+            data: &[u8],
+            permissions: Option<::std::fs::Permissions>,
+            create_parent_dir: Option<bool>,
+            dir_permissions: Option<::std::fs::Permissions>,
+        ) -> $crate::Result<()> {
+            self.$field.put_bytes_non_atomic(
+                relpath,
+                data,
+                permissions,
+                create_parent_dir,
+                dir_permissions,
+            )
+        }
+    };
+}
+#[macro_export]
 macro_rules! fwd_mkdir {
     ($field:ident) => {
         fn mkdir(

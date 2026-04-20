@@ -86,6 +86,50 @@ impl Transport for FakeVfatTransport {
             .put_file(&Self::squash_name(relpath)?, f, permissions)
     }
 
+    fn put_bytes(
+        &self,
+        relpath: &UrlFragment,
+        data: &[u8],
+        permissions: Option<Permissions>,
+    ) -> Result<()> {
+        self.inner
+            .put_bytes(&Self::squash_name(relpath)?, data, permissions)
+    }
+
+    fn put_file_non_atomic(
+        &self,
+        relpath: &UrlFragment,
+        f: &mut dyn std::io::Read,
+        permissions: Option<Permissions>,
+        create_parent_dir: Option<bool>,
+        dir_permissions: Option<Permissions>,
+    ) -> Result<()> {
+        self.inner.put_file_non_atomic(
+            &Self::squash_name(relpath)?,
+            f,
+            permissions,
+            create_parent_dir,
+            dir_permissions,
+        )
+    }
+
+    fn put_bytes_non_atomic(
+        &self,
+        relpath: &UrlFragment,
+        data: &[u8],
+        permissions: Option<Permissions>,
+        create_parent_dir: Option<bool>,
+        dir_permissions: Option<Permissions>,
+    ) -> Result<()> {
+        self.inner.put_bytes_non_atomic(
+            &Self::squash_name(relpath)?,
+            data,
+            permissions,
+            create_parent_dir,
+            dir_permissions,
+        )
+    }
+
     fn mkdir(&self, relpath: &UrlFragment, _permissions: Option<Permissions>) -> Result<()> {
         // Python hard-codes 0o755 for VFAT mkdir.
         #[cfg(unix)]
