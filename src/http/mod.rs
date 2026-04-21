@@ -4,8 +4,13 @@
 //! to be wired in: locating the CA certificate bundle and the User-Agent
 //! default. The Python wrapper in `dromedary.http` delegates to these.
 
+pub mod auth;
 pub mod client;
 pub mod response;
+pub use auth::{
+    build_basic_auth_header, build_digest_auth_header, parse_digest_challenge, DigestAuthState,
+    DigestChallenge,
+};
 pub use client::{ClientError, HttpClient, HttpClientConfig, HttpResponse};
 pub use response::{handle_response, InFile, RangeFile, ResponseError, ResponseFile, ResponseKind};
 
