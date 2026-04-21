@@ -1,12 +1,15 @@
 //! Pure-logic pieces of the SSH module — argv construction for subprocess
-//! vendors, shared by the PyO3 layer in `_transport_rs` and unit-testable
-//! without Python link symbols.
+//! vendors and vendor auto-detection, shared by the PyO3 layer in
+//! `_transport_rs` and unit-testable without Python link symbols.
 //!
 //! Spawning, connection wrappers, and library-backed vendors live in
 //! `_transport_rs/src/ssh/` because they're PyO3-facing.
 
 use std::error::Error;
+use std::ffi::OsStr;
 use std::fmt;
+use std::path::Path;
+use std::process::Command;
 
 /// Which subprocess vendor we're building argv for. Collapses the per-vendor
 /// Python classes into an enum because they differ only in flag syntax.
@@ -140,6 +143,47 @@ pub fn build_argv(
     }
 
     Ok(args)
+}
+
+/// Classify an `ssh -V` version string into the registry key of the matching
+/// vendor. `progname` is the basename (no extension) of the binary that was
+/// run — it's only consulted for plink because Windows `ssh -V` sometimes
+/// reports "plink" in its version output (launchpad bug 107155); we only
+/// accept it when plink was actually the binary.
+///
+/// Returns `None` if the version doesn't match any known implementation.
+pub fn classify_ssh_version(version: &str, progname: &str) -> Option<&'static str> {
+    if version.contains("OpenSSH") {
+        Some("openssh")
+    } else if version.contains("lsh") {
+        Some("lsh")
+    } else if version.contains("plink") && progname == "plink" {
+        // plink prompts aren't wired up, so we don't auto-detect it from
+        // inspection — require the user to name `plink` explicitly via
+        // BRZ_SSH=plink. See https://bugs.launchpad.net/bugs/414743.
+        Some("plink")
+    } else {
+        None
+    }
+}
+
+/// Run `executable -V` and classify the output. Returns the vendor registry
+/// key, or `None` if the binary can't be run or produces an unrecognized
+/// version. `progname` is derived from the executable's file stem.
+///
+/// Combines stdout+stderr to match paramiko/OpenSSH behavior where the
+/// version lands on stderr. Decodes as UTF-8 lossy — we only look for ASCII
+/// substrings, so encoding mismatches on non-UTF-8 locales don't matter.
+pub fn detect_ssh_vendor(executable: &OsStr) -> Option<&'static str> {
+    let progname = Path::new(executable)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let output = Command::new(executable).arg("-V").output().ok()?;
+    let mut combined = output.stdout;
+    combined.extend_from_slice(&output.stderr);
+    let version = String::from_utf8_lossy(&combined);
+    classify_ssh_version(&version, progname)
 }
 
 #[cfg(test)]
@@ -281,8 +325,16 @@ mod tests {
     fn openssh_does_not_check_hostname() {
         // Matches Python: OpenSSH vendor never called _check_hostname. The
         // -- separator before host makes this safe for OpenSSH.
-        let argv =
-            build_argv(Flavor::OpenSSH, None, None, "-evil", None, Some("sftp"), None).unwrap();
+        let argv = build_argv(
+            Flavor::OpenSSH,
+            None,
+            None,
+            "-evil",
+            None,
+            Some("sftp"),
+            None,
+        )
+        .unwrap();
         assert!(argv.contains(&"-evil".to_string()));
         assert!(argv.contains(&"--".to_string()));
     }
@@ -291,6 +343,41 @@ mod tests {
     fn missing_both_subsystem_and_command_errors() {
         let err = build_argv(Flavor::OpenSSH, None, None, "h", None, None, None);
         assert!(matches!(err, Err(ArgvError::InvalidArguments)));
+    }
+
+    #[test]
+    fn classify_openssh_version() {
+        assert_eq!(
+            classify_ssh_version("OpenSSH_9.6p1 Ubuntu-3ubuntu13.5", "ssh"),
+            Some("openssh")
+        );
+    }
+
+    #[test]
+    fn classify_lsh_version() {
+        assert_eq!(classify_ssh_version("lsh-2.1", "lsh"), Some("lsh"));
+    }
+
+    #[test]
+    fn classify_plink_requires_plink_progname() {
+        // Windows sometimes reports "plink" in `ssh -V` output even when ssh
+        // is actually OpenSSH (launchpad bug 107155), so the progname must
+        // also be plink before we claim it.
+        assert_eq!(classify_ssh_version("plink 0.80", "plink"), Some("plink"));
+        assert_eq!(classify_ssh_version("plink 0.80", "ssh"), None);
+    }
+
+    #[test]
+    fn classify_unknown_returns_none() {
+        assert_eq!(classify_ssh_version("Dropbear v2022.83", "ssh"), None);
+        assert_eq!(classify_ssh_version("", "ssh"), None);
+    }
+
+    #[test]
+    fn classify_ssh_corp_no_longer_matches() {
+        // SSH Corporation's "SSH Secure Shell" used to map to its own vendor;
+        // now that SSHCorp is gone, the string falls through to None.
+        assert_eq!(classify_ssh_version("SSH Secure Shell 3.2", "ssh"), None);
     }
 
     #[test]

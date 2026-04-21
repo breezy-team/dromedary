@@ -10,6 +10,7 @@
 //! They are deliberately not exposed to Python.
 
 use pyo3::prelude::*;
+use std::ffi::OsString;
 
 #[cfg(feature = "russh")]
 mod russh_vendor;
@@ -50,9 +51,28 @@ pub(crate) trait SshLibrary {
     fn connect(cfg: &ConnectConfig) -> std::io::Result<Box<dyn SshSession>>;
 }
 
+/// Classify an `ssh -V` version string into a vendor registry key.
+/// Mirrors `dromedary.ssh.SSHVendorManager._get_vendor_by_version_string`.
+#[pyfunction]
+#[pyo3(signature = (version, progname))]
+fn classify_ssh_version(version: &str, progname: &str) -> Option<&'static str> {
+    dromedary::ssh::classify_ssh_version(version, progname)
+}
+
+/// Run `executable -V` and return the vendor registry key, or `None` if
+/// the binary can't be run or the output isn't recognized. Mirrors the
+/// combination of `_get_ssh_version_string` + `_get_vendor_from_path`.
+#[pyfunction]
+#[pyo3(signature = (executable))]
+fn detect_ssh_vendor(py: Python, executable: OsString) -> Option<&'static str> {
+    py.detach(|| dromedary::ssh::detect_ssh_vendor(&executable))
+}
+
 pub(crate) fn register(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     subprocess::register(py, m)?;
     #[cfg(feature = "russh")]
     russh_vendor::register(py, m)?;
+    m.add_function(wrap_pyfunction!(classify_ssh_version, m)?)?;
+    m.add_function(wrap_pyfunction!(detect_ssh_vendor, m)?)?;
     Ok(())
 }
