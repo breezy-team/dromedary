@@ -17,8 +17,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use dromedary::http::client::{
-    ClientError, CredentialProvider, HttpClient as RsHttpClient, HttpClientConfig,
-    HttpResponse as RsHttpResponse, RequestOptions,
+    ActivityCallback, ActivityDirection, ClientError, CredentialProvider,
+    HttpClient as RsHttpClient, HttpClientConfig, HttpResponse as RsHttpResponse, RequestOptions,
 };
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::import_exception;
@@ -128,10 +128,20 @@ impl HttpClient {
 
     /// Issue an HTTP request.
     ///
-    /// `headers` is an iterable of `(name, value)` pairs (matching the
-    /// stdlib pattern). The response is returned as an `HttpResponse`
-    /// pyclass mirroring the old `Urllib3LikeResponse` shape.
-    #[pyo3(signature = (method, url, headers=None, body=None, follow_redirects=None))]
+    /// `headers` is an iterable of `(name, value)` pairs (matching
+    /// the stdlib pattern). `report_activity`, when provided, is a
+    /// callable invoked as `report_activity(byte_count, direction)`
+    /// where direction is `"read"` or `"write"` — matches the Python
+    /// `Transport._report_activity` signature so breezy's progress
+    /// bar integration works unchanged.
+    #[pyo3(signature = (
+        method,
+        url,
+        headers=None,
+        body=None,
+        follow_redirects=None,
+        report_activity=None,
+    ))]
     fn request(
         &self,
         py: Python,
@@ -140,6 +150,7 @@ impl HttpClient {
         headers: Option<Py<PyAny>>,
         body: Option<Py<PyAny>>,
         follow_redirects: Option<bool>,
+        report_activity: Option<Py<PyAny>>,
     ) -> PyResult<HttpResponse> {
         let header_pairs = match headers {
             Some(h) => extract_headers(py, &h)?,
@@ -156,18 +167,47 @@ impl HttpClient {
             }
             o
         };
+        let activity: Option<ActivityCallback> = report_activity.map(make_activity_callback);
 
         // `Python::detach` releases the GIL while the HTTP call is
         // in flight so other Python threads can run (matching the
         // behaviour of the old urllib-based transport, which did the
         // actual socket read under the GIL-released `ssl` module).
+        //
+        // The activity callback reacquires the GIL inside its
+        // closure body — safe because we're handing ownership of
+        // the callback to `request_with` via a reference.
         let resp = py.detach(|| {
-            self.inner
-                .request_with(method, url, &header_pairs, &body_bytes, &opts)
+            self.inner.request_with(
+                method,
+                url,
+                &header_pairs,
+                &body_bytes,
+                &opts,
+                activity.as_ref(),
+            )
         });
         let resp = resp.map_err(client_err_to_py)?;
         Ok(HttpResponse::new(resp))
     }
+}
+
+/// Wrap a Python callable as an [`ActivityCallback`]. The Python
+/// callable receives `(byte_count, direction_str)` where direction
+/// is `"read"` or `"write"` — matching the
+/// `Transport._report_activity` signature breezy's UI expects.
+///
+/// Errors inside the callback are silently swallowed. Activity
+/// reporting is advisory; a broken progress-bar hook shouldn't fail
+/// the actual HTTP request.
+fn make_activity_callback(cb: Py<PyAny>) -> ActivityCallback {
+    Box::new(move |bytes: usize, dir: ActivityDirection| {
+        Python::attach(|py| {
+            // `call1` can raise; ignore the result so a buggy hook
+            // doesn't propagate into the HTTP path.
+            let _ = cb.bind(py).call1((bytes, dir.as_str()));
+        });
+    })
 }
 
 /// Urllib3-shaped response returned by [`HttpClient::request`].

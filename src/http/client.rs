@@ -76,10 +76,44 @@ impl From<std::io::Error> for ClientError {
 
 pub type Result<T> = std::result::Result<T, ClientError>;
 
+/// Direction of a byte transfer reported via [`ActivityCallback`].
+///
+/// The two values are the only ones breezy's
+/// `Transport._report_activity` ever sees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivityDirection {
+    /// Bytes received from the server.
+    Read,
+    /// Bytes sent to the server.
+    Write,
+}
+
+impl ActivityDirection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+        }
+    }
+}
+
+/// Reports byte transfers to the surrounding progress UI.
+///
+/// Called once after the request body is sent (with `Write`) and
+/// once after the full response body is received (with `Read`). For
+/// streaming bodies we'll want finer-grained reporting; for now one
+/// call per direction per request matches what breezy's progress
+/// bar actually displays.
+pub type ActivityCallback = Box<dyn Fn(usize, ActivityDirection) + Send + Sync>;
+
 /// Per-request knobs that callers sometimes need to override. The
 /// defaults match breezy's urllib-layer behaviour: no redirect
 /// following, so 3xx responses surface as-is for the caller to
 /// translate into a `RedirectRequested` if they want.
+///
+/// Deliberately `Clone` + `Copy`-free: the activity callback is
+/// passed separately to [`HttpClient::request_with`] because it's a
+/// closure, not a plain config knob.
 #[derive(Debug, Clone)]
 pub struct RequestOptions {
     /// Follow 301/302/303/307/308 redirects automatically.
@@ -381,7 +415,8 @@ impl HttpClient {
     }
 
     /// Perform an HTTP request with default options (no redirect
-    /// following). Convenience wrapper over [`Self::request_with`].
+    /// following, no activity reporting). Convenience wrapper over
+    /// [`Self::request_with`].
     pub fn request(
         &self,
         method: &str,
@@ -389,7 +424,7 @@ impl HttpClient {
         headers: &[(String, String)],
         body: &[u8],
     ) -> Result<HttpResponse> {
-        self.request_with(method, url, headers, body, &RequestOptions::default())
+        self.request_with(method, url, headers, body, &RequestOptions::default(), None)
     }
 
     /// Perform an HTTP request and optionally follow redirects.
@@ -413,6 +448,7 @@ impl HttpClient {
         headers: &[(String, String)],
         body: &[u8],
         options: &RequestOptions,
+        activity: Option<&ActivityCallback>,
     ) -> Result<HttpResponse> {
         let method = Method::from_bytes(method.as_bytes())
             .map_err(|_| ClientError::InvalidRequest(format!("bad method: {}", method)))?;
@@ -422,7 +458,7 @@ impl HttpClient {
         // auth, and handling that here keeps the redirect-loop code
         // from having to know anything about auth.
         drive_redirects(options, url, |target| {
-            self.send_with_auth(&method, target, headers, body)
+            self.send_with_auth(&method, target, headers, body, activity)
         })
     }
 
@@ -436,6 +472,7 @@ impl HttpClient {
         url: &str,
         headers: &[(String, String)],
         body: &[u8],
+        activity: Option<&ActivityCallback>,
     ) -> Result<HttpResponse> {
         let uri: Uri = url
             .parse()
@@ -462,7 +499,7 @@ impl HttpClient {
             }
         }
 
-        let response = self.send_once(method, url, &first_headers, body)?;
+        let response = self.send_once(method, url, &first_headers, body, activity)?;
         if response.status != 401 && response.status != 407 {
             return Ok(response);
         }
@@ -511,7 +548,7 @@ impl HttpClient {
         retry_headers.push(("Authorization".into(), hdr));
         let _ = scheme; // scheme name currently only used for logging
 
-        let retry = self.send_once(method, url, &retry_headers, body)?;
+        let retry = self.send_once(method, url, &retry_headers, body, activity)?;
         if retry.status < 400 {
             // Cache the working credentials so future requests to
             // this origin don't need the 401 roundtrip.
@@ -610,6 +647,7 @@ impl HttpClient {
         url: &str,
         headers: &[(String, String)],
         body: &[u8],
+        activity: Option<&ActivityCallback>,
     ) -> Result<HttpResponse> {
         let uri: Uri = url
             .parse()
@@ -627,8 +665,24 @@ impl HttpClient {
             Some(proxy) => self.agent.configure_request(req).proxy(Some(proxy)).build(),
             None => req,
         };
+        // Report the upload size before the actual send. We don't
+        // have per-socket counters (ureq doesn't expose them) so we
+        // report the application-level byte count; matches what
+        // breezy's progress bar displayed with the urllib-handler
+        // version (which also reported len(data) at write time).
+        if let Some(cb) = activity {
+            if !body.is_empty() {
+                cb(body.len(), ActivityDirection::Write);
+            }
+        }
         let response = self.agent.run(req)?;
-        HttpResponse::from_ureq(response, url.to_string())
+        let resp = HttpResponse::from_ureq(response, url.to_string())?;
+        if let Some(cb) = activity {
+            if !resp.body.is_empty() {
+                cb(resp.body.len(), ActivityDirection::Read);
+            }
+        }
+        Ok(resp)
     }
 
     /// Decide whether the request to `uri` should go through a
@@ -1216,7 +1270,9 @@ mod tests {
             r#"Basic realm="fallback""#,
             r#"Digest realm="secure", nonce="n", qop="auth""#,
         ];
-        let got = client.pick_auth_scheme(&uri, &challenges, &Method::GET).unwrap();
+        let got = client
+            .pick_auth_scheme(&uri, &challenges, &Method::GET)
+            .unwrap();
         assert_eq!(got.0, "digest");
         assert!(matches!(got.1, CachedAuth::Digest(_)));
     }
@@ -1229,7 +1285,9 @@ mod tests {
         }));
         let uri: Uri = "http://example.com/".parse().unwrap();
         let challenges = [r#"Basic realm="r""#];
-        let got = client.pick_auth_scheme(&uri, &challenges, &Method::GET).unwrap();
+        let got = client
+            .pick_auth_scheme(&uri, &challenges, &Method::GET)
+            .unwrap();
         assert_eq!(got.0, "basic");
         match got.1 {
             CachedAuth::Basic { user, password } => {
@@ -1245,11 +1303,9 @@ mod tests {
         let client = fresh_client(Box::new(NoCreds));
         let uri: Uri = "http://example.com/".parse().unwrap();
         let challenges = [r#"Basic realm="r""#];
-        assert!(
-            client
-                .pick_auth_scheme(&uri, &challenges, &Method::GET)
-                .is_none()
-        );
+        assert!(client
+            .pick_auth_scheme(&uri, &challenges, &Method::GET)
+            .is_none());
     }
 
     #[test]
@@ -1260,11 +1316,9 @@ mod tests {
         }));
         let uri: Uri = "http://example.com/".parse().unwrap();
         let challenges = ["Bearer realm=whatever"];
-        assert!(
-            client
-                .pick_auth_scheme(&uri, &challenges, &Method::GET)
-                .is_none()
-        );
+        assert!(client
+            .pick_auth_scheme(&uri, &challenges, &Method::GET)
+            .is_none());
     }
 
     #[test]
@@ -1280,11 +1334,9 @@ mod tests {
             // (which isn't offered either) and ultimately give up.
             r#"Digest realm="r", nonce="n", qop="auth", algorithm="SHA-256""#,
         ];
-        assert!(
-            client
-                .pick_auth_scheme(&uri, &challenges, &Method::GET)
-                .is_none()
-        );
+        assert!(client
+            .pick_auth_scheme(&uri, &challenges, &Method::GET)
+            .is_none());
     }
 
     #[test]

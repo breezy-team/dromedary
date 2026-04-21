@@ -158,6 +158,7 @@ class HttpTransport(ConnectedTransport):
             headers=headers,
             body=body,
             follow_redirects=follow_redirects,
+            report_activity=self._report_activity,
         )
 
         code = response.status
