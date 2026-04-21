@@ -1,5 +1,6 @@
 //! Python bindings for the HTTP helper functions in `dromedary::http`.
 
+mod client;
 mod response;
 
 use std::sync::Mutex;
@@ -223,6 +224,7 @@ pub(crate) fn register(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_credentials, m)?)?;
     m.add_function(wrap_pyfunction!(evaluate_proxy_bypass, m)?)?;
 
+    client::register(m)?;
     response::register(m)?;
 
     let locations = PyList::new(py, dromedary::http::SSL_CA_CERTS_KNOWN_LOCATIONS)?;
