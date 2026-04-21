@@ -13,10 +13,14 @@ pyo3-filelike = { workspace = true }
 sftp = "0.2.3"
 url = { workspace = true }
 log = { workspace = true }
+russh = { version = "0.54", optional = true }
+tokio = { version = "1", features = ["rt", "io-util", "net", "sync", "macros"], optional = true }
 
 [features]
-default = []
+default = ["russh"]
 gio = ["dromedary/gio"]
+russh = ["dep:russh", "dep:tokio"]
+# TODO: add `libssh2` and `ssh2-rs` features when those backends are implemented.
 
 [target.'cfg(unix)'.dependencies]
-nix = { workspace = true, features = ["fs"] }
+nix = { workspace = true, features = ["fs", "socket"] }

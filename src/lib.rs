@@ -588,6 +588,8 @@ pub mod pathfilter;
 
 pub mod readonly;
 
+pub mod ssh;
+
 pub mod unlistable;
 
 pub mod osutils;

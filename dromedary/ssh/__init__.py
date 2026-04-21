@@ -407,10 +407,18 @@ _ssh_connection_errors: tuple[type[Exception], ...] = (
     IOError,
     socket.error,
 )
+
+# Rust-backed vendors. Registered lazily so the extension module is only
+# imported when one of these vendors is actually selected.
+register_lazy_ssh_vendor("russh", "dromedary.ssh.russh", "russh_vendor")
+register_lazy_ssh_vendor("openssh-rs", "dromedary.ssh.subprocess_rs", "openssh_vendor")
+register_lazy_ssh_vendor("lsh-rs", "dromedary.ssh.subprocess_rs", "lsh_vendor")
+register_lazy_ssh_vendor("plink-rs", "dromedary.ssh.subprocess_rs", "plink_vendor")
+_ssh_vendor_manager.default_key = "russh"
+
 if paramiko is not None:
     register_lazy_ssh_vendor("paramiko", "dromedary.ssh.paramiko", "paramiko_vendor")
     register_lazy_ssh_vendor("none", "dromedary.ssh.paramiko", "paramiko_vendor")
-    _ssh_vendor_manager.default_key = "paramiko"
     _ssh_connection_errors += (paramiko.SSHException,)
 
 
