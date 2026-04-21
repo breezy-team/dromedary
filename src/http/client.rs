@@ -385,6 +385,7 @@ enum AuthKind {
     Proxy,
 }
 
+
 /// Cached per-origin authentication state. Once the server accepts
 /// our credentials we preemptively attach the same auth header to
 /// subsequent requests to the same host+port, matching urllib's
@@ -2002,6 +2003,7 @@ mod tests {
         // After discard, reads return empty.
         assert_eq!(r.read(None).unwrap(), Vec::<u8>::new());
     }
+
 
     #[test]
     fn cached_auth_header_digest_bumps_nonce_count_via_clone() {
