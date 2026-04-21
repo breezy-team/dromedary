@@ -216,6 +216,20 @@ fn auth_cache_key(uri: &Uri) -> AuthCacheKey {
     (scheme, host, port)
 }
 
+/// Key under which proxy auth is cached. Proxy credentials bind to
+/// the proxy URL, not the origin, so we key on the proxy's own
+/// host + port.
+fn proxy_cache_key(proxy: &Proxy) -> AuthCacheKey {
+    // ureq's Proxy exposes host/port as &str/u16. Lowercase the host
+    // for case-insensitive matching.
+    let host = proxy.host().to_ascii_lowercase();
+    let port = proxy.port();
+    // The "scheme" for proxy-cache-key is always "proxy" — we don't
+    // need to distinguish HTTP-tunnelled proxy from SOCKS here
+    // because the proxy protocol is fixed per Proxy instance.
+    ("proxy".to_string(), host, port)
+}
+
 /// Build an `Authorization:` header value from the cached state.
 /// Mutates digest state in place so `nonce_count` bumps correctly.
 fn cached_auth_header(cached: &CachedAuth, method: &Method, uri: &Uri) -> Option<String> {
@@ -333,6 +347,18 @@ impl NegotiateProvider for NoNegotiateProvider {
     }
 }
 
+/// Direction of an auth challenge: origin (401 → WWW-Authenticate
+/// → Authorization) vs proxy (407 → Proxy-Authenticate →
+/// Proxy-Authorization). The logic is identical other than the
+/// cache, header names, and which URL we key credentials on — this
+/// enum lets the shared retry path tell them apart without two
+/// copies of the code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthKind {
+    Origin,
+    Proxy,
+}
+
 /// Cached per-origin authentication state. Once the server accepts
 /// our credentials we preemptively attach the same auth header to
 /// subsequent requests to the same host+port, matching urllib's
@@ -415,6 +441,11 @@ pub struct HttpClient {
     /// the server accepts our credentials; subsequent requests to
     /// the same host preemptively attach the cached header.
     auth_cache: AuthCache,
+    /// Per-proxy cache of successful auth state. Separate from
+    /// `auth_cache` because proxy credentials are bound to the
+    /// proxy URL rather than the origin and shouldn't leak across
+    /// origins that share a proxy.
+    proxy_auth_cache: AuthCache,
     /// How we look up `(user, password)` when a challenge arrives.
     credentials: Box<dyn CredentialProvider>,
     /// Source of Negotiate (Kerberos) initial tokens. Defaults to a
@@ -454,6 +485,7 @@ impl HttpClient {
         Ok(Self {
             agent,
             auth_cache: AuthCache::new(),
+            proxy_auth_cache: AuthCache::new(),
             credentials,
             negotiate,
         })
@@ -507,10 +539,10 @@ impl HttpClient {
         })
     }
 
-    /// Send a request, transparently handling a single 401/407
-    /// auth challenge. Returns the final response (which may still
-    /// be 401 if we ran out of credentials or the server rejected
-    /// what we offered).
+    /// Send a request, transparently handling a single 401 (origin
+    /// auth) or 407 (proxy auth) challenge. Returns the final
+    /// response — may still be 401/407 if we ran out of credentials
+    /// or the server rejected what we offered.
     fn send_with_auth(
         &self,
         method: &Method,
@@ -522,24 +554,32 @@ impl HttpClient {
         let uri: Uri = url
             .parse()
             .map_err(|_| ClientError::InvalidRequest(format!("bad URL: {}", url)))?;
-        let cache_key = auth_cache_key(&uri);
 
-        // Preemptively attach a cached auth header if we have one.
-        // Callers' explicit Authorization headers take precedence —
-        // don't clobber.
-        let has_explicit_auth = headers
+        // Resolve the proxy ahead of time so both the preemptive
+        // header attach and the 407 retry can use the same key.
+        let proxy = self.choose_proxy(&uri)?;
+        let origin_key = auth_cache_key(&uri);
+        let proxy_key = proxy.as_ref().map(proxy_cache_key);
+
+        // Preemptively attach cached auth headers. Callers' explicit
+        // headers take precedence — don't clobber.
+        let has_explicit_origin_auth = headers
             .iter()
             .any(|(k, _)| k.eq_ignore_ascii_case("authorization"));
+        let has_explicit_proxy_auth = headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("proxy-authorization"));
+
         let mut first_headers: Vec<(String, String)> = headers.to_vec();
-        if !has_explicit_auth {
-            if let Some(cached) = self.auth_cache.get(&cache_key) {
-                if let Some(hdr) = cached_auth_header(&cached, method, &uri) {
-                    first_headers.push(("Authorization".into(), hdr));
-                    // For Digest, `build_digest_auth_header` bumped
-                    // `nonce_count` inside the cached state; store
-                    // the mutation so the next request uses a fresh
-                    // nc value.
-                    self.auth_cache.put(cache_key.clone(), cached);
+        if !has_explicit_origin_auth {
+            if let Some(hdr) = self.attach_cached(&self.auth_cache, &origin_key, method, &uri) {
+                first_headers.push(("Authorization".into(), hdr));
+            }
+        }
+        if !has_explicit_proxy_auth {
+            if let Some(key) = &proxy_key {
+                if let Some(hdr) = self.attach_cached(&self.proxy_auth_cache, key, method, &uri) {
+                    first_headers.push(("Proxy-Authorization".into(), hdr));
                 }
             }
         }
@@ -548,16 +588,45 @@ impl HttpClient {
         if response.status != 401 && response.status != 407 {
             return Ok(response);
         }
-        if has_explicit_auth {
-            // The caller asked for specific auth; don't second-guess
-            // them by retrying with different credentials.
-            return Ok(response);
+
+        // Decide which direction to retry. 407 wins over 401 if both
+        // somehow happened (the server shouldn't send both — they're
+        // separate turn-around points — but guard anyway).
+        if response.status == 407 {
+            if has_explicit_proxy_auth {
+                return Ok(response);
+            }
+            let Some(proxy_key) = proxy_key else {
+                // 407 without a configured proxy is a server bug —
+                // we have no credentials to look up. Surface as-is.
+                return Ok(response);
+            };
+            // Collect header values into owned Strings before we
+            // pass `&mut response` to retry_with_auth: the slice
+            // borrow would otherwise overlap with the mutable one.
+            let challenges: Vec<String> = response
+                .headers_all("proxy-authenticate")
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            return self.retry_with_auth(
+                &challenges,
+                method,
+                url,
+                &uri,
+                headers,
+                body,
+                activity,
+                &mut response,
+                &self.proxy_auth_cache,
+                &proxy_key,
+                "Proxy-Authorization",
+                AuthKind::Proxy,
+            );
         }
 
-        // Parse the challenge. We only handle WWW-Authenticate for
-        // now; Proxy-Authenticate (407) support would need the same
-        // logic keyed differently and is not yet wired.
-        if response.status == 407 {
+        // 401 — origin auth.
+        if has_explicit_origin_auth {
             return Ok(response);
         }
         let challenges: Vec<String> = response
@@ -565,58 +634,128 @@ impl HttpClient {
             .into_iter()
             .map(str::to_string)
             .collect();
-        let challenge_refs: Vec<&str> = challenges.iter().map(String::as_str).collect();
-        let Some((scheme, new_auth)) = self.pick_auth_scheme(&uri, &challenge_refs, method) else {
-            return Ok(response);
+        self.retry_with_auth(
+            &challenges,
+            method,
+            url,
+            &uri,
+            headers,
+            body,
+            activity,
+            &mut response,
+            &self.auth_cache,
+            &origin_key,
+            "Authorization",
+            AuthKind::Origin,
+        )
+    }
+
+    /// Look up cached auth state for the given key and build its
+    /// header value, if any. Returns `None` when no entry exists.
+    /// Re-stores the entry with the (possibly-mutated) Digest state
+    /// so `nonce_count` bumps persist.
+    fn attach_cached(
+        &self,
+        cache: &AuthCache,
+        key: &AuthCacheKey,
+        method: &Method,
+        uri: &Uri,
+    ) -> Option<String> {
+        let cached = cache.get(key)?;
+        let hdr = cached_auth_header(&cached, method, uri)?;
+        cache.put(key.clone(), cached);
+        Some(hdr)
+    }
+
+    /// Shared retry machinery for 401 and 407. `cache` is where we
+    /// store the successful state (origin or proxy); `cache_key` is
+    /// the lookup key; `header_name` is `Authorization` or
+    /// `Proxy-Authorization` depending on direction.
+    #[allow(clippy::too_many_arguments)]
+    fn retry_with_auth(
+        &self,
+        challenges: &[String],
+        method: &Method,
+        url: &str,
+        uri: &Uri,
+        headers: &[(String, String)],
+        body: &[u8],
+        activity: Option<&ActivityCallback>,
+        first_response: &mut HttpResponse,
+        cache: &AuthCache,
+        cache_key: &AuthCacheKey,
+        header_name: &'static str,
+        kind: AuthKind,
+    ) -> Result<HttpResponse> {
+        let refs: Vec<&str> = challenges.iter().map(String::as_str).collect();
+        let Some((_scheme, new_auth)) = self.pick_auth_scheme_for(&refs, uri, kind) else {
+            // No scheme we can handle, or no credentials for the
+            // ones on offer. Hand the 401/407 back to the caller.
+            return Ok(HttpResponse {
+                body: std::mem::replace(
+                    &mut first_response.body,
+                    BodyState::Buffered(std::io::Cursor::new(Vec::new())),
+                ),
+                status: first_response.status,
+                reason: std::mem::take(&mut first_response.reason),
+                headers: std::mem::take(&mut first_response.headers),
+                final_url: std::mem::take(&mut first_response.final_url),
+                redirected_to: first_response.redirected_to.take(),
+            });
         };
 
-        // Return the 401's connection to the pool before reissuing.
-        // ureq's BodyReader doesn't drain on Drop, so failing to do
-        // this here forces a fresh connection for the retry.
-        response.discard_body().ok();
+        // Return the first response's connection to ureq's pool
+        // before the retry. BodyReader doesn't drain on Drop.
+        first_response.discard_body().ok();
 
-        // Retry with the new auth header attached. Don't stack on
-        // top of the preemptive header we added above; rebuild from
-        // the caller's headers and append the new one.
+        // Build the retry header. For Digest we persist the bumped
+        // `nonce_count` regardless of retry outcome — the server has
+        // seen that count and won't accept it again.
         let mut retry_headers = headers.to_vec();
         let hdr = match &new_auth {
             CachedAuth::Basic { user, password } => build_basic_auth_header(user, password),
             CachedAuth::Digest(state) => {
-                // `build_digest_auth_header` mutates `nonce_count`,
-                // and we want to persist that bump. Work on a clone
-                // and re-store after.
                 let mut s = state.clone();
                 let h = build_digest_auth_header(&mut s, method.as_str(), uri.path());
-                // Replace what we just cloned with the bumped state.
-                self.auth_cache
-                    .put(cache_key.clone(), CachedAuth::Digest(s));
+                cache.put(cache_key.clone(), CachedAuth::Digest(s));
                 h
             }
             CachedAuth::Negotiate { token } => format!("Negotiate {}", token),
         };
-        retry_headers.push(("Authorization".into(), hdr));
-        let _ = scheme; // scheme name currently only used for logging
+        retry_headers.push((header_name.into(), hdr));
 
         let retry = self.send_once(method, url, &retry_headers, body, activity)?;
         if retry.status < 400 {
-            // Cache the working credentials so future requests to
-            // this origin don't need the 401 roundtrip.
             match &new_auth {
                 CachedAuth::Basic { .. } => {
-                    self.auth_cache.put(cache_key, new_auth);
+                    cache.put(cache_key.clone(), new_auth);
                 }
                 CachedAuth::Digest(_) => {
-                    // Already cached above — we needed the bumped
-                    // nonce_count regardless of outcome.
+                    // Already cached above.
                 }
                 CachedAuth::Negotiate { .. } => {
                     // Kerberos tokens are single-use per challenge.
-                    // Don't cache; the next 401 will request a fresh
-                    // token from the provider.
+                    // Don't cache; the next 401/407 will request a
+                    // fresh token from the provider.
                 }
             }
         }
         Ok(retry)
+    }
+
+    /// Convenience wrapper used by tests that want to pick an
+    /// origin-auth scheme from a set of WWW-Authenticate
+    /// challenges. See [`pick_auth_scheme_for`] for the real
+    /// implementation — production code goes through that directly
+    /// so it can distinguish origin vs proxy direction.
+    #[cfg(test)]
+    fn pick_auth_scheme(
+        &self,
+        uri: &Uri,
+        challenges: &[&str],
+        _method: &Method,
+    ) -> Option<(&'static str, CachedAuth)> {
+        self.pick_auth_scheme_for(challenges, uri, AuthKind::Origin)
     }
 
     /// Given the challenges a server sent, pick the scheme we'll
@@ -627,11 +766,22 @@ impl HttpClient {
     /// Scheme preference follows the handler_order values from the
     /// old urllib code: NegotiateAuthHandler (480) > Digest (490) >
     /// Basic (500). Lower-ordered handlers mean "prefer this".
-    fn pick_auth_scheme(
+    ///
+    /// `kind` drives which host to look up credentials for: Origin
+    /// asks for `uri.host()`, Proxy consults the environment's
+    /// proxy URL extracted from `choose_proxy` (expected to already
+    /// be known via the caller's context — we just don't have it
+    /// here, so proxy credential lookups currently use the *origin*
+    /// host too. That matches breezy's behaviour: the
+    /// credential-store keys proxy auth on the proxy URL, but
+    /// dromedary's CredentialProvider signature doesn't carry enough
+    /// context to distinguish the two cases, and breezy itself
+    /// handles that resolution internally.)
+    fn pick_auth_scheme_for(
         &self,
-        uri: &Uri,
         challenges: &[&str],
-        _method: &Method,
+        uri: &Uri,
+        _kind: AuthKind,
     ) -> Option<(&'static str, CachedAuth)> {
         let mut negotiate_seen = false;
         let mut digest_remainder: Option<&str> = None;
@@ -1548,6 +1698,50 @@ mod tests {
         let uri: Uri = "http://example.com/resource".parse().unwrap();
         let hdr = cached_auth_header(&cached, &Method::GET, &uri).unwrap();
         assert_eq!(hdr, "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==");
+    }
+
+    #[test]
+    fn proxy_cache_key_differs_from_origin_key() {
+        // Same host reached directly vs via a proxy should use
+        // different cache buckets so credentials don't leak.
+        let origin: Uri = "http://example.com/".parse().unwrap();
+        let proxy = Proxy::new("http://proxy.example:8080").unwrap();
+        let ok = auth_cache_key(&origin);
+        let pk = proxy_cache_key(&proxy);
+        assert_ne!(ok, pk);
+    }
+
+    #[test]
+    fn proxy_cache_key_is_case_insensitive_on_host() {
+        // Proxy host lookup shouldn't be affected by case variation.
+        let a = Proxy::new("http://PROXY.Example:3128").unwrap();
+        let b = Proxy::new("http://proxy.example:3128").unwrap();
+        assert_eq!(proxy_cache_key(&a), proxy_cache_key(&b));
+    }
+
+    #[test]
+    fn pick_auth_scheme_for_proxy_uses_credentials() {
+        // AuthKind::Proxy currently routes through the same
+        // credential provider; verify it works end-to-end on the
+        // scheme-picking side. If we later key credentials on the
+        // proxy URL this test should be updated accordingly.
+        let client = fresh_client(Box::new(FixedCreds {
+            user: "px-u",
+            password: "px-p",
+        }));
+        let uri: Uri = "http://example.com/".parse().unwrap();
+        let challenges = [r#"Basic realm="proxy""#];
+        let got = client
+            .pick_auth_scheme_for(&challenges, &uri, AuthKind::Proxy)
+            .unwrap();
+        assert_eq!(got.0, "basic");
+        match got.1 {
+            CachedAuth::Basic { user, password } => {
+                assert_eq!(user, "px-u");
+                assert_eq!(password, "px-p");
+            }
+            _ => panic!("expected Basic"),
+        }
     }
 
     #[test]
