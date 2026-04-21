@@ -23,7 +23,6 @@ DEBUG = 0
 
 import base64
 import errno
-import hashlib
 import http.client
 import logging
 import os
@@ -31,7 +30,6 @@ import re
 import socket
 import ssl
 import sys
-import time
 import urllib
 import urllib.request
 from urllib.parse import urlencode, urljoin, urlparse
@@ -53,8 +51,8 @@ from dromedary.errors import (
     UnexpectedHttpStatus,
     UnusableRedirect,
 )
+from dromedary._transport_rs import http as _http_rs
 from dromedary.http import default_user_agent
-from dromedary.osutils import rand_chars
 
 logger = logging.getLogger("dromedary.http.urllib")
 debug_logger = logging.getLogger("dromedary.http")
@@ -78,23 +76,11 @@ kerberos = None
 def splitport(host):
     """Split a network host and port from a host string.
 
-    Parses a host string in the format 'hostname:port' and returns the
-    hostname and port as separate values.
-
-    Args:
-        host: A string containing hostname and optional port number in the
-            format 'hostname:port' or just 'hostname'.
-
-    Returns:
-        A tuple of (hostname, port) where:
-        - hostname (str): The hostname portion
-        - port (str or None): The port number as a string, or None if no port
+    Thin wrapper over the Rust implementation in
+    ``_transport_rs.http.splitport`` — see that function for the exact
+    semantics (digits-only port, empty port normalised to ``None``).
     """
-    m = re.fullmatch("(.*):([0-9]*)", host, re.DOTALL)
-    if m:
-        host, port = m.groups()
-        return host, port or None
-    return host, None
+    return _http_rs.splitport(host)
 
 
 class _ReportingFileSocket:
@@ -1459,12 +1445,7 @@ class AbstractAuthHandler(urllib.request.BaseHandler):
         :return: A tuple (scheme, remainder) scheme being the first word in the
             given header (lower cased), remainder may be None.
         """
-        try:
-            scheme, remainder = server_header.split(None, 1)
-        except ValueError:
-            scheme = server_header
-            remainder = None
-        return (scheme.lower(), remainder)
+        return _http_rs.parse_auth_header(server_header)
 
     def update_auth(self, auth, key, value):
         """Update a value in auth marking the auth as modified if needed."""
@@ -1855,33 +1836,27 @@ class BasicAuthHandler(AbstractAuthHandler):
 def get_digest_algorithm_impls(algorithm):
     """Get digest algorithm implementations for HTTP authentication.
 
-    Creates hash function implementations (H) and key derivation function (KD)
-    for the specified digest algorithm used in HTTP digest authentication.
+    Returns ``(H, KD)`` callables implemented in Rust, or ``(None, None)``
+    when the named algorithm is not supported (MD5 and SHA are the only
+    ones accepted, matching the previous Python behaviour).
 
     Args:
         algorithm: The digest algorithm name (e.g., 'MD5', 'SHA').
 
     Returns:
-        A tuple of (H, KD) where:
+        A tuple of (H, KD):
         - H: Hash function that takes bytes and returns hex digest
         - KD: Key derivation function that takes secret and data strings
-        Both functions return None if the algorithm is not supported.
+        Both are None if the algorithm is not supported.
     """
-    H = None
-    KD = None
-    if algorithm == "MD5":
+    if not _http_rs.digest_algorithm_supported(algorithm):
+        return None, None
 
-        def H(x):
-            return hashlib.md5(x).hexdigest()  # noqa: S324
-    elif algorithm == "SHA":
+    def H(x):
+        return _http_rs.digest_h(algorithm, x)
 
-        def H(x):
-            return hashlib.sha1(x).hexdigest()  # noqa: S324
-
-    if H is not None:
-
-        def KD(secret, data):
-            return H(f"{secret}:{data}".encode())
+    def KD(secret, data):
+        return _http_rs.digest_kd(algorithm, secret, data)
 
     return H, KD
 
@@ -1889,18 +1864,11 @@ def get_digest_algorithm_impls(algorithm):
 def get_new_cnonce(nonce, nonce_count):
     """Generate a new client nonce for HTTP digest authentication.
 
-    Creates a unique client nonce by combining the server nonce, nonce count,
-    current time, and random characters, then hashing the result.
-
-    Args:
-        nonce: The server-provided nonce string.
-        nonce_count: The number of times this nonce has been used.
-
-    Returns:
-        A 16-character hexadecimal string to use as client nonce.
+    Returns a 16-character hexadecimal string suitable for the
+    ``cnonce`` parameter. Delegates to the Rust implementation — see
+    ``_transport_rs.http.get_new_cnonce``.
     """
-    raw = "%s:%d:%s:%s" % (nonce, nonce_count, time.ctime(), rand_chars(8))
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]  # noqa: S324
+    return _http_rs.get_new_cnonce(nonce, nonce_count)
 
 
 class DigestAuthHandler(AbstractAuthHandler):
@@ -1940,9 +1908,7 @@ class DigestAuthHandler(AbstractAuthHandler):
             return False
 
         # Put the requested authentication info into a dict
-        req_auth = urllib.request.parse_keqv_list(
-            urllib.request.parse_http_list(raw_auth)
-        )
+        req_auth = _http_rs.parse_keqv_list(_http_rs.parse_http_list(raw_auth))
 
         # Check that we can handle that authentication
         qop = req_auth.get("qop", None)
