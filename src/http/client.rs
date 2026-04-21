@@ -7,12 +7,37 @@
 //! platform's native store, and the User-Agent managed by the
 //! module-level setter.
 //!
-//! Stage 6 scope is deliberately minimal: request/response flow
-//! through the agent, non-2xx statuses surface as normal responses,
-//! redirects are caught at the client boundary but not yet
-//! followed, and authentication is not wired in. Each of those
-//! pieces lands in a follow-up commit on this branch so the diff
-//! stays reviewable.
+//! # Known limitations
+//!
+//! ## Proxy protocol: CONNECT only
+//!
+//! ureq's HTTP proxy support uses CONNECT tunneling for both
+//! `http://` and `https://` origin URLs. That's fine for HTTPS
+//! (everyone uses CONNECT) but differs from the pre-Rust
+//! urllib-based transport, which used absolute-form request-targets
+//! (`GET http://origin/path HTTP/1.1`) for plain HTTP through a
+//! proxy. Some proxy servers (notably squid in its default config)
+//! accept absolute-form GETs for plain HTTP but reject CONNECT to
+//! port 80, so users of that configuration will see a
+//! `501 Not Implemented` when combined with `http_proxy`.
+//!
+//! Workaround options today:
+//!
+//! - Use `https://` URLs (CONNECT works everywhere).
+//! - Configure the proxy server to allow CONNECT to plain HTTP
+//!   ports.
+//! - Set `no_proxy` to bypass the proxy for affected origins.
+//!
+//! TODO: swap in a custom `ureq::unversioned::transport::Connector`
+//! that emits absolute-form HTTP requests for plain-HTTP proxies.
+//! The Connector trait is at
+//! `ureq::unversioned::transport::Connector` — a chain that opens
+//! TCP to the *proxy* address and then writes the request with an
+//! absolute-form request-target (`GET http://origin/path HTTP/1.1`)
+//! rather than going through the CONNECT tunneling path. See
+//! [`HttpClient::choose_proxy`] for where the bad combination is
+//! detected today; the warning emitted there should go away once
+//! the connector is wired up.
 
 use std::path::Path;
 use std::time::Duration;
@@ -947,10 +972,36 @@ impl HttpClient {
         let Some(proxy_url) = get_proxy_env_var(&env, scheme, Some("all")) else {
             return Ok(None);
         };
+        // ureq tunnels via CONNECT for both http:// and https://
+        // origins. Some proxies (squid default) accept absolute-
+        // form GETs for plain HTTP but reject CONNECT to port 80.
+        // See the module-level docs + TODO. Warn once per process
+        // so users hitting the regression can diagnose it quickly.
+        if scheme == "http" {
+            warn_about_plain_http_proxy_once();
+        }
         Proxy::new(&proxy_url)
             .map(Some)
             .map_err(|e| ClientError::InvalidRequest(format!("bad proxy URL {}: {}", proxy_url, e)))
     }
+}
+
+/// Log-once guard for the plain-HTTP-through-proxy warning. Using a
+/// static `Once` keeps the client quiet for the common HTTPS case
+/// and emits a single diagnostic for the known-problematic
+/// combination. See the module-level `TODO` for the real fix.
+fn warn_about_plain_http_proxy_once() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        log::warn!(
+            "plain HTTP proxied request: ureq will tunnel via CONNECT \
+             rather than emit absolute-form GET. Proxies expecting \
+             absolute-form (e.g. squid default) may reject with \
+             501. Use https:// or set no_proxy to bypass. See \
+             dromedary::http::client module docs for details.",
+        );
+    });
 }
 
 /// Build the initial `ureq::Config` honouring our TLS/User-Agent/
