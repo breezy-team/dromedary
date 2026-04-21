@@ -21,18 +21,17 @@ import errno
 import logging
 import os
 import socket
-import subprocess
-import sys
 from binascii import hexlify
 
 from catalogus import registry
 
 from dromedary import _bedding as bedding
 from dromedary import _config, _ui, errors
-from dromedary.errors import SocketConnectionError, StrangeHostname
-from dromedary.osutils import get_terminal_encoding, pathjoin, set_fd_cloexec
+from dromedary.errors import SocketConnectionError
+from dromedary.osutils import pathjoin
 
 from .._transport_rs import sftp as _sftp_rs
+from .._transport_rs import ssh as _ssh_rs
 
 logger = logging.getLogger("dromedary.ssh")
 
@@ -107,76 +106,21 @@ class SSHVendorManager(registry.Registry[str, "SSHVendor", None]):
             return vendor
         return None
 
-    def _get_ssh_version_string(self, args):
-        """Return SSH version string from the subprocess.
-
-        Runs the given command and captures its output to determine
-        the SSH implementation version.
-
-        Args:
-            args: Command line arguments to execute (typically ['ssh', '-V']).
-
-        Returns:
-            str: Combined stdout and stderr output decoded using terminal encoding.
-                Returns empty string if the command fails.
-        """
-        try:
-            p = subprocess.Popen(
-                args,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                bufsize=0,
-                **os_specific_subprocess_params(),
-            )
-            stdout, stderr = p.communicate()
-        except OSError:
-            stdout = stderr = b""
-        return (stdout + stderr).decode(get_terminal_encoding())
-
-    def _get_vendor_by_version_string(self, version, progname):
-        """Return the vendor or None based on output from the subprocess.
-
-        Examines the version string to determine which SSH implementation
-        is being used (OpenSSH, SSH Corp, GNU lsh, or PuTTY plink).
-
-        Args:
-            version: The output of 'ssh -V' like command.
-            progname: The program name that was executed.
-
-        Returns:
-            SSHVendor: The appropriate vendor instance, or None if not recognized.
-        """
-        vendor = None
-        if "OpenSSH" in version:
-            logger.debug("ssh implementation is OpenSSH")
-            vendor = OpenSSHSubprocessVendor()
-        elif "SSH Secure Shell" in version:
-            logger.debug("ssh implementation is SSH Corp.")
-            vendor = SSHCorpSubprocessVendor()
-        elif "lsh" in version:
-            logger.debug("ssh implementation is GNU lsh.")
-            vendor = LSHSubprocessVendor()
-        # As plink user prompts are not handled currently, don't auto-detect
-        # it by inspection below, but keep this vendor detection for if a path
-        # is given in BRZ_SSH. See https://bugs.launchpad.net/bugs/414743
-        elif "plink" in version and progname == "plink":
-            # Checking if "plink" was the executed argument as Windows
-            # sometimes reports 'ssh -V' incorrectly with 'plink' in its
-            # version.  See https://bugs.launchpad.net/bzr/+bug/107155
-            logger.debug("ssh implementation is Putty's plink.")
-            vendor = PLinkSubprocessVendor()
-        return vendor
-
     def _get_vendor_by_inspection(self):
         """Return the vendor or None by checking for known SSH implementations.
 
-        Runs 'ssh -V' to determine the SSH implementation in use.
+        Runs 'ssh -V' to determine the SSH implementation in use. Detection
+        runs in Rust; this just maps the returned registry key back to a
+        vendor instance.
 
         Returns:
             SSHVendor: The detected vendor, or None if not recognized.
         """
-        version = self._get_ssh_version_string(["ssh", "-V"])
-        return self._get_vendor_by_version_string(version, "ssh")
+        key = _ssh_rs.detect_ssh_vendor("ssh")
+        if key is None:
+            return None
+        logger.debug("ssh implementation detected as %s", key)
+        return self.get(key)
 
     def _get_vendor_from_path(self, path):
         """Return the vendor or None using the program at the given path.
@@ -189,10 +133,11 @@ class SSHVendorManager(registry.Registry[str, "SSHVendor", None]):
         Returns:
             SSHVendor: The detected vendor, or None if not recognized.
         """
-        version = self._get_ssh_version_string([path, "-V"])
-        return self._get_vendor_by_version_string(
-            version, os.path.splitext(os.path.basename(path))[0]
-        )
+        key = _ssh_rs.detect_ssh_vendor(path)
+        if key is None:
+            return None
+        logger.debug("ssh implementation at %s detected as %s", path, key)
+        return self.get(key)
 
     def get_vendor(self):
         """Find out what version of SSH is on the system.
@@ -218,28 +163,6 @@ _ssh_vendor_manager = SSHVendorManager()
 _get_ssh_vendor = _ssh_vendor_manager.get_vendor
 register_ssh_vendor = _ssh_vendor_manager.register
 register_lazy_ssh_vendor = _ssh_vendor_manager.register_lazy
-
-
-def _ignore_signals():
-    """Configure signal handling for SSH subprocesses.
-
-    Sets up signal handlers to ignore SIGINT and conditionally SIGQUIT.
-    This prevents the SSH subprocess from being interrupted by keyboard
-    interrupts intended for the parent process.
-
-    The function ignores:
-    - SIGINT: Always ignored to prevent Ctrl+C from affecting SSH
-    - SIGQUIT: Ignored if not already set to default (to respect breakin)
-    """
-    # TODO: This should possibly ignore SIGHUP as well, but bzr currently
-    # doesn't handle it itself.
-    # <https://launchpad.net/products/bzr/+bug/41433/+index>
-    import signal
-
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-    # GZ 2010-02-19: Perhaps make this check if breakin is installed instead
-    if signal.getsignal(signal.SIGQUIT) != signal.SIG_DFL:
-        signal.signal(signal.SIGQUIT, signal.SIG_IGN)
 
 
 class SocketAsChannelAdapter:
@@ -401,281 +324,17 @@ class LoopbackVendor(SSHVendor):
 register_ssh_vendor("loopback", LoopbackVendor())
 
 
-_ssh_connection_errors: tuple[type[Exception], ...] = (
-    EOFError,
-    OSError,
-    IOError,
-    socket.error,
-)
+# Rust-backed vendors. Registered lazily so the extension module is only
+# imported when one of these vendors is actually selected.
+register_lazy_ssh_vendor("russh", "dromedary.ssh.russh", "russh_vendor")
+register_lazy_ssh_vendor("openssh", "dromedary.ssh.subprocess_rs", "openssh_vendor")
+register_lazy_ssh_vendor("lsh", "dromedary.ssh.subprocess_rs", "lsh_vendor")
+register_lazy_ssh_vendor("plink", "dromedary.ssh.subprocess_rs", "plink_vendor")
+_ssh_vendor_manager.default_key = "russh"
+
 if paramiko is not None:
     register_lazy_ssh_vendor("paramiko", "dromedary.ssh.paramiko", "paramiko_vendor")
     register_lazy_ssh_vendor("none", "dromedary.ssh.paramiko", "paramiko_vendor")
-    _ssh_vendor_manager.default_key = "paramiko"
-    _ssh_connection_errors += (paramiko.SSHException,)
-
-
-class SubprocessVendor(SSHVendor):
-    """Abstract base class for vendors that use pipes to a subprocess."""
-
-    # In general stderr should be inherited from the parent process so prompts
-    # are visible on the terminal. This can be overriden to another file for
-    # tests, but beware of using PIPE which may hang due to not being read.
-    _stderr_target = None
-
-    @staticmethod
-    def _check_hostname(arg):
-        """Check if hostname is safe to pass to subprocess.
-
-        Args:
-            arg: The hostname to check.
-
-        Raises:
-            StrangeHostname: If the hostname starts with a dash.
-        """
-        if arg.startswith("-"):
-            raise StrangeHostname(hostname=arg)
-
-    def _connect(self, argv):
-        """Create and connect to an SSH subprocess.
-
-        Attempts to use socketpair for better performance (non-blocking reads),
-        falling back to pipes if socketpair is not available.
-
-        Args:
-            argv: Command line arguments for the SSH subprocess.
-
-        Returns:
-            SSHSubprocessConnection: A connection to the SSH subprocess.
-        """
-        # Attempt to make a socketpair to use as stdin/stdout for the SSH
-        # subprocess.  We prefer sockets to pipes because they support
-        # non-blocking short reads, allowing us to optimistically read 64k (or
-        # whatever) chunks.
-        try:
-            my_sock, subproc_sock = socket.socketpair()
-            set_fd_cloexec(my_sock)
-        except (AttributeError, OSError):
-            # This platform doesn't support socketpair(), so just use ordinary
-            # pipes instead.
-            stdin = stdout = subprocess.PIPE
-            my_sock, subproc_sock = None, None
-        else:
-            stdin = stdout = subproc_sock
-        proc = subprocess.Popen(
-            argv,
-            stdin=stdin,
-            stdout=stdout,
-            stderr=self._stderr_target,
-            bufsize=0,
-            **os_specific_subprocess_params(),
-        )
-        if subproc_sock is not None:
-            subproc_sock.close()
-        return SSHSubprocessConnection(proc, sock=my_sock)
-
-    def connect_sftp(self, username, password, host, port):
-        """Connect to an SFTP server using an SSH subprocess.
-
-        Args:
-            username: SSH username.
-            password: SSH password (not used by subprocess vendors).
-            host: Hostname to connect to.
-            port: Port number to connect to.
-
-        Returns:
-            SFTPClient: An SFTP client connected via SSH subprocess.
-
-        Raises:
-            SocketConnectionError: If connection fails.
-        """
-        try:
-            argv = self._get_vendor_specific_argv(
-                username, host, port, subsystem="sftp"
-            )
-            sock = self._connect(argv)
-            return SFTPClient(sock._sock.detach())
-        except _ssh_connection_errors as e:
-            self._raise_connection_error(host, port=port, orig_error=e)
-
-    def connect_ssh(self, username, password, host, port, command):
-        """Connect to an SSH server and run a command.
-
-        Args:
-            username: SSH username.
-            password: SSH password (not used by subprocess vendors).
-            host: Hostname to connect to.
-            port: Port number to connect to.
-            command: Command to execute on the remote host.
-
-        Returns:
-            SSHSubprocessConnection: A connection to the SSH subprocess.
-
-        Raises:
-            SocketConnectionError: If connection fails.
-        """
-        try:
-            argv = self._get_vendor_specific_argv(username, host, port, command=command)
-            return self._connect(argv)
-        except _ssh_connection_errors as e:
-            self._raise_connection_error(host, port=port, orig_error=e)
-
-    def _get_vendor_specific_argv(
-        self, username, host, port, subsystem=None, command=None
-    ):
-        """Returns the argument list to run the subprocess with.
-
-        Exactly one of 'subsystem' and 'command' must be specified.
-        """
-        raise NotImplementedError(self._get_vendor_specific_argv)
-
-
-class OpenSSHSubprocessVendor(SubprocessVendor):
-    """SSH vendor that uses the 'ssh' executable from OpenSSH."""
-
-    executable_path = "ssh"
-
-    def _get_vendor_specific_argv(
-        self, username, host, port, subsystem=None, command=None
-    ):
-        """Build OpenSSH command line arguments.
-
-        Args:
-            username: SSH username.
-            host: Hostname to connect to.
-            port: Port number (optional).
-            subsystem: SSH subsystem to invoke (e.g., 'sftp').
-            command: Command to execute (alternative to subsystem).
-
-        Returns:
-            list: Command line arguments for OpenSSH.
-        """
-        args = [
-            self.executable_path,
-            "-oForwardX11=no",
-            "-oForwardAgent=no",
-            "-oClearAllForwardings=yes",
-            "-oNoHostAuthenticationForLocalhost=yes",
-        ]
-        if port is not None:
-            args.extend(["-p", str(port)])
-        if username is not None:
-            args.extend(["-l", username])
-        if subsystem is not None:
-            args.extend(["-s", "--", host, subsystem])
-        else:
-            args.extend(["--", host] + command)
-        return args
-
-
-register_ssh_vendor("openssh", OpenSSHSubprocessVendor())
-
-
-class SSHCorpSubprocessVendor(SubprocessVendor):
-    """SSH vendor that uses the 'ssh' executable from SSH Corporation."""
-
-    executable_path = "ssh"
-
-    def _get_vendor_specific_argv(
-        self, username, host, port, subsystem=None, command=None
-    ):
-        """Build SSH Corporation command line arguments.
-
-        Args:
-            username: SSH username.
-            host: Hostname to connect to.
-            port: Port number (optional).
-            subsystem: SSH subsystem to invoke (e.g., 'sftp').
-            command: Command to execute (alternative to subsystem).
-
-        Returns:
-            list: Command line arguments for SSH Corp's ssh.
-        """
-        self._check_hostname(host)
-        args = [self.executable_path, "-x"]
-        if port is not None:
-            args.extend(["-p", str(port)])
-        if username is not None:
-            args.extend(["-l", username])
-        if subsystem is not None:
-            args.extend(["-s", subsystem, host])
-        else:
-            args.extend([host] + command)
-        return args
-
-
-register_ssh_vendor("sshcorp", SSHCorpSubprocessVendor())
-
-
-class LSHSubprocessVendor(SubprocessVendor):
-    """SSH vendor that uses the 'lsh' executable from GNU."""
-
-    executable_path = "lsh"
-
-    def _get_vendor_specific_argv(
-        self, username, host, port, subsystem=None, command=None
-    ):
-        """Build GNU lsh command line arguments.
-
-        Args:
-            username: SSH username.
-            host: Hostname to connect to.
-            port: Port number (optional).
-            subsystem: SSH subsystem to invoke (e.g., 'sftp').
-            command: Command to execute (alternative to subsystem).
-
-        Returns:
-            list: Command line arguments for GNU lsh.
-        """
-        self._check_hostname(host)
-        args = [self.executable_path]
-        if port is not None:
-            args.extend(["-p", str(port)])
-        if username is not None:
-            args.extend(["-l", username])
-        if subsystem is not None:
-            args.extend(["--subsystem", subsystem, host])
-        else:
-            args.extend([host] + command)
-        return args
-
-
-register_ssh_vendor("lsh", LSHSubprocessVendor())
-
-
-class PLinkSubprocessVendor(SubprocessVendor):
-    """SSH vendor that uses the 'plink' executable from Putty."""
-
-    executable_path = "plink"
-
-    def _get_vendor_specific_argv(
-        self, username, host, port, subsystem=None, command=None
-    ):
-        """Build PuTTY plink command line arguments.
-
-        Args:
-            username: SSH username.
-            host: Hostname to connect to.
-            port: Port number (optional).
-            subsystem: SSH subsystem to invoke (e.g., 'sftp').
-            command: Command to execute (alternative to subsystem).
-
-        Returns:
-            list: Command line arguments for plink.
-        """
-        self._check_hostname(host)
-        args = [self.executable_path, "-x", "-a", "-ssh", "-2", "-batch"]
-        if port is not None:
-            args.extend(["-P", str(port)])
-        if username is not None:
-            args.extend(["-l", username])
-        if subsystem is not None:
-            args.extend(["-s", host, subsystem])
-        else:
-            args.extend([host] + command)
-        return args
-
-
-register_ssh_vendor("plink", PLinkSubprocessVendor())
 
 
 def _paramiko_auth(username, password, host, port, paramiko_transport):
@@ -831,78 +490,6 @@ def save_host_keys():
         logger.debug("failed to save bzr host keys: %s", e)
 
 
-def os_specific_subprocess_params():
-    """Get O/S specific subprocess parameters.
-
-    Returns different parameters based on the operating system:
-    - Windows: Empty dict (no special handling)
-    - Unix-like: Dict with preexec_fn to ignore signals and close_fds=True
-
-    Returns:
-        dict: Subprocess parameters suitable for the current OS.
-    """
-    if sys.platform == "win32":
-        # setting the process group and closing fds is not supported on
-        # win32
-        return {}
-    else:
-        # We close fds other than the pipes as the child process does not need
-        # them to be open.
-        #
-        # We also set the child process to ignore SIGINT.  Normally the signal
-        # would be sent to every process in the foreground process group, but
-        # this causes it to be seen only by bzr and not by ssh.  Python will
-        # generate a KeyboardInterrupt in bzr, and we will then have a chance
-        # to release locks or do other cleanup over ssh before the connection
-        # goes away.
-        # <https://launchpad.net/products/bzr/+bug/5987>
-        #
-        # Running it in a separate process group is not good because then it
-        # can't get non-echoed input of a password or passphrase.
-        # <https://launchpad.net/products/bzr/+bug/40508>
-        return {
-            "preexec_fn": _ignore_signals,
-            "close_fds": True,
-        }
-
-
-import weakref
-
-_subproc_weakrefs: set[weakref.ref] = set()
-
-
-def _close_ssh_proc(proc, sock):
-    """Carefully close stdin/stdout and reap the SSH process.
-
-    If the pipes are already closed and/or the process has already been
-    wait()ed on, that's ok, and no error is raised.  The goal is to do our best
-    to clean up (whether or not a clean up was already tried).
-
-    Args:
-        proc: The subprocess.Popen instance to clean up.
-        sock: Optional socket to close (may be None).
-
-    Note:
-        Silently ignores OSError exceptions during cleanup to handle
-        already-closed resources gracefully.
-    """
-    funcs = []
-    for closeable in (proc.stdin, proc.stdout, sock):
-        # We expect that either proc (a subprocess.Popen) will have stdin and
-        # stdout streams to close, or that we will have been passed a socket to
-        # close, with the option not in use being None.
-        if closeable is not None:
-            funcs.append(closeable.close)
-    funcs.append(proc.wait)
-    for func in funcs:
-        try:
-            func()
-        except OSError:
-            # It's ok for the pipe to already be closed, or the process to
-            # already be finished.
-            continue
-
-
 class SSHConnection:
     """Abstract base class for SSH connections."""
 
@@ -928,85 +515,3 @@ class SSHConnection:
         connection type.
         """
         raise NotImplementedError(self.close)
-
-
-class SSHSubprocessConnection(SSHConnection):
-    """A connection to an ssh subprocess via pipes or a socket.
-
-    This class is also socket-like enough to be used with
-    SocketAsChannelAdapter (it has 'send' and 'recv' methods).
-    """
-
-    def __init__(self, proc, sock=None):
-        """Constructor.
-
-        :param proc: a subprocess.Popen
-        :param sock: if proc.stdin/out is a socket from a socketpair, then sock
-            should breezy's half of that socketpair.  If not passed, proc's
-            stdin/out is assumed to be ordinary pipes.
-        """
-        self.proc = proc
-        self._sock = sock
-        # Add a weakref to proc that will attempt to do the same as self.close
-        # to avoid leaving processes lingering indefinitely.
-
-        def terminate(ref):
-            _subproc_weakrefs.remove(ref)
-            _close_ssh_proc(proc, sock)
-
-        _subproc_weakrefs.add(weakref.ref(self, terminate))
-
-    def send(self, data):
-        """Send data through the connection.
-
-        Uses either socket.send() or os.write() depending on the
-        connection type.
-
-        Args:
-            data: Bytes to send.
-
-        Returns:
-            int: Number of bytes sent.
-        """
-        if self._sock is not None:
-            return self._sock.send(data)
-        else:
-            return os.write(self.proc.stdin.fileno(), data)
-
-    def recv(self, count):
-        """Receive data from the connection.
-
-        Uses either socket.recv() or os.read() depending on the
-        connection type.
-
-        Args:
-            count: Maximum number of bytes to receive.
-
-        Returns:
-            bytes: Data received from the connection.
-        """
-        if self._sock is not None:
-            return self._sock.recv(count)
-        else:
-            return os.read(self.proc.stdout.fileno(), count)
-
-    def close(self):
-        """Close the SSH subprocess connection.
-
-        Delegates to _close_ssh_proc to handle cleanup of the subprocess
-        and any associated sockets or pipes.
-        """
-        _close_ssh_proc(self.proc, self._sock)
-
-    def get_sock_or_pipes(self):
-        """Get the underlying I/O objects for this connection.
-
-        Returns:
-            tuple: A (kind, io_object) pair where:
-                - If using socketpair: ('socket', socket_object)
-                - If using pipes: ('pipes', (stdout_pipe, stdin_pipe))
-        """
-        if self._sock is not None:
-            return "socket", self._sock
-        else:
-            return "pipes", (self.proc.stdout, self.proc.stdin)

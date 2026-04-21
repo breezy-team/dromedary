@@ -5,7 +5,17 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyType};
 
 use std::collections::VecDeque;
+use std::io::{Read, Write};
 use std::sync::Arc;
+
+/// Synchronous bidirectional byte stream the SFTP client can run over.
+/// Either a `std::fs::File` (subprocess vendors hand us an fd) or the
+/// russh blocking adapter. Boxed so `SFTPClient` has a single concrete
+/// generic instantiation regardless of backend.
+pub(crate) trait SshChannel: Read + Write + Send {}
+impl<T: Read + Write + Send + ?Sized> SshChannel for T {}
+
+pub(crate) type BoxedChannel = Box<dyn SshChannel>;
 
 create_exception!(dromedary._transport_rs, SFTPError, PyException);
 import_exception!(dromedary.errors, NoSuchFile);
@@ -43,9 +53,23 @@ impl SFTPAttributes {
 }
 
 #[pyclass]
-struct SFTPClient {
-    sftp: Arc<sftp::SftpClient<std::fs::File>>,
+pub(crate) struct SFTPClient {
+    sftp: Arc<sftp::SftpClient<BoxedChannel>>,
     cwd: Option<String>,
+}
+
+impl SFTPClient {
+    /// Construct an SFTP client over an arbitrary sync byte-stream channel.
+    /// Used by library-backed SSH vendors (russh etc.) that produce a stream
+    /// rather than a kernel fd.
+    #[cfg(feature = "russh")]
+    pub(crate) fn from_channel(channel: BoxedChannel) -> std::io::Result<Self> {
+        let session = sftp::SftpClient::new(channel)?;
+        Ok(Self {
+            sftp: Arc::new(session),
+            cwd: None,
+        })
+    }
 }
 
 fn sftp_error_to_py_err(e: sftp::Error, path: Option<&str>) -> PyErr {
@@ -65,7 +89,7 @@ fn sftp_error_to_py_err(e: sftp::Error, path: Option<&str>) -> PyErr {
 
 #[pyclass]
 struct SFTPFile {
-    sftp: Arc<sftp::SftpClient<std::fs::File>>,
+    sftp: Arc<sftp::SftpClient<BoxedChannel>>,
     file: sftp::File,
     offset: u64,
 }
@@ -172,7 +196,7 @@ impl SFTPFile {
         #[pyclass]
         struct ReadvIter {
             offsets: VecDeque<(u64, u32)>,
-            sftp: Arc<sftp::SftpClient<std::fs::File>>,
+            sftp: Arc<sftp::SftpClient<BoxedChannel>>,
             file: sftp::File,
         }
 
@@ -254,7 +278,7 @@ impl SFTPFile {
 }
 
 #[pyclass]
-struct SFTPDir(Arc<sftp::SftpClient<std::fs::File>>, sftp::Directory);
+struct SFTPDir(Arc<sftp::SftpClient<BoxedChannel>>, sftp::Directory);
 
 #[pymethods]
 impl SFTPDir {
@@ -284,14 +308,20 @@ impl SFTPClient {
     fn new(py: Python, fd: isize) -> PyResult<Self> {
         let session = py.detach(|| {
             #[cfg(unix)]
-            {
-                sftp::SftpClient::<std::fs::File>::from_fd(fd as i32)
-            }
+            let channel: BoxedChannel = {
+                use std::os::fd::FromRawFd;
+                // SAFETY: `fd` was produced by a vendor that transferred
+                // ownership via `detach_fd`; wrapping it in `File` makes
+                // us the sole owner, closed on `Drop`.
+                Box::new(unsafe { std::fs::File::from_raw_fd(fd as i32) })
+            };
             #[cfg(windows)]
-            {
-                use std::os::windows::io::RawHandle;
-                sftp::SftpClient::<std::fs::File>::from_handle(fd as RawHandle)
-            }
+            let channel: BoxedChannel = {
+                use std::os::windows::io::{FromRawHandle, RawHandle};
+                // SAFETY: same detach-and-transfer contract as unix above.
+                Box::new(unsafe { std::fs::File::from_raw_handle(fd as RawHandle) })
+            };
+            sftp::SftpClient::new(channel)
         })?;
         Ok(Self {
             sftp: Arc::new(session),

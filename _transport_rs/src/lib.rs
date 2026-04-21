@@ -1290,6 +1290,7 @@ mod memory;
 mod pathfilter;
 mod readonly;
 mod sftp;
+mod ssh;
 mod unlistable;
 mod urlutils;
 
@@ -1311,6 +1312,10 @@ fn _transport_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     let sftpm = PyModule::new(py, "sftp")?;
     sftp::_sftp_rs(py, &sftpm)?;
     m.add_submodule(&sftpm)?;
+
+    let sshm = PyModule::new(py, "ssh")?;
+    ssh::register(py, &sshm)?;
+    m.add_submodule(&sshm)?;
     m.add_class::<ReadLock>()?;
     m.add_class::<WriteLock>()?;
     m.add_class::<TemporaryWriteLock>()?;
@@ -1371,6 +1376,7 @@ fn _transport_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     // Register submodules in sys.modules for dotted import support
     modules.set_item(format!("{}.local", module_name), &localm)?;
     modules.set_item(format!("{}.sftp", module_name), &sftpm)?;
+    modules.set_item(format!("{}.ssh", module_name), &sshm)?;
     modules.set_item(format!("{}.urlutils", module_name), &urlutilsm)?;
     modules.set_item(format!("{}.unlistable", module_name), &unlistablem)?;
     modules.set_item(format!("{}.readonly", module_name), &readonlym)?;
