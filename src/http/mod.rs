@@ -28,6 +28,125 @@ pub const SSL_CA_CERTS_KNOWN_LOCATIONS: &[&str] = &[
 
 lazy_static! {
     static ref CA_PATH_CACHE: Mutex<Option<String>> = Mutex::new(None);
+    /// Current User-Agent prefix used by the HTTP client. Starts as
+    /// `"Dromedary/<version>"`; breezy overrides this via
+    /// [`set_user_agent`] at module load.
+    static ref USER_AGENT_PREFIX: Mutex<String> =
+        Mutex::new(format!("Dromedary/{}", env!("CARGO_PKG_VERSION")));
+    /// Path to the PEM bundle we materialised from the platform's
+    /// native certificate store. Cached for the process lifetime so
+    /// repeated calls don't re-read the keychain / registry.
+    static ref NATIVE_CA_BUNDLE_PATH: Mutex<Option<String>> = Mutex::new(None);
+}
+
+/// Replace the current User-Agent prefix.
+pub fn set_user_agent(prefix: String) {
+    *USER_AGENT_PREFIX.lock().unwrap() = prefix;
+}
+
+/// Return the current User-Agent prefix.
+pub fn default_user_agent() -> String {
+    USER_AGENT_PREFIX.lock().unwrap().clone()
+}
+
+/// Certificate verification requirement. The integer representation
+/// matches the Python `ssl.CERT_*` constants so the Rust and Python
+/// sides can interchange values without a translation table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CertReqs {
+    /// `ssl.CERT_NONE` — no verification.
+    None = 0,
+    /// `ssl.CERT_REQUIRED` — verify the peer certificate.
+    Required = 2,
+}
+
+impl CertReqs {
+    pub fn to_int(self) -> u8 {
+        self as u8
+    }
+}
+
+/// Path to a PEM bundle materialised from the platform's native
+/// certificate store (macOS keychain, Windows cert store, or the
+/// Linux `ca-certificates` bundle by way of `SSL_CERT_FILE` /
+/// `SSL_CERT_DIR` env vars).
+///
+/// Returns `None` if nothing could be loaded — that includes the case
+/// where the platform has no native store at all, or where loading
+/// failed for any reason (we treat failure as "no certs" rather than
+/// poisoning the Python side with an exception).
+///
+/// The file is written once per process and kept on disk so Python's
+/// `ssl.load_verify_locations(cafile=...)` has a stable path to
+/// reference. Subsequent calls return the cached path.
+///
+/// Tests may invalidate the cache via [`clear_native_ca_bundle_cache`].
+pub fn native_ca_bundle_path() -> Option<String> {
+    if let Some(cached) = NATIVE_CA_BUNDLE_PATH.lock().unwrap().as_ref() {
+        return Some(cached.clone());
+    }
+
+    let certs = match rustls_native_certs::load_native_certs() {
+        result if result.errors.is_empty() && !result.certs.is_empty() => result.certs,
+        _ => return None,
+    };
+
+    // Serialise to PEM. Writing "-----BEGIN CERTIFICATE-----" wrappers
+    // around base64-encoded DER by hand keeps us off the `pem` crate.
+    let mut pem = String::with_capacity(certs.len() * 2000);
+    for der in &certs {
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(der);
+        pem.push_str("-----BEGIN CERTIFICATE-----\n");
+        // PEM wraps at 64 chars.
+        for chunk in encoded.as_bytes().chunks(64) {
+            pem.push_str(std::str::from_utf8(chunk).unwrap());
+            pem.push('\n');
+        }
+        pem.push_str("-----END CERTIFICATE-----\n");
+    }
+
+    let mut tmp = match tempfile::Builder::new()
+        .prefix("dromedary-native-ca-")
+        .suffix(".pem")
+        .tempfile()
+    {
+        Ok(t) => t,
+        Err(_) => return None,
+    };
+    use std::io::Write;
+    if tmp.write_all(pem.as_bytes()).is_err() {
+        return None;
+    }
+    let path = match tmp.into_temp_path().keep() {
+        Ok(p) => p,
+        Err(_) => return None,
+    };
+    let path_str = path.to_string_lossy().into_owned();
+    *NATIVE_CA_BUNDLE_PATH.lock().unwrap() = Some(path_str.clone());
+    Some(path_str)
+}
+
+/// Invalidate the cached native CA bundle path (for tests).
+pub fn clear_native_ca_bundle_cache() {
+    *NATIVE_CA_BUNDLE_PATH.lock().unwrap() = None;
+}
+
+/// Platform-default certificate verification requirement.
+///
+/// Windows and macOS historically had no native access to root
+/// certificates from Python's `ssl`, so Breezy chose `CERT_NONE`
+/// there to avoid false negatives. Everywhere else `CERT_REQUIRED`
+/// is the safe default. With the native-certs branch in
+/// [`default_ca_certs`] we could tighten this later, but for now we
+/// preserve the historical behaviour.
+pub fn default_cert_reqs() -> CertReqs {
+    if cfg!(any(target_os = "windows", target_os = "macos")) {
+        CertReqs::None
+    } else {
+        CertReqs::Required
+    }
 }
 
 /// Clear the cached CA bundle path.
@@ -111,15 +230,35 @@ fn find_windows_ca_bundle() -> Option<String> {
 
 /// Return the default CA certificates path for the running platform.
 ///
-/// On non-Windows, non-macOS systems, scans [`SSL_CA_CERTS_KNOWN_LOCATIONS`]
-/// and returns the first entry that exists on disk. If nothing is found the
-/// first known location is returned as a fallback so that any error message
-/// surfaced to the user at least points at a plausible path.
+/// Precedence:
 ///
-/// On Windows the convention is to look for `cacert.pem` next to the
-/// executable. On macOS there is no sensible default (tracked upstream); we
-/// fall back to the same placeholder as when nothing is found on Linux.
+/// 1. On Linux, scan [`SSL_CA_CERTS_KNOWN_LOCATIONS`] first — the
+///    system bundle there is what most TLS libraries read anyway, and
+///    keeping it means we pass the *real* path (not a materialised
+///    copy) to Python's `ssl.load_verify_locations`.
+/// 2. Otherwise materialise the native certificate store to a PEM
+///    tempfile (via [`native_ca_bundle_path`]) and return that path.
+///    This is the main win on Windows and macOS where the Python
+///    `ssl` module otherwise can't see the native root CAs.
+/// 3. On Linux with nothing installed, return the first known
+///    location as a breadcrumb so error messages point at a plausible
+///    path. On Windows, fall back to looking for `cacert.pem` next to
+///    the executable (the historical default Breezy used).
 pub fn default_ca_certs() -> String {
+    // Linux first: prefer the real system bundle over a
+    // materialisation of it.
+    if !cfg!(any(target_os = "windows", target_os = "macos")) {
+        for path in SSL_CA_CERTS_KNOWN_LOCATIONS {
+            if Path::new(path).exists() {
+                return (*path).to_string();
+            }
+        }
+    }
+
+    if let Some(native) = native_ca_bundle_path() {
+        return native;
+    }
+
     if cfg!(target_os = "windows") {
         if let Some(argv0) = std::env::args_os().next() {
             if let Ok(canon) = Path::new(&argv0).canonicalize() {
@@ -131,17 +270,7 @@ pub fn default_ca_certs() -> String {
         return "cacert.pem".to_string();
     }
 
-    if cfg!(target_os = "macos") {
-        // TODO: No sensible default for macOS yet; upstream is still waiting
-        // on installer-team feedback (see Python source comments).
-        return SSL_CA_CERTS_KNOWN_LOCATIONS[0].to_string();
-    }
-
-    for path in SSL_CA_CERTS_KNOWN_LOCATIONS {
-        if Path::new(path).exists() {
-            return (*path).to_string();
-        }
-    }
+    // Linux no-bundle fallback (Unix with no known location on disk).
     SSL_CA_CERTS_KNOWN_LOCATIONS[0].to_string()
 }
 
@@ -390,6 +519,27 @@ mod tests {
     #[test]
     fn user_agent_format() {
         assert_eq!(format_user_agent("Dromedary", "0.1.0"), "Dromedary/0.1.0");
+    }
+
+    #[test]
+    fn default_cert_reqs_matches_ssl_constants() {
+        // `ssl.CERT_NONE == 0` and `ssl.CERT_REQUIRED == 2` are load-
+        // bearing: the Python side compares this integer against those
+        // constants. If the enum ever grows a new variant, it must
+        // reuse the corresponding stdlib integer.
+        let v = default_cert_reqs().to_int();
+        assert!(matches!(v, 0 | 2));
+    }
+
+    #[test]
+    fn user_agent_setter_roundtrips() {
+        // The User-Agent prefix is process-global state, so other
+        // tests may have mutated it. Save and restore around this
+        // test to keep the suite self-contained.
+        let prev = default_user_agent();
+        set_user_agent("Test-Agent/1.0".into());
+        assert_eq!(default_user_agent(), "Test-Agent/1.0");
+        set_user_agent(prev);
     }
 
     #[test]

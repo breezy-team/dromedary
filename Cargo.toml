@@ -43,6 +43,8 @@ md-5 = "0.10"
 sha1 = "0.10"
 hex = "0.4"
 rand = "0.8"
+rustls-native-certs = "0.8"
+base64 = "0.22"
 gio = { version = "0.22", optional = true }
 glib = { version = "0.22", optional = true }
 
