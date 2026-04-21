@@ -46,7 +46,7 @@ pub(crate) fn map_transport_err_to_py_err(
         Error::NotLocalUrl(url) => NotLocalUrl::new_err((url,)),
         Error::NoSuchFile(name) => NoSuchFile::new_err((pick_path(name),)),
         Error::FileExists(name) => FileExists::new_err((pick_path(name),)),
-        Error::TransportNotPossible => TransportNotPossible::new_err(()),
+        Error::TransportNotPossible(msg) => TransportNotPossible::new_err((msg,)),
         Error::UrlError(_e) => InvalidURL::new_err((p.map(|p| p.to_string()),)),
         Error::PermissionDenied(name) => PermissionDenied::new_err((pick_path(name),)),
         Error::PathNotChild => {

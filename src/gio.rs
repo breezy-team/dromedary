@@ -104,7 +104,9 @@ impl GioTransport {
             Some(IOErrorEnum::NotEmpty) => Error::DirectoryNotEmptyError(path),
             Some(IOErrorEnum::PermissionDenied) => Error::PermissionDenied(path),
             Some(IOErrorEnum::Busy) => Error::ResourceBusy(path),
-            Some(IOErrorEnum::NotMounted) => Error::TransportNotPossible,
+            Some(IOErrorEnum::NotMounted) => {
+                Error::TransportNotPossible(Some("volume not mounted".into()))
+            }
             Some(IOErrorEnum::ReadOnly) => Error::PermissionDenied(path),
             // Everything else folds into a generic IO error so the caller
             // gets *something* useful instead of a panic.
@@ -590,7 +592,9 @@ impl Transport for GioTransport {
     }
 
     fn set_segment_parameter(&mut self, _key: &str, _value: Option<&str>) -> Result<()> {
-        Err(Error::TransportNotPossible)
+        Err(Error::TransportNotPossible(Some(
+            "gio transport does not support segment parameters".into(),
+        )))
     }
 
     fn get_segment_parameters(&self) -> Result<HashMap<String, String>> {
@@ -601,15 +605,21 @@ impl Transport for GioTransport {
         // gvfs symlinks are exposed by query_info but resolving them
         // requires standard::symlink-target. The Python port did not
         // implement readlink either; keep parity.
-        Err(Error::TransportNotPossible)
+        Err(Error::TransportNotPossible(Some(
+            "gio transport does not support readlink".into(),
+        )))
     }
 
     fn hardlink(&self, _rel_from: &UrlFragment, _rel_to: &UrlFragment) -> Result<()> {
-        Err(Error::TransportNotPossible)
+        Err(Error::TransportNotPossible(Some(
+            "gio transport does not support hardlink".into(),
+        )))
     }
 
     fn symlink(&self, _rel_from: &UrlFragment, _rel_to: &UrlFragment) -> Result<()> {
-        Err(Error::TransportNotPossible)
+        Err(Error::TransportNotPossible(Some(
+            "gio transport does not support symlink".into(),
+        )))
     }
 
     fn delete_tree(&self, relpath: &UrlFragment) -> Result<()> {

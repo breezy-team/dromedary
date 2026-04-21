@@ -28,7 +28,7 @@ impl std::fmt::Debug for ReadonlyTransport {
 }
 
 fn not_possible() -> Error {
-    Error::TransportNotPossible
+    Error::TransportNotPossible(Some("readonly transport".to_string()))
 }
 
 impl Transport for ReadonlyTransport {
@@ -203,7 +203,7 @@ mod tests {
     #[test]
     fn put_bytes_rejected() {
         match ro().put_bytes("x", b"y", None) {
-            Err(Error::TransportNotPossible) => {}
+            Err(Error::TransportNotPossible(_)) => {}
             other => panic!("expected TransportNotPossible, got {:?}", other),
         }
     }
@@ -211,7 +211,7 @@ mod tests {
     #[test]
     fn mkdir_rejected() {
         match ro().mkdir("d", None) {
-            Err(Error::TransportNotPossible) => {}
+            Err(Error::TransportNotPossible(_)) => {}
             other => panic!("expected TransportNotPossible, got {:?}", other),
         }
     }
@@ -219,7 +219,7 @@ mod tests {
     #[test]
     fn delete_rejected() {
         match ro().delete("hello") {
-            Err(Error::TransportNotPossible) => {}
+            Err(Error::TransportNotPossible(_)) => {}
             other => panic!("expected TransportNotPossible, got {:?}", other),
         }
     }
@@ -227,7 +227,7 @@ mod tests {
     #[test]
     fn rename_rejected() {
         match ro().rename("hello", "world") {
-            Err(Error::TransportNotPossible) => {}
+            Err(Error::TransportNotPossible(_)) => {}
             other => panic!("expected TransportNotPossible, got {:?}", other),
         }
     }
@@ -237,7 +237,7 @@ mod tests {
         let t = ro();
         let _l = t.lock_read("hello").ok().expect("read lock");
         match t.lock_write("hello") {
-            Err(Error::TransportNotPossible) => {}
+            Err(Error::TransportNotPossible(_)) => {}
             Err(other) => panic!("expected TransportNotPossible, got {:?}", other),
             Ok(_) => panic!("expected TransportNotPossible, got Ok"),
         }
@@ -280,7 +280,7 @@ mod tests {
 
     fn expect_not_possible<T: std::fmt::Debug>(r: Result<T>, label: &str) {
         match r {
-            Err(Error::TransportNotPossible) => {}
+            Err(Error::TransportNotPossible(_)) => {}
             Err(other) => panic!("{}: expected TransportNotPossible, got {:?}", label, other),
             Ok(ok) => panic!("{}: expected TransportNotPossible, got Ok({:?})", label, ok),
         }
@@ -324,7 +324,7 @@ mod tests {
     #[test]
     fn open_write_stream_rejected() {
         match ro().open_write_stream("hello", None) {
-            Err(Error::TransportNotPossible) => {}
+            Err(Error::TransportNotPossible(_)) => {}
             Err(other) => panic!("expected TransportNotPossible, got {:?}", other),
             Ok(_) => panic!("expected TransportNotPossible, got Ok"),
         }
