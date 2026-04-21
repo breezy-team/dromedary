@@ -140,11 +140,19 @@ impl Drop for SSHSubprocessConnection {
 /// non-blocking short reads").
 #[cfg(unix)]
 fn spawn(argv: &[String], host: &str, port: Option<u16>) -> PyResult<SSHSubprocessConnection> {
+    // Apple targets' `SockFlag` doesn't expose SOCK_CLOEXEC (the OS itself
+    // lacks atomic CLOEXEC on socketpair), so on those we create the pair
+    // without the flag and set FD_CLOEXEC on our half via fcntl below.
+    #[cfg(not(target_vendor = "apple"))]
+    let cloexec = nix::sys::socket::SockFlag::SOCK_CLOEXEC;
+    #[cfg(target_vendor = "apple")]
+    let cloexec = nix::sys::socket::SockFlag::empty();
+
     let pair = nix::sys::socket::socketpair(
         nix::sys::socket::AddressFamily::Unix,
         nix::sys::socket::SockType::Stream,
         None,
-        nix::sys::socket::SockFlag::SOCK_CLOEXEC,
+        cloexec,
     )
     .ok();
 
@@ -163,6 +171,13 @@ fn spawn(argv: &[String], host: &str, port: Option<u16>) -> PyResult<SSHSubproce
         cmd.stdout(Stdio::from(dup_out));
         // `theirs` is closed in the parent when this `OwnedFd` drops.
         drop(theirs);
+        // On Apple targets, socketpair() can't atomically set CLOEXEC, so do it now.
+        #[cfg(target_vendor = "apple")]
+        nix::fcntl::fcntl(
+            &mine,
+            nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+        )
+        .map_err(|e| PyRuntimeError::new_err(format!("fcntl(FD_CLOEXEC) failed: {e}")))?;
         Some(mine)
     } else {
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped());

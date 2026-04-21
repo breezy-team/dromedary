@@ -21,8 +21,6 @@ import errno
 import logging
 import os
 import socket
-import subprocess
-import sys
 from binascii import hexlify
 
 from catalogus import registry
@@ -30,9 +28,10 @@ from catalogus import registry
 from dromedary import _bedding as bedding
 from dromedary import _config, _ui, errors
 from dromedary.errors import SocketConnectionError
-from dromedary.osutils import get_terminal_encoding, pathjoin
+from dromedary.osutils import pathjoin
 
 from .._transport_rs import sftp as _sftp_rs
+from .._transport_rs import ssh as _ssh_rs
 
 logger = logging.getLogger("dromedary.ssh")
 
@@ -107,73 +106,21 @@ class SSHVendorManager(registry.Registry[str, "SSHVendor", None]):
             return vendor
         return None
 
-    def _get_ssh_version_string(self, args):
-        """Return SSH version string from the subprocess.
-
-        Runs the given command and captures its output to determine
-        the SSH implementation version.
-
-        Args:
-            args: Command line arguments to execute (typically ['ssh', '-V']).
-
-        Returns:
-            str: Combined stdout and stderr output decoded using terminal encoding.
-                Returns empty string if the command fails.
-        """
-        try:
-            p = subprocess.Popen(
-                args,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                bufsize=0,
-                **os_specific_subprocess_params(),
-            )
-            stdout, stderr = p.communicate()
-        except OSError:
-            stdout = stderr = b""
-        return (stdout + stderr).decode(get_terminal_encoding())
-
-    def _get_vendor_by_version_string(self, version, progname):
-        """Return the vendor or None based on output from the subprocess.
-
-        Examines the version string to determine which SSH implementation
-        is being used (OpenSSH, GNU lsh, or PuTTY plink).
-
-        Args:
-            version: The output of 'ssh -V' like command.
-            progname: The program name that was executed.
-
-        Returns:
-            SSHVendor: The appropriate vendor instance, or None if not recognized.
-        """
-        vendor = None
-        if "OpenSSH" in version:
-            logger.debug("ssh implementation is OpenSSH")
-            vendor = self.get("openssh")
-        elif "lsh" in version:
-            logger.debug("ssh implementation is GNU lsh.")
-            vendor = self.get("lsh")
-        # As plink user prompts are not handled currently, don't auto-detect
-        # it by inspection below, but keep this vendor detection for if a path
-        # is given in BRZ_SSH. See https://bugs.launchpad.net/bugs/414743
-        elif "plink" in version and progname == "plink":
-            # Checking if "plink" was the executed argument as Windows
-            # sometimes reports 'ssh -V' incorrectly with 'plink' in its
-            # version.  See https://bugs.launchpad.net/bzr/+bug/107155
-            logger.debug("ssh implementation is Putty's plink.")
-            vendor = self.get("plink")
-        return vendor
-
     def _get_vendor_by_inspection(self):
         """Return the vendor or None by checking for known SSH implementations.
 
-        Runs 'ssh -V' to determine the SSH implementation in use.
+        Runs 'ssh -V' to determine the SSH implementation in use. Detection
+        runs in Rust; this just maps the returned registry key back to a
+        vendor instance.
 
         Returns:
             SSHVendor: The detected vendor, or None if not recognized.
         """
-        version = self._get_ssh_version_string(["ssh", "-V"])
-        return self._get_vendor_by_version_string(version, "ssh")
+        key = _ssh_rs.detect_ssh_vendor("ssh")
+        if key is None:
+            return None
+        logger.debug("ssh implementation detected as %s", key)
+        return self.get(key)
 
     def _get_vendor_from_path(self, path):
         """Return the vendor or None using the program at the given path.
@@ -186,10 +133,11 @@ class SSHVendorManager(registry.Registry[str, "SSHVendor", None]):
         Returns:
             SSHVendor: The detected vendor, or None if not recognized.
         """
-        version = self._get_ssh_version_string([path, "-V"])
-        return self._get_vendor_by_version_string(
-            version, os.path.splitext(os.path.basename(path))[0]
-        )
+        key = _ssh_rs.detect_ssh_vendor(path)
+        if key is None:
+            return None
+        logger.debug("ssh implementation at %s detected as %s", path, key)
+        return self.get(key)
 
     def get_vendor(self):
         """Find out what version of SSH is on the system.
@@ -215,28 +163,6 @@ _ssh_vendor_manager = SSHVendorManager()
 _get_ssh_vendor = _ssh_vendor_manager.get_vendor
 register_ssh_vendor = _ssh_vendor_manager.register
 register_lazy_ssh_vendor = _ssh_vendor_manager.register_lazy
-
-
-def _ignore_signals():
-    """Configure signal handling for SSH subprocesses.
-
-    Sets up signal handlers to ignore SIGINT and conditionally SIGQUIT.
-    This prevents the SSH subprocess from being interrupted by keyboard
-    interrupts intended for the parent process.
-
-    The function ignores:
-    - SIGINT: Always ignored to prevent Ctrl+C from affecting SSH
-    - SIGQUIT: Ignored if not already set to default (to respect breakin)
-    """
-    # TODO: This should possibly ignore SIGHUP as well, but bzr currently
-    # doesn't handle it itself.
-    # <https://launchpad.net/products/bzr/+bug/41433/+index>
-    import signal
-
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-    # GZ 2010-02-19: Perhaps make this check if breakin is installed instead
-    if signal.getsignal(signal.SIGQUIT) != signal.SIG_DFL:
-        signal.signal(signal.SIGQUIT, signal.SIG_IGN)
 
 
 class SocketAsChannelAdapter:
@@ -562,41 +488,6 @@ def save_host_keys():
                     f.write("{} {} {}\n".format(hostname, keytype, key.get_base64()))
     except OSError as e:
         logger.debug("failed to save bzr host keys: %s", e)
-
-
-def os_specific_subprocess_params():
-    """Get O/S specific subprocess parameters.
-
-    Returns different parameters based on the operating system:
-    - Windows: Empty dict (no special handling)
-    - Unix-like: Dict with preexec_fn to ignore signals and close_fds=True
-
-    Returns:
-        dict: Subprocess parameters suitable for the current OS.
-    """
-    if sys.platform == "win32":
-        # setting the process group and closing fds is not supported on
-        # win32
-        return {}
-    else:
-        # We close fds other than the pipes as the child process does not need
-        # them to be open.
-        #
-        # We also set the child process to ignore SIGINT.  Normally the signal
-        # would be sent to every process in the foreground process group, but
-        # this causes it to be seen only by bzr and not by ssh.  Python will
-        # generate a KeyboardInterrupt in bzr, and we will then have a chance
-        # to release locks or do other cleanup over ssh before the connection
-        # goes away.
-        # <https://launchpad.net/products/bzr/+bug/5987>
-        #
-        # Running it in a separate process group is not good because then it
-        # can't get non-echoed input of a password or passphrase.
-        # <https://launchpad.net/products/bzr/+bug/40508>
-        return {
-            "preexec_fn": _ignore_signals,
-            "close_fds": True,
-        }
 
 
 class SSHConnection:
