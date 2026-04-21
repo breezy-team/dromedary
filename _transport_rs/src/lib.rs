@@ -35,6 +35,65 @@ import_exception!(dromedary.urlutils, InvalidURL);
 #[pyclass(subclass)]
 pub(crate) struct Transport(pub(crate) Box<dyn TransportTrait>);
 
+/// Shared base class for all Rust-backed Transport decorators.
+///
+/// Stores a reference to the wrapped Python transport and provides the
+/// common decorator machinery (`_decorated` accessor, `__getattr__`
+/// fallback, redirect re-wrapping). Concrete decorators extend this class
+/// and only need to supply their URL prefix and their `__new__` / `clone`
+/// (which construct the decorator-specific wrapped Rust transport).
+#[pyclass(extends=Transport, subclass)]
+pub(crate) struct TransportDecorator {
+    pub(crate) decorated: Py<PyAny>,
+    pub(crate) prefix: &'static str,
+}
+
+#[pymethods]
+impl TransportDecorator {
+    #[getter]
+    fn _decorated(&self, py: Python) -> Py<PyAny> {
+        self.decorated.clone_ref(py)
+    }
+
+    #[classmethod]
+    fn _get_url_prefix(_cls: &Bound<'_, pyo3::types::PyType>) -> PyResult<&'static str> {
+        // Subclasses override this to return their static prefix. Called on
+        // the class itself, not the instance, so we can't consult `prefix`
+        // here — but since this is the abstract base, we shouldn't be called
+        // on it directly. Return empty to make the failure obvious.
+        Ok("")
+    }
+
+    /// Forward unrecognised attribute access to the wrapped transport.
+    ///
+    /// Decorators mix Rust (base Transport methods) with Python (extras like
+    /// HttpTransport.request). Anything not bound on the decorator itself
+    /// should pass through to the inner transport.
+    fn __getattr__(&self, py: Python, name: &str) -> PyResult<Py<PyAny>> {
+        self.decorated.bind(py).getattr(name).map(|b| b.unbind())
+    }
+
+    /// Re-wrap the redirected transport so the decorator qualifier is
+    /// preserved across HTTP redirects.
+    fn _redirected_to<'a>(
+        slf: PyRef<'a, Self>,
+        py: Python<'a>,
+        source: &str,
+        target: &str,
+    ) -> PyResult<Option<Py<PyAny>>> {
+        let inner = slf.decorated.bind(py);
+        let redirected = inner.call_method1("_redirected_to", (source, target))?;
+        if redirected.is_none() {
+            return Ok(None);
+        }
+        let base: String = redirected.getattr("base")?.extract()?;
+        let new_url = format!("{}{}", slf.prefix, base);
+        let cls = slf.into_pyobject(py)?.get_type();
+        let instance = cls.call1((new_url, redirected.clone().unbind()))?;
+        Ok(Some(instance.unbind()))
+    }
+}
+
 pub(crate) fn map_transport_err_to_py_err(
     e: Error,
     t: Option<Py<PyAny>>,
@@ -1237,6 +1296,7 @@ mod urlutils;
 #[pymodule]
 fn _transport_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<Transport>()?;
+    m.add_class::<TransportDecorator>()?;
     let localm = PyModule::new(py, "local")?;
     localm.add_class::<LocalTransport>()?;
     m.add_submodule(&localm)?;
