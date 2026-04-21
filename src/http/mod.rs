@@ -279,6 +279,145 @@ pub fn format_user_agent(product: &str, version: &str) -> String {
     format!("{}/{}", product, version)
 }
 
+/// Decision returned by [`evaluate_proxy_bypass`]: a definite match in
+/// the `no_proxy` list (`Bypass`), a definite non-match (`UseProxy`),
+/// or "nothing explicit — leave it to the platform fallback"
+/// (`Undecided`).
+///
+/// The trichotomy mirrors the Python `ProxyHandler.evaluate_proxy_bypass`
+/// return values of `True` / `False` / `None`. Python's `None` lets the
+/// caller fall through to the stdlib `urllib.request.proxy_bypass`,
+/// which consults platform-specific sources (Windows registry,
+/// system-wide proxy config, etc.). We surface that as its own
+/// variant so the caller can make the same choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyBypass {
+    /// The host matched the `no_proxy` list; skip the proxy.
+    Bypass,
+    /// No `no_proxy` list was configured, so every host is proxied.
+    /// The Python original returned `False` here, and the caller
+    /// never consulted the platform fallback in this case.
+    UseProxy,
+    /// A `no_proxy` list was configured but nothing matched the
+    /// host. Python returned `None`, and the caller fell through to
+    /// the platform-specific proxy-bypass check.
+    Undecided,
+}
+
+/// Check a host against a comma-separated `no_proxy` list and
+/// return whether the proxy should be bypassed.
+///
+/// Mirrors breezy's `ProxyHandler.evaluate_proxy_bypass`, including
+/// its quirks:
+///
+/// - entries are `host[:port]`, port-matched against the client's
+///   `hport` — an entry without a port matches any port;
+/// - `*` and `?` inside `dhost` act as shell-style globs, `.` is
+///   treated literally;
+/// - matching is case-insensitive and **anchored at the start
+///   only** (the Python implementation uses `re.match`), so an
+///   entry of `example.com` matches both `example.com` and
+///   `example.com.evil.com`. That's surprising, but it's what the
+///   existing tests depend on — don't "fix" it here.
+pub fn evaluate_proxy_bypass(host: &str, no_proxy: Option<&str>) -> ProxyBypass {
+    let Some(no_proxy) = no_proxy else {
+        // Python returns `False` here: "All hosts are proxied" when
+        // no `no_proxy` list is configured. Callers of the Python
+        // version only fall through to the platform fallback when
+        // the *list* was configured but nothing matched — that's
+        // the `None` / Undecided case below.
+        return ProxyBypass::UseProxy;
+    };
+    let (hhost, hport) = splitport(host);
+    for domain in no_proxy.split(',') {
+        let domain = domain.trim();
+        if domain.is_empty() {
+            continue;
+        }
+        let (dhost, dport) = splitport(domain);
+        if hport == dport || dport.is_none() {
+            if glob_prefix_match_ignore_ascii_case(dhost, hhost) {
+                return ProxyBypass::Bypass;
+            }
+        }
+    }
+    // A no_proxy list was configured but the host didn't match any
+    // entry. Python returned `None` here, which its caller unboxed
+    // via `if bypass is None: fall back to urllib.proxy_bypass`.
+    ProxyBypass::Undecided
+}
+
+/// Match `host` against `pattern` using the same dialect the Python
+/// helper built from `re.sub`: `.` is literal, `*` is `.*`, `?` is
+/// `.`, case-insensitive, anchored at the start only.
+///
+/// Implemented by hand rather than compiling a `regex::Regex` because
+/// this is called once per `no_proxy` entry per request — the regex
+/// crate's fixed overhead isn't worth it for such small patterns, and
+/// keeping it regex-free means we don't get any of the regex
+/// engine's idiosyncrasies (e.g. DOT-ALL handling, Unicode tables).
+fn glob_prefix_match_ignore_ascii_case(pattern: &str, host: &str) -> bool {
+    // Recursion at most as deep as `pattern.len()`; no_proxy entries
+    // are short in practice.
+    fn go(pat: &[u8], s: &[u8]) -> bool {
+        let mut pi = 0;
+        let mut si = 0;
+        while pi < pat.len() {
+            match pat[pi] {
+                b'*' => {
+                    // Skip runs of `*` so `**` behaves like `*`.
+                    while pi < pat.len() && pat[pi] == b'*' {
+                        pi += 1;
+                    }
+                    if pi == pat.len() {
+                        // Trailing `*` matches the rest of the
+                        // string (actually, `re.match` only anchors
+                        // at the start so everything from here on
+                        // already matches — the match ends wherever
+                        // we like).
+                        return true;
+                    }
+                    let rest = &pat[pi..];
+                    while si <= s.len() {
+                        if go(rest, &s[si..]) {
+                            return true;
+                        }
+                        if si == s.len() {
+                            return false;
+                        }
+                        si += 1;
+                    }
+                    return false;
+                }
+                b'?' => {
+                    // `?` becomes `.` — match exactly one char.
+                    if si == s.len() {
+                        return false;
+                    }
+                    pi += 1;
+                    si += 1;
+                }
+                pc => {
+                    if si == s.len() {
+                        return false;
+                    }
+                    let sc = s[si];
+                    if pc.eq_ignore_ascii_case(&sc) {
+                        pi += 1;
+                        si += 1;
+                    } else {
+                        return false;
+                    }
+                }
+            }
+        }
+        // Prefix-only: consuming the whole pattern is a match even
+        // if there's unmatched input remaining.
+        true
+    }
+    go(pattern.as_bytes(), host.as_bytes())
+}
+
 /// Split a `host[:port]` string into its two parts.
 ///
 /// Mirrors the Python helper in `dromedary/http/urllib.py`: the port is
@@ -529,6 +668,116 @@ mod tests {
         // reuse the corresponding stdlib integer.
         let v = default_cert_reqs().to_int();
         assert!(matches!(v, 0 | 2));
+    }
+
+    #[test]
+    fn evaluate_proxy_bypass_use_proxy_when_unset() {
+        // Python returns `False` when no_proxy is None — meaning
+        // every host is proxied, skip the platform fallback.
+        assert_eq!(
+            evaluate_proxy_bypass("example.com", None),
+            ProxyBypass::UseProxy
+        );
+    }
+
+    #[test]
+    fn evaluate_proxy_bypass_exact_match() {
+        assert_eq!(
+            evaluate_proxy_bypass("example.com", Some("example.com")),
+            ProxyBypass::Bypass
+        );
+    }
+
+    #[test]
+    fn evaluate_proxy_bypass_is_prefix_only() {
+        // Python's re.match anchors at the start only, so this
+        // surprising case matches. We preserve that behaviour.
+        assert_eq!(
+            evaluate_proxy_bypass("example.com.evil.com", Some("example.com")),
+            ProxyBypass::Bypass
+        );
+    }
+
+    #[test]
+    fn evaluate_proxy_bypass_no_match() {
+        assert_eq!(
+            evaluate_proxy_bypass("foo.com", Some("bar.com,baz.com")),
+            ProxyBypass::Undecided
+        );
+    }
+
+    #[test]
+    fn evaluate_proxy_bypass_dot_is_literal() {
+        // `.` shouldn't act as a regex wildcard; `exampleXcom` is
+        // not equivalent to `example.com`.
+        assert_eq!(
+            evaluate_proxy_bypass("exampleXcom", Some("example.com")),
+            ProxyBypass::Undecided
+        );
+    }
+
+    #[test]
+    fn evaluate_proxy_bypass_star_glob() {
+        assert_eq!(
+            evaluate_proxy_bypass("host1.internal", Some("*.internal")),
+            ProxyBypass::Bypass
+        );
+    }
+
+    #[test]
+    fn evaluate_proxy_bypass_question_glob() {
+        // `?` matches exactly one character.
+        assert_eq!(
+            evaluate_proxy_bypass("host1.com", Some("host?.com")),
+            ProxyBypass::Bypass
+        );
+        // `host10.com` doesn't match `host?.com` because after `host?`
+        // eats `host1`, the pattern still expects a literal `.com` —
+        // but the input has `0.com` at that point, and `0` isn't a
+        // `.`. Matches Python's `re.match('host.\.com', 'host10.com')`.
+        assert_eq!(
+            evaluate_proxy_bypass("host10.com", Some("host?.com")),
+            ProxyBypass::Undecided
+        );
+    }
+
+    #[test]
+    fn evaluate_proxy_bypass_case_insensitive() {
+        assert_eq!(
+            evaluate_proxy_bypass("EXAMPLE.COM", Some("example.com")),
+            ProxyBypass::Bypass
+        );
+    }
+
+    #[test]
+    fn evaluate_proxy_bypass_port_wildcard_entry() {
+        // Entry without a port matches any port.
+        assert_eq!(
+            evaluate_proxy_bypass("example.com:8080", Some("example.com")),
+            ProxyBypass::Bypass
+        );
+    }
+
+    #[test]
+    fn evaluate_proxy_bypass_port_must_match_when_specified() {
+        assert_eq!(
+            evaluate_proxy_bypass("example.com:8080", Some("example.com:80")),
+            ProxyBypass::Undecided
+        );
+        assert_eq!(
+            evaluate_proxy_bypass("example.com:80", Some("example.com:80")),
+            ProxyBypass::Bypass
+        );
+    }
+
+    #[test]
+    fn evaluate_proxy_bypass_commas_and_whitespace() {
+        // Leading/trailing whitespace around each entry is stripped;
+        // empty entries from e.g. a trailing comma are skipped.
+        assert_eq!(
+            evaluate_proxy_bypass("foo.com", Some(" bar.com , foo.com ,")),
+            ProxyBypass::Bypass
+        );
     }
 
     #[test]

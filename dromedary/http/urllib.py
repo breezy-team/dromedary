@@ -1309,28 +1309,7 @@ class ProxyHandler(urllib.request.ProxyHandler):
         :returns: True to skip the proxy, False not to, or None to
             leave it to urllib.
         """
-        if no_proxy is None:
-            # All hosts are proxied
-            return False
-        hhost, hport = splitport(host)
-        # Does host match any of the domains mentioned in
-        # no_proxy ? The rules about what is authorized in no_proxy
-        # are fuzzy (to say the least). We try to allow most
-        # commonly seen values.
-        for domain in no_proxy.split(","):
-            domain = domain.strip()
-            if domain == "":
-                continue
-            dhost, dport = splitport(domain)
-            if hport == dport or dport is None:
-                # Protect glob chars
-                dhost = dhost.replace(".", r"\.")
-                dhost = dhost.replace("*", r".*")
-                dhost = dhost.replace("?", r".")
-                if re.match(dhost, hhost, re.IGNORECASE):
-                    return True
-        # Nothing explicitly avoid the host
-        return None
+        return _http_rs.evaluate_proxy_bypass(host, no_proxy)
 
     def set_proxy(self, request, type):
         """Set proxy for request if not bypassed.

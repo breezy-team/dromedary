@@ -101,6 +101,26 @@ fn get_new_cnonce(nonce: &str, nonce_count: u64) -> String {
     dromedary::http::new_cnonce(nonce, nonce_count)
 }
 
+/// Check a host against a `no_proxy` list. Returns `True` to bypass
+/// the proxy, `False` to use it, or `None` if the caller should fall
+/// back to the platform-specific proxy-bypass logic (Python's
+/// `urllib.request.proxy_bypass`).
+///
+/// This preserves the Python `ProxyHandler.evaluate_proxy_bypass`
+/// contract byte-for-byte, including the surprising prefix-only
+/// match that lets `example.com` in `no_proxy` match
+/// `example.com.evil.com`.
+#[pyfunction]
+#[pyo3(signature = (host, no_proxy))]
+fn evaluate_proxy_bypass(py: Python, host: &str, no_proxy: Option<&str>) -> Py<PyAny> {
+    use dromedary::http::ProxyBypass;
+    match dromedary::http::evaluate_proxy_bypass(host, no_proxy) {
+        ProxyBypass::Bypass => true.into_py_any(py).unwrap(),
+        ProxyBypass::UseProxy => false.into_py_any(py).unwrap(),
+        ProxyBypass::Undecided => py.None(),
+    }
+}
+
 /// Replace the global User-Agent prefix.
 #[pyfunction]
 fn set_user_agent(prefix: String) {
@@ -201,6 +221,7 @@ pub(crate) fn register(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(set_credential_lookup, m)?)?;
     m.add_function(wrap_pyfunction!(get_credential_lookup, m)?)?;
     m.add_function(wrap_pyfunction!(get_credentials, m)?)?;
+    m.add_function(wrap_pyfunction!(evaluate_proxy_bypass, m)?)?;
 
     response::register(m)?;
 
