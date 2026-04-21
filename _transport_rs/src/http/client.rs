@@ -11,7 +11,6 @@
 //! callers (and the still-Python `HttpTransport.request` wrapper) see
 //! no breaking change.
 
-use std::io::{Cursor, Read};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -233,26 +232,22 @@ fn make_activity_callback(cb: Py<PyAny>) -> ActivityCallback {
 /// `readline`, `readlines`) and the urllib3 property set (`status`,
 /// `reason`, `data`, `text`, `getheader`, `getheaders`) so existing
 /// callers pulled from `Urllib3LikeResponse` work unchanged.
+///
+/// The body is streamed on demand from ureq rather than buffered
+/// eagerly: `status` / `reason` / `getheader` / `getheaders` read
+/// purely from metadata, `data` / `text` / `read(None)` force a
+/// full drain, and `read(n)` / `readline()` pull incrementally.
+/// First call to a "full drain" method transitions the underlying
+/// body to a Buffered state so repeat reads are cheap.
 #[pyclass(module = "dromedary._transport_rs.http")]
 pub(crate) struct HttpResponse {
-    inner: Mutex<HttpResponseInner>,
-}
-
-/// Interior-mutable state held behind the pyclass lock. Separated
-/// so we can borrow `&mut self` without exposing it through pyo3.
-struct HttpResponseInner {
-    /// Raw response data — headers stay accessible after the body is
-    /// consumed, unlike an HTTPResponse which invalidates on close.
-    raw: RsHttpResponse,
-    /// Cursor over `raw.body`; advances on every `read` / `readline`.
-    body: Cursor<Vec<u8>>,
+    inner: Mutex<RsHttpResponse>,
 }
 
 impl HttpResponse {
     fn new(raw: RsHttpResponse) -> Self {
-        let body = Cursor::new(raw.body.clone());
         Self {
-            inner: Mutex::new(HttpResponseInner { raw, body }),
+            inner: Mutex::new(raw),
         }
     }
 }
@@ -261,19 +256,19 @@ impl HttpResponse {
 impl HttpResponse {
     #[getter]
     fn status(&self) -> u16 {
-        self.inner.lock().unwrap().raw.status
+        self.inner.lock().unwrap().status
     }
 
     #[getter]
     fn reason(&self) -> String {
-        self.inner.lock().unwrap().raw.reason.clone()
+        self.inner.lock().unwrap().reason.clone()
     }
 
     /// Final URL after any redirect following. For requests that
     /// weren't redirected this equals the request URL.
     #[getter]
     fn final_url(&self) -> String {
-        self.inner.lock().unwrap().raw.final_url.clone()
+        self.inner.lock().unwrap().final_url.clone()
     }
 
     /// Set when the server returned a 3xx that the client didn't
@@ -281,7 +276,7 @@ impl HttpResponse {
     /// raise `RedirectRequested`.
     #[getter]
     fn redirected_to(&self) -> Option<String> {
-        self.inner.lock().unwrap().raw.redirected_to.clone()
+        self.inner.lock().unwrap().redirected_to.clone()
     }
 
     /// Case-insensitive header lookup. `default` is returned if
@@ -289,7 +284,7 @@ impl HttpResponse {
     #[pyo3(signature = (name, default=None))]
     fn getheader(&self, py: Python, name: &str, default: Option<Py<PyAny>>) -> Py<PyAny> {
         let inner = self.inner.lock().unwrap();
-        match inner.raw.header(name) {
+        match inner.header(name) {
             Some(v) => PyString::new(py, v).into(),
             None => default.unwrap_or_else(|| py.None()),
         }
@@ -299,7 +294,6 @@ impl HttpResponse {
     fn getheaders<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let inner = self.inner.lock().unwrap();
         let items: Vec<Bound<'py, PyAny>> = inner
-            .raw
             .headers
             .iter()
             .map(|(k, v)| {
@@ -310,12 +304,14 @@ impl HttpResponse {
         PyList::new(py, items)
     }
 
-    /// Full response body as bytes. Cached; reading this doesn't
-    /// advance the `read()` cursor.
+    /// Full response body as bytes. Forces a drain on first access;
+    /// subsequent reads through this property return the same
+    /// buffer without re-reading.
     #[getter]
-    fn data<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        let inner = self.inner.lock().unwrap();
-        PyBytes::new(py, &inner.raw.body)
+    fn data<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let mut inner = self.inner.lock().unwrap();
+        let body = inner.body().map_err(py_io_err)?;
+        Ok(PyBytes::new(py, body))
     }
 
     /// Decoded body as str, using the Content-Type charset when
@@ -323,15 +319,16 @@ impl HttpResponse {
     /// returns `None` on a 204 No Content response.
     #[getter]
     fn text(&self, py: Python) -> PyResult<Py<PyAny>> {
-        let inner = self.inner.lock().unwrap();
-        if inner.raw.status == 204 {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.status == 204 {
             return Ok(py.None());
         }
-        let charset = inner
-            .raw
+        // Read the charset out of the Content-Type header before
+        // borrowing the body; the two &self borrows otherwise
+        // overlap because `body()` takes &mut.
+        let _charset = inner
             .header("content-type")
             .and_then(|v| {
-                // Very small content-type parser: find `charset=`.
                 v.split(';').find_map(|piece| {
                     let piece = piece.trim();
                     piece
@@ -345,63 +342,53 @@ impl HttpResponse {
         // to replacing invalid bytes. Real non-UTF-8 payloads are
         // vanishingly rare on the Bazaar smart-protocol path this
         // is aimed at, and breezy didn't support them either.
-        let text = match charset.to_ascii_lowercase().as_str() {
-            "utf-8" | "utf8" => String::from_utf8_lossy(&inner.raw.body).into_owned(),
-            _ => String::from_utf8_lossy(&inner.raw.body).into_owned(),
-        };
+        let body = inner.body().map_err(py_io_err)?;
+        let text = String::from_utf8_lossy(body).into_owned();
         Ok(PyString::new(py, &text).into())
     }
 
-    /// File-like read. `size=None` reads all remaining bytes,
-    /// matching the Python convention.
+    /// File-like read. `size=None` (or negative) reads all remaining
+    /// bytes — forces a full drain. Positive `size` pulls up to that
+    /// many bytes from the current position (streamed), leaving the
+    /// rest available for subsequent reads.
     #[pyo3(signature = (size=None))]
     fn read<'py>(&self, py: Python<'py>, size: Option<i64>) -> PyResult<Bound<'py, PyBytes>> {
         let mut inner = self.inner.lock().unwrap();
-        let mut out = Vec::new();
-        match size {
-            None | Some(-1) => {
-                inner
-                    .body
-                    .read_to_end(&mut out)
-                    .map_err(PyIOError::new_err_from_io)?;
-            }
-            Some(n) if n >= 0 => {
-                let mut buf = vec![0u8; n as usize];
-                let got = inner
-                    .body
-                    .read(&mut buf)
-                    .map_err(PyIOError::new_err_from_io)?;
-                buf.truncate(got);
-                out = buf;
-            }
-            Some(_) => {
-                // Negative `size` other than -1: Python's file protocol
-                // treats these as "read all", so we do too.
-                inner
-                    .body
-                    .read_to_end(&mut out)
-                    .map_err(PyIOError::new_err_from_io)?;
-            }
-        }
-        Ok(PyBytes::new(py, &out))
+        let n = match size {
+            None | Some(-1) => None,
+            Some(n) if n < 0 => None,
+            Some(n) => Some(n as usize),
+        };
+        let data = inner.read(n).map_err(py_io_err)?;
+        Ok(PyBytes::new(py, &data))
     }
 
-    /// Read up to the next newline (inclusive) or EOF.
+    /// Read up to the next newline (inclusive) or EOF. Forces the
+    /// body to be buffered on first call — line splitting across a
+    /// live stream would require a BufRead wrapper we don't have
+    /// yet, and the callers that use readline() (handle_response
+    /// for multipart responses) typically consume the whole body
+    /// anyway.
     #[pyo3(signature = (_size=-1))]
     fn readline<'py>(&self, py: Python<'py>, _size: i64) -> PyResult<Bound<'py, PyBytes>> {
         let mut inner = self.inner.lock().unwrap();
-        let pos = inner.body.position() as usize;
-        let total = inner.raw.body.len();
-        let end = inner.raw.body[pos..]
-            .iter()
-            .position(|&b| b == b'\n')
-            .map(|i| pos + i + 1)
-            .unwrap_or(total);
-        // Copy the bytes out before advancing the cursor so the
-        // borrow checker doesn't see overlapping mutable/immutable
-        // borrows of `inner`.
-        let line: Vec<u8> = inner.raw.body[pos..end].to_vec();
-        inner.body.set_position(end as u64);
+        // Drain the body into the buffer so we can scan for '\n'
+        // without losing the rest of the stream.
+        let _ = inner.body().map_err(py_io_err)?;
+        // Now read one byte at a time until '\n' or EOF. This works
+        // because the BodyState is Buffered after body().
+        let mut line: Vec<u8> = Vec::new();
+        loop {
+            let chunk = inner.read(Some(1)).map_err(py_io_err)?;
+            if chunk.is_empty() {
+                break;
+            }
+            let b = chunk[0];
+            line.push(b);
+            if b == b'\n' {
+                break;
+            }
+        }
         Ok(PyBytes::new(py, &line))
     }
 
@@ -417,22 +404,17 @@ impl HttpResponse {
         PyList::new(py, out)
     }
 
-    /// No-op; matches the file-like contract. The underlying body
-    /// is already fully buffered so there's nothing to release.
-    fn close(&self) {}
-}
-
-/// Adapter: ureq's `PyIOError::new_err_from_io` doesn't exist; we
-/// ship our own trivial conversion so the `read()` / `readline()`
-/// paths stay concise.
-trait PyIOErrorExt {
-    fn new_err_from_io(e: std::io::Error) -> PyErr;
-}
-
-impl PyIOErrorExt for PyIOError {
-    fn new_err_from_io(e: std::io::Error) -> PyErr {
-        PyIOError::new_err(e.to_string())
+    /// Close the response by discarding any unread body, returning
+    /// the underlying socket to ureq's pool. Mirrors the file-like
+    /// `close()` contract.
+    fn close(&self) -> PyResult<()> {
+        self.inner.lock().unwrap().discard_body().map_err(py_io_err)
     }
+}
+
+/// Map an `io::Error` from the streaming body read into `OSError`.
+fn py_io_err(e: std::io::Error) -> PyErr {
+    PyIOError::new_err(e.to_string())
 }
 
 /// Coerce whatever Python hands us into `(name, value)` pairs. We

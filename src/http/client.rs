@@ -14,7 +14,6 @@
 //! pieces lands in a follow-up commit on this branch so the diff
 //! stays reviewable.
 
-use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 
@@ -545,7 +544,7 @@ impl HttpClient {
             }
         }
 
-        let response = self.send_once(method, url, &first_headers, body, activity)?;
+        let mut response = self.send_once(method, url, &first_headers, body, activity)?;
         if response.status != 401 && response.status != 407 {
             return Ok(response);
         }
@@ -561,10 +560,20 @@ impl HttpClient {
         if response.status == 407 {
             return Ok(response);
         }
-        let challenges = response.headers_all("www-authenticate");
-        let Some((scheme, new_auth)) = self.pick_auth_scheme(&uri, &challenges, method) else {
+        let challenges: Vec<String> = response
+            .headers_all("www-authenticate")
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let challenge_refs: Vec<&str> = challenges.iter().map(String::as_str).collect();
+        let Some((scheme, new_auth)) = self.pick_auth_scheme(&uri, &challenge_refs, method) else {
             return Ok(response);
         };
+
+        // Return the 401's connection to the pool before reissuing.
+        // ureq's BodyReader doesn't drain on Drop, so failing to do
+        // this here forces a fresh connection for the retry.
+        response.discard_body().ok();
 
         // Retry with the new auth header attached. Don't stack on
         // top of the preemptive header we added above; rebuild from
@@ -735,9 +744,21 @@ impl HttpClient {
         }
         let response = self.agent.run(req)?;
         let resp = HttpResponse::from_ureq(response, url.to_string())?;
+        // Report the *expected* body size (from Content-Length) up
+        // front. When the header is missing we skip reporting for
+        // this response — the body is streamed on demand and we
+        // can't know the final size ahead of draining. For breezy's
+        // progress-bar use case a single up-front report is what
+        // the old urllib-based transport did too (it called
+        // `report_activity(len(body), 'read')` once after buffering
+        // the whole response).
         if let Some(cb) = activity {
-            if !resp.body.is_empty() {
-                cb(resp.body.len(), ActivityDirection::Read);
+            if let Some(v) = resp.header("content-length") {
+                if let Ok(n) = v.parse::<usize>() {
+                    if n > 0 {
+                        cb(n, ActivityDirection::Read);
+                    }
+                }
             }
         }
         Ok(resp)
@@ -863,11 +884,13 @@ fn root_certs_from_native_store() -> RootCerts {
     certs.into()
 }
 
-/// Response returned by [`HttpClient::request`]. Owns the body
-/// buffer so callers can read it after the underlying `ureq::Body`
-/// goes out of scope. For range requests and other streaming uses
-/// we'll add a separate streaming response type in Stage 7.
-#[derive(Debug)]
+/// Response returned by [`HttpClient::request`]. Headers are
+/// eagerly parsed; the body is streamed on demand.
+///
+/// Callers that only care about status / headers pay nothing for
+/// the body — it stays as a live `ureq::BodyReader` and is
+/// consumed only when something calls [`read`](Self::read) /
+/// [`read_to_end`](Self::read_to_end) / [`body`](Self::body).
 pub struct HttpResponse {
     /// HTTP status code (e.g. 200, 404, 302).
     pub status: u16,
@@ -875,10 +898,6 @@ pub struct HttpResponse {
     pub reason: String,
     /// Response headers. Multi-value headers keep their order.
     pub headers: Vec<(String, String)>,
-    /// Full response body. Not streaming — good enough for the
-    /// handler-layer auth retries that Stage 6b will add. Stage 7
-    /// swaps this for a streaming body to plug into `RangeFile`.
-    pub body: Vec<u8>,
     /// URL of the final response after any redirect following. For
     /// non-redirected requests this equals the original URL.
     pub final_url: String,
@@ -886,33 +905,141 @@ pub struct HttpResponse {
     /// false, this carries the `Location`-resolved URL the caller
     /// would have been redirected to. `None` otherwise.
     pub redirected_to: Option<String>,
+    /// Body streaming state. Kept private so callers go through
+    /// `read` / `body` / `read_to_end` — that way we can swap
+    /// between streaming and buffered without changing the public
+    /// surface.
+    body: BodyState,
+}
+
+/// Body read state. Starts as `Streaming` right after the response
+/// arrives; on first full-drain (`body()` or `read(None)`) it
+/// transitions to `Buffered` so subsequent reads are cheap and
+/// idempotent.
+enum BodyState {
+    /// Body hasn't been fully consumed yet. The `BodyReader` is
+    /// `'static` because `ureq::Body::into_reader()` hands us
+    /// owned reader chain.
+    Streaming(ureq::BodyReader<'static>),
+    /// Body was fully drained into a buffer. Cursor tracks how
+    /// much of it has been handed out through `read()`.
+    Buffered(std::io::Cursor<Vec<u8>>),
+}
+
+impl std::fmt::Debug for HttpResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpResponse")
+            .field("status", &self.status)
+            .field("reason", &self.reason)
+            .field("headers", &self.headers)
+            .field("final_url", &self.final_url)
+            .field("redirected_to", &self.redirected_to)
+            .finish_non_exhaustive()
+    }
 }
 
 impl HttpResponse {
-    fn from_ureq(mut resp: Response<Body>, final_url: String) -> Result<Self> {
+    fn from_ureq(resp: Response<Body>, final_url: String) -> Result<Self> {
         let status = resp.status().as_u16();
         // HTTP/2 has no reason phrase — fall back to the canonical
         // text for the status code so callers always get something.
         let reason = resp.status().canonical_reason().unwrap_or("").to_string();
-        let mut headers: Vec<(String, String)> = Vec::with_capacity(resp.headers().len());
-        for (name, value) in resp.headers() {
+        let (parts, body) = resp.into_parts();
+        let mut headers: Vec<(String, String)> = Vec::with_capacity(parts.headers.len());
+        for (name, value) in &parts.headers {
             if let Ok(v) = value.to_str() {
                 headers.push((name.as_str().to_string(), v.to_string()));
             }
         }
-        let mut body: Vec<u8> = Vec::new();
-        resp.body_mut()
-            .as_reader()
-            .read_to_end(&mut body)
-            .map_err(ClientError::Io)?;
         Ok(Self {
             status,
             reason,
             headers,
-            body,
             final_url,
             redirected_to: None,
+            body: BodyState::Streaming(body.into_reader()),
         })
+    }
+
+    /// Read up to `n` bytes from the body. `None` means "read
+    /// everything left" — which also transitions the body state to
+    /// Buffered so repeat calls are no-ops.
+    pub fn read(&mut self, n: Option<usize>) -> std::io::Result<Vec<u8>> {
+        match n {
+            Some(n) => self.read_exact_up_to(n),
+            None => {
+                self.buffer_all()?;
+                match &mut self.body {
+                    BodyState::Buffered(cur) => {
+                        let mut out = Vec::new();
+                        std::io::Read::read_to_end(cur, &mut out)?;
+                        Ok(out)
+                    }
+                    BodyState::Streaming(_) => unreachable!("buffer_all transitions to Buffered"),
+                }
+            }
+        }
+    }
+
+    fn read_exact_up_to(&mut self, n: usize) -> std::io::Result<Vec<u8>> {
+        let mut out = vec![0u8; n];
+        let got = match &mut self.body {
+            BodyState::Streaming(reader) => {
+                // BodyReader::read can return short reads; loop until
+                // we have `n` bytes or hit EOF, matching the usual
+                // Python .read(n) contract that fills the buffer on
+                // a socket.
+                let mut filled = 0;
+                while filled < n {
+                    match std::io::Read::read(reader, &mut out[filled..]) {
+                        Ok(0) => break,
+                        Ok(k) => filled += k,
+                        Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(e) => return Err(e),
+                    }
+                }
+                filled
+            }
+            BodyState::Buffered(cur) => std::io::Read::read(cur, &mut out)?,
+        };
+        out.truncate(got);
+        Ok(out)
+    }
+
+    /// Drain the remaining body into the buffer. No-op if already
+    /// buffered.
+    fn buffer_all(&mut self) -> std::io::Result<()> {
+        if let BodyState::Streaming(reader) = &mut self.body {
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(reader, &mut buf)?;
+            self.body = BodyState::Buffered(std::io::Cursor::new(buf));
+        }
+        Ok(())
+    }
+
+    /// Fully drain the body into memory (if it wasn't already) and
+    /// return a borrow of the whole thing.
+    pub fn body(&mut self) -> std::io::Result<&[u8]> {
+        self.buffer_all()?;
+        match &self.body {
+            BodyState::Buffered(cur) => Ok(cur.get_ref().as_slice()),
+            BodyState::Streaming(_) => unreachable!("buffer_all transitions to Buffered"),
+        }
+    }
+
+    /// Drain and discard the body, leaving the response marked as
+    /// consumed. Used on the 401 path when we're about to retry —
+    /// we need the underlying socket returned to ureq's pool but
+    /// don't care about the body content. Subsequent `read` /
+    /// `body` calls return empty.
+    pub fn discard_body(&mut self) -> std::io::Result<()> {
+        if let BodyState::Streaming(reader) = &mut self.body {
+            std::io::copy(reader, &mut std::io::sink())?;
+        }
+        // Whether we were streaming or already buffered, flip to a
+        // fresh empty buffer so the response is effectively closed.
+        self.body = BodyState::Buffered(std::io::Cursor::new(Vec::new()));
+        Ok(())
     }
 
     /// Case-insensitive header lookup, first match wins.
@@ -1043,7 +1170,7 @@ mod tests {
                 ("X-Custom".to_string(), "a".to_string()),
                 ("X-Custom".to_string(), "b".to_string()),
             ],
-            body: Vec::new(),
+            body: BodyState::Buffered(std::io::Cursor::new(Vec::new())),
             final_url: "http://example.com/".into(),
             redirected_to: None,
         };
@@ -1061,7 +1188,7 @@ mod tests {
                 ("Location".into(), "/new".into()),
                 ("URI".into(), "/ignored".into()),
             ],
-            body: Vec::new(),
+            body: BodyState::Buffered(std::io::Cursor::new(Vec::new())),
             final_url: "http://example.com/".into(),
             redirected_to: None,
         };
@@ -1077,7 +1204,7 @@ mod tests {
             status: 301,
             reason: "Moved".into(),
             headers: vec![("URI".into(), "http://other.example/".into())],
-            body: Vec::new(),
+            body: BodyState::Buffered(std::io::Cursor::new(Vec::new())),
             final_url: "http://example.com/".into(),
             redirected_to: None,
         };
@@ -1093,7 +1220,7 @@ mod tests {
             status: 302,
             reason: "Found".into(),
             headers: vec![],
-            body: Vec::new(),
+            body: BodyState::Buffered(std::io::Cursor::new(Vec::new())),
             final_url: "http://example.com/".into(),
             redirected_to: None,
         };
@@ -1106,7 +1233,7 @@ mod tests {
             status: 303,
             reason: "See Other".into(),
             headers: vec![("Location".into(), "../b".into())],
-            body: Vec::new(),
+            body: BodyState::Buffered(std::io::Cursor::new(Vec::new())),
             final_url: "http://example.com/a/c".into(),
             redirected_to: None,
         };
@@ -1127,7 +1254,7 @@ mod tests {
             status: code,
             reason: "".into(),
             headers,
-            body: Vec::new(),
+            body: BodyState::Buffered(std::io::Cursor::new(Vec::new())),
             final_url: url.into(),
             redirected_to: None,
         }
@@ -1483,6 +1610,61 @@ mod tests {
         let uri: Uri = "http://example.com/".parse().unwrap();
         let hdr = cached_auth_header(&cached, &Method::GET, &uri).unwrap();
         assert_eq!(hdr, "Negotiate TOKEN-BYTES");
+    }
+
+    /// Build an HttpResponse whose body is pre-buffered with the
+    /// given bytes. Convenient for testing the read path without a
+    /// real network connection.
+    fn mk_buffered(status: u16, body: &[u8]) -> HttpResponse {
+        HttpResponse {
+            status,
+            reason: "".into(),
+            headers: vec![],
+            final_url: "http://example/".into(),
+            redirected_to: None,
+            body: BodyState::Buffered(std::io::Cursor::new(body.to_vec())),
+        }
+    }
+
+    #[test]
+    fn response_read_returns_all_when_size_none() {
+        let mut r = mk_buffered(200, b"hello");
+        let got = r.read(None).unwrap();
+        assert_eq!(got, b"hello");
+    }
+
+    #[test]
+    fn response_read_returns_up_to_n() {
+        let mut r = mk_buffered(200, b"abcdef");
+        assert_eq!(r.read(Some(3)).unwrap(), b"abc");
+        assert_eq!(r.read(Some(10)).unwrap(), b"def");
+        // Further reads return empty.
+        assert_eq!(r.read(Some(5)).unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn response_body_drains_once() {
+        let mut r = mk_buffered(200, b"hello");
+        assert_eq!(r.body().unwrap(), b"hello");
+        // Subsequent body() calls return the same bytes.
+        assert_eq!(r.body().unwrap(), b"hello");
+    }
+
+    #[test]
+    fn response_body_after_partial_read_contains_everything() {
+        // `body()` forces a full drain regardless of where read()
+        // left off — it returns the full buffer.
+        let mut r = mk_buffered(200, b"abcdef");
+        assert_eq!(r.read(Some(3)).unwrap(), b"abc");
+        assert_eq!(r.body().unwrap(), b"abcdef");
+    }
+
+    #[test]
+    fn response_discard_body_marks_as_consumed() {
+        let mut r = mk_buffered(200, b"hello");
+        r.discard_body().unwrap();
+        // After discard, reads return empty.
+        assert_eq!(r.read(None).unwrap(), Vec::<u8>::new());
     }
 
     #[test]
