@@ -14,8 +14,10 @@ use std::sync::Arc;
 use url::Url;
 
 /// Shared filter callback. Wrapped in `Arc` so clone() can hand a copy to
-/// the cloned transport without moving ownership.
-pub type FilterFunc = Arc<dyn Fn(&str) -> String + Send + Sync>;
+/// the cloned transport without moving ownership. Returns `Err` to refuse
+/// the path (e.g. PermissionDenied); the error propagates out of the
+/// transport method that called the filter.
+pub type FilterFunc = Arc<dyn Fn(&str) -> Result<String> + Send + Sync>;
 
 pub struct PathFilteringTransport {
     backing: Box<dyn Transport + Send + Sync>,
@@ -70,7 +72,7 @@ impl PathFilteringTransport {
     pub fn filter(&self, relpath: &str) -> Result<String> {
         let p = self.relpath_from_server_root(relpath)?;
         match &self.filter_func {
-            Some(f) => Ok(f(&p)),
+            Some(f) => f(&p),
             None => Ok(p),
         }
     }
@@ -380,7 +382,7 @@ mod tests {
     fn filter_func_rewrites_path() {
         // Filter prepends "sub/" to every relpath; starting from root that
         // means every get effectively reads from /sub/...
-        let filter: FilterFunc = Arc::new(|p: &str| format!("sub/{}", p));
+        let filter: FilterFunc = Arc::new(|p: &str| Ok(format!("sub/{}", p)));
         let t = make("/", Some(filter));
         assert_eq!(t.get_bytes("b").unwrap(), b"B");
     }
@@ -414,7 +416,7 @@ mod tests {
 
     #[test]
     fn abspath_is_not_filtered() {
-        let filter: FilterFunc = Arc::new(|p: &str| format!("sub/{}", p));
+        let filter: FilterFunc = Arc::new(|p: &str| Ok(format!("sub/{}", p)));
         let t = make("/", Some(filter));
         let u = t.abspath("x").unwrap();
         assert!(u.as_str().ends_with("/x"), "got {}", u);

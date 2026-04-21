@@ -552,7 +552,7 @@ impl Transport for MemoryTransport {
     }
 
     fn hardlink(&self, _rel_from: &UrlFragment, _rel_to: &UrlFragment) -> Result<()> {
-        Err(Error::TransportNotPossible)
+        Err(Error::TransportNotPossible(None))
     }
 
     fn symlink(&self, source: &UrlFragment, link_name: &UrlFragment) -> Result<()> {
@@ -600,8 +600,19 @@ impl Transport for MemoryTransport {
         }))
     }
 
-    fn delete_tree(&self, _relpath: &UrlFragment) -> Result<()> {
-        Err(Error::TransportNotPossible)
+    fn delete_tree(&self, relpath: &UrlFragment) -> Result<()> {
+        let abspath = self.resolve_symlinks(relpath)?;
+        let mut store = self.store.lock().unwrap();
+        if !store.dirs.contains_key(&abspath) {
+            return Err(Error::NoSuchFile(Some(relpath.to_string())));
+        }
+        let prefix = format!("{}/", abspath);
+        store.files.retain(|k, _| !k.starts_with(&prefix));
+        store.symlinks.retain(|k, _| !k.starts_with(&prefix));
+        store
+            .dirs
+            .retain(|k, _| !k.starts_with(&prefix) && k != &abspath);
+        Ok(())
     }
 
     fn list_dir(&self, relpath: &UrlFragment) -> Box<dyn Iterator<Item = Result<String>>> {

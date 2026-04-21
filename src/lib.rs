@@ -17,7 +17,7 @@ pub enum Error {
 
     FileExists(Option<String>),
 
-    TransportNotPossible,
+    TransportNotPossible(Option<String>),
 
     UrlError(url::ParseError),
 
@@ -210,7 +210,7 @@ pub trait Transport: std::fmt::Debug + 'static + Send + Sync {
             match err {
                 Error::FileExists(_) => Ok(false),
                 Error::PermissionDenied(_) => Ok(false),
-                Error::TransportNotPossible => {
+                Error::TransportNotPossible(_) => {
                     if self.has(".")? {
                         Ok(false)
                     } else {

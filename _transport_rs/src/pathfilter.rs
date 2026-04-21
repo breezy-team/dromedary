@@ -6,11 +6,12 @@ use std::sync::Arc;
 
 fn make_filter_func(filter_py: Option<Py<PyAny>>) -> Option<FilterFunc> {
     let f = filter_py?;
-    Some(Arc::new(move |p: &str| -> String {
-        Python::attach(|py| {
-            f.call1(py, (p,))
-                .and_then(|r| r.extract::<String>(py))
-                .unwrap_or_else(|_| p.to_string())
+    Some(Arc::new(move |p: &str| -> dromedary::Result<String> {
+        Python::attach(|py| match f.call1(py, (p,)) {
+            Ok(r) => r
+                .extract::<String>(py)
+                .map_err(|e| dromedary::Error::from(e)),
+            Err(e) => Err(dromedary::Error::from(e)),
         })
     }))
 }

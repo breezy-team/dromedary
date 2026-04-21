@@ -64,11 +64,11 @@ impl Transport for UnlistableTransport {
     }
 
     fn list_dir(&self, _relpath: &UrlFragment) -> Box<dyn Iterator<Item = Result<String>>> {
-        Box::new(std::iter::once(Err(Error::TransportNotPossible)))
+        Box::new(std::iter::once(Err(Error::TransportNotPossible(None))))
     }
 
     fn iter_files_recursive(&self) -> Box<dyn Iterator<Item = Result<String>>> {
-        Box::new(std::iter::once(Err(Error::TransportNotPossible)))
+        Box::new(std::iter::once(Err(Error::TransportNotPossible(None))))
     }
 }
 
@@ -100,7 +100,7 @@ mod tests {
         let results: Vec<Result<String>> = t.list_dir(".").collect();
         assert_eq!(results.len(), 1);
         match &results[0] {
-            Err(Error::TransportNotPossible) => {}
+            Err(Error::TransportNotPossible(None)) => {}
             other => panic!("expected TransportNotPossible, got {:?}", other),
         }
     }
@@ -111,7 +111,7 @@ mod tests {
         let results: Vec<Result<String>> = t.iter_files_recursive().collect();
         assert_eq!(results.len(), 1);
         match &results[0] {
-            Err(Error::TransportNotPossible) => {}
+            Err(Error::TransportNotPossible(None)) => {}
             other => panic!("expected TransportNotPossible, got {:?}", other),
         }
     }

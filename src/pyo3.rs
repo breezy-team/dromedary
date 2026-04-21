@@ -122,7 +122,13 @@ impl From<PyErr> for Error {
             } else if e.is_instance_of::<FileExists>(py) {
                 Error::FileExists(arg(0))
             } else if e.is_instance_of::<TransportNotPossible>(py) {
-                Error::TransportNotPossible
+                let msg = e
+                    .value(py)
+                    .getattr("msg")
+                    .ok()
+                    .and_then(|m| m.extract::<String>().ok())
+                    .filter(|s| !s.is_empty());
+                Error::TransportNotPossible(msg)
             } else if e.is_instance_of::<PermissionDenied>(py) {
                 Error::PermissionDenied(arg(0))
             } else if e.is_instance_of::<PathNotChild>(py) {
@@ -655,7 +661,7 @@ impl Transport for PyTransport {
         // boundary. The Python side expects a Transport object, but we'd
         // need to obtain its underlying Py wrapper. For now signal the
         // caller that this transport can't perform the operation.
-        Err(Error::TransportNotPossible)
+        Err(Error::TransportNotPossible(None))
     }
 
     fn copy_to(
@@ -667,7 +673,7 @@ impl Transport for PyTransport {
         // TODO(jelmer): same blocker as copy_tree_to_transport — the
         // destination transport isn't readily expressible as a Py object
         // from inside the Rust adapter.
-        Err(Error::TransportNotPossible)
+        Err(Error::TransportNotPossible(None))
     }
 
     fn can_roundtrip_unix_modebits(&self) -> bool {
