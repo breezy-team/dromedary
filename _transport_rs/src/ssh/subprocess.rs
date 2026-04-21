@@ -208,13 +208,31 @@ fn spawn(argv: &[String], host: &str, port: Option<u16>) -> PyResult<SSHSubproce
 macro_rules! subprocess_vendor {
     ($name:ident, $flavor:expr, $pyname:literal) => {
         #[pyclass(module = "dromedary._transport_rs.ssh", name = $pyname)]
-        pub(crate) struct $name;
+        pub(crate) struct $name {
+            executable_path: Mutex<Option<String>>,
+        }
 
         #[pymethods]
         impl $name {
             #[new]
             fn new() -> Self {
-                Self
+                Self {
+                    executable_path: Mutex::new(None),
+                }
+            }
+
+            /// Override the ssh binary. Matches the Python
+            /// `SSHVendorManager._get_vendor_from_path` flow, where
+            /// `BRZ_SSH=/path/to/ssh` assigns `vendor.executable_path` on
+            /// the detected vendor.
+            #[setter]
+            fn set_executable_path(&self, path: Option<String>) {
+                *self.executable_path.lock().unwrap() = path;
+            }
+
+            #[getter]
+            fn executable_path(&self) -> Option<String> {
+                self.executable_path.lock().unwrap().clone()
             }
 
             /// Spawn the ssh binary with the "sftp" subsystem and return
@@ -228,8 +246,17 @@ macro_rules! subprocess_vendor {
                 host: &str,
                 port: Option<u16>,
             ) -> PyResult<RawFd> {
-                let argv = build_argv($flavor, username, host, port, Some("sftp"), None)
-                    .map_err(argv_err_to_py)?;
+                let exe = self.executable_path.lock().unwrap().clone();
+                let argv = build_argv(
+                    $flavor,
+                    exe.as_deref(),
+                    username,
+                    host,
+                    port,
+                    Some("sftp"),
+                    None,
+                )
+                .map_err(argv_err_to_py)?;
                 let conn = spawn(&argv, host, port)?;
                 conn.detach_fd()
             }
@@ -245,8 +272,17 @@ macro_rules! subprocess_vendor {
                 command: Vec<String>,
                 port: Option<u16>,
             ) -> PyResult<SSHSubprocessConnection> {
-                let argv = build_argv($flavor, username, host, port, None, Some(&command))
-                    .map_err(argv_err_to_py)?;
+                let exe = self.executable_path.lock().unwrap().clone();
+                let argv = build_argv(
+                    $flavor,
+                    exe.as_deref(),
+                    username,
+                    host,
+                    port,
+                    None,
+                    Some(&command),
+                )
+                .map_err(argv_err_to_py)?;
                 spawn(&argv, host, port)
             }
         }

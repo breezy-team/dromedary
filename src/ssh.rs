@@ -55,12 +55,14 @@ impl Error for ArgvError {}
 
 /// Build the full argv for a subprocess vendor.
 ///
-/// Exactly one of `subsystem` and `command` must be `Some`. The produced
-/// argv matches the Python vendor classes in `dromedary/ssh/__init__.py`
-/// byte-for-byte so behavioral tests that compare argv stay stable across
-/// the port.
+/// Exactly one of `subsystem` and `command` must be `Some`. `executable`
+/// overrides the default binary name (used when `BRZ_SSH=/path/to/ssh`
+/// selects a vendor via auto-detection). The produced argv matches the
+/// Python vendor classes in `dromedary/ssh/__init__.py` byte-for-byte so
+/// behavioral tests that compare argv stay stable across the port.
 pub fn build_argv(
     flavor: Flavor,
+    executable: Option<&str>,
     username: Option<&str>,
     host: &str,
     port: Option<u16>,
@@ -77,7 +79,7 @@ pub fn build_argv(
     }
 
     let mut args: Vec<String> = Vec::new();
-    args.push(flavor.executable().to_string());
+    args.push(executable.unwrap_or(flavor.executable()).to_string());
 
     match flavor {
         Flavor::OpenSSH => {
@@ -152,6 +154,7 @@ mod tests {
     fn openssh_sftp_argv() {
         let argv = build_argv(
             Flavor::OpenSSH,
+            None,
             Some("alice"),
             "example.com",
             Some(2222),
@@ -182,8 +185,16 @@ mod tests {
     #[test]
     fn openssh_command_argv() {
         let cmd = s(&["bzr", "serve", "--inet"]);
-        let argv =
-            build_argv(Flavor::OpenSSH, None, "example.com", None, None, Some(&cmd)).unwrap();
+        let argv = build_argv(
+            Flavor::OpenSSH,
+            None,
+            None,
+            "example.com",
+            None,
+            None,
+            Some(&cmd),
+        )
+        .unwrap();
         assert_eq!(
             argv,
             s(&[
@@ -205,6 +216,7 @@ mod tests {
     fn lsh_sftp_argv() {
         let argv = build_argv(
             Flavor::Lsh,
+            None,
             Some("bob"),
             "example.com",
             Some(22),
@@ -231,6 +243,7 @@ mod tests {
     fn plink_sftp_argv() {
         let argv = build_argv(
             Flavor::PLink,
+            None,
             Some("carol"),
             "example.com",
             Some(22),
@@ -260,7 +273,7 @@ mod tests {
 
     #[test]
     fn strange_hostname_rejected_for_non_openssh() {
-        let err = build_argv(Flavor::Lsh, None, "-evil", None, Some("sftp"), None);
+        let err = build_argv(Flavor::Lsh, None, None, "-evil", None, Some("sftp"), None);
         assert!(matches!(err, Err(ArgvError::StrangeHostname(_))));
     }
 
@@ -268,14 +281,30 @@ mod tests {
     fn openssh_does_not_check_hostname() {
         // Matches Python: OpenSSH vendor never called _check_hostname. The
         // -- separator before host makes this safe for OpenSSH.
-        let argv = build_argv(Flavor::OpenSSH, None, "-evil", None, Some("sftp"), None).unwrap();
+        let argv =
+            build_argv(Flavor::OpenSSH, None, None, "-evil", None, Some("sftp"), None).unwrap();
         assert!(argv.contains(&"-evil".to_string()));
         assert!(argv.contains(&"--".to_string()));
     }
 
     #[test]
     fn missing_both_subsystem_and_command_errors() {
-        let err = build_argv(Flavor::OpenSSH, None, "h", None, None, None);
+        let err = build_argv(Flavor::OpenSSH, None, None, "h", None, None, None);
         assert!(matches!(err, Err(ArgvError::InvalidArguments)));
+    }
+
+    #[test]
+    fn executable_override_replaces_default() {
+        let argv = build_argv(
+            Flavor::OpenSSH,
+            Some("/usr/local/bin/my-ssh"),
+            None,
+            "example.com",
+            None,
+            Some("sftp"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(argv[0], "/usr/local/bin/my-ssh");
     }
 }

@@ -17,9 +17,9 @@
 """Rust-backed subprocess SSH vendors (OpenSSH, LSH, PLink).
 
 Thin Python adapters over `dromedary._transport_rs.ssh.{OpenSSH,LSH,
-PLink}SubprocessVendor`, registered alongside the existing pure-Python
-subprocess vendors. Selecting any of them is opt-in via `BRZ_SSH=openssh-rs`
-(etc.) until step 8 removes the Python implementations.
+PLink}SubprocessVendor`. These are the implementations registered for the
+`openssh`, `lsh`, and `plink` vendor names (the former pure-Python
+equivalents have been removed).
 """
 
 from dromedary.ssh import SFTPClient, SSHConnection, SSHVendor
@@ -42,6 +42,17 @@ class _RustSubprocessVendor(SSHVendor):
 
     def __init__(self, rust_vendor):
         self._vendor = rust_vendor
+
+    @property
+    def executable_path(self):
+        return self._vendor.executable_path
+
+    @executable_path.setter
+    def executable_path(self, value):
+        # `SSHVendorManager._get_vendor_from_path` assigns this when
+        # `BRZ_SSH=/path/to/ssh` is set, so the override has to reach the
+        # Rust vendor's argv builder.
+        self._vendor.executable_path = value
 
     def connect_sftp(self, username, password, host, port):
         fd = self._vendor.spawn_sftp(username, host, port)

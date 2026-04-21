@@ -149,13 +149,13 @@ class SSHVendorManager(registry.Registry[str, "SSHVendor", None]):
         vendor = None
         if "OpenSSH" in version:
             logger.debug("ssh implementation is OpenSSH")
-            vendor = OpenSSHSubprocessVendor()
+            vendor = self.get("openssh")
         elif "SSH Secure Shell" in version:
             logger.debug("ssh implementation is SSH Corp.")
             vendor = SSHCorpSubprocessVendor()
         elif "lsh" in version:
             logger.debug("ssh implementation is GNU lsh.")
-            vendor = LSHSubprocessVendor()
+            vendor = self.get("lsh")
         # As plink user prompts are not handled currently, don't auto-detect
         # it by inspection below, but keep this vendor detection for if a path
         # is given in BRZ_SSH. See https://bugs.launchpad.net/bugs/414743
@@ -164,7 +164,7 @@ class SSHVendorManager(registry.Registry[str, "SSHVendor", None]):
             # sometimes reports 'ssh -V' incorrectly with 'plink' in its
             # version.  See https://bugs.launchpad.net/bzr/+bug/107155
             logger.debug("ssh implementation is Putty's plink.")
-            vendor = PLinkSubprocessVendor()
+            vendor = self.get("plink")
         return vendor
 
     def _get_vendor_by_inspection(self):
@@ -411,9 +411,9 @@ _ssh_connection_errors: tuple[type[Exception], ...] = (
 # Rust-backed vendors. Registered lazily so the extension module is only
 # imported when one of these vendors is actually selected.
 register_lazy_ssh_vendor("russh", "dromedary.ssh.russh", "russh_vendor")
-register_lazy_ssh_vendor("openssh-rs", "dromedary.ssh.subprocess_rs", "openssh_vendor")
-register_lazy_ssh_vendor("lsh-rs", "dromedary.ssh.subprocess_rs", "lsh_vendor")
-register_lazy_ssh_vendor("plink-rs", "dromedary.ssh.subprocess_rs", "plink_vendor")
+register_lazy_ssh_vendor("openssh", "dromedary.ssh.subprocess_rs", "openssh_vendor")
+register_lazy_ssh_vendor("lsh", "dromedary.ssh.subprocess_rs", "lsh_vendor")
+register_lazy_ssh_vendor("plink", "dromedary.ssh.subprocess_rs", "plink_vendor")
 _ssh_vendor_manager.default_key = "russh"
 
 if paramiko is not None:
@@ -537,47 +537,6 @@ class SubprocessVendor(SSHVendor):
         raise NotImplementedError(self._get_vendor_specific_argv)
 
 
-class OpenSSHSubprocessVendor(SubprocessVendor):
-    """SSH vendor that uses the 'ssh' executable from OpenSSH."""
-
-    executable_path = "ssh"
-
-    def _get_vendor_specific_argv(
-        self, username, host, port, subsystem=None, command=None
-    ):
-        """Build OpenSSH command line arguments.
-
-        Args:
-            username: SSH username.
-            host: Hostname to connect to.
-            port: Port number (optional).
-            subsystem: SSH subsystem to invoke (e.g., 'sftp').
-            command: Command to execute (alternative to subsystem).
-
-        Returns:
-            list: Command line arguments for OpenSSH.
-        """
-        args = [
-            self.executable_path,
-            "-oForwardX11=no",
-            "-oForwardAgent=no",
-            "-oClearAllForwardings=yes",
-            "-oNoHostAuthenticationForLocalhost=yes",
-        ]
-        if port is not None:
-            args.extend(["-p", str(port)])
-        if username is not None:
-            args.extend(["-l", username])
-        if subsystem is not None:
-            args.extend(["-s", "--", host, subsystem])
-        else:
-            args.extend(["--", host] + command)
-        return args
-
-
-register_ssh_vendor("openssh", OpenSSHSubprocessVendor())
-
-
 class SSHCorpSubprocessVendor(SubprocessVendor):
     """SSH vendor that uses the 'ssh' executable from SSH Corporation."""
 
@@ -612,78 +571,6 @@ class SSHCorpSubprocessVendor(SubprocessVendor):
 
 
 register_ssh_vendor("sshcorp", SSHCorpSubprocessVendor())
-
-
-class LSHSubprocessVendor(SubprocessVendor):
-    """SSH vendor that uses the 'lsh' executable from GNU."""
-
-    executable_path = "lsh"
-
-    def _get_vendor_specific_argv(
-        self, username, host, port, subsystem=None, command=None
-    ):
-        """Build GNU lsh command line arguments.
-
-        Args:
-            username: SSH username.
-            host: Hostname to connect to.
-            port: Port number (optional).
-            subsystem: SSH subsystem to invoke (e.g., 'sftp').
-            command: Command to execute (alternative to subsystem).
-
-        Returns:
-            list: Command line arguments for GNU lsh.
-        """
-        self._check_hostname(host)
-        args = [self.executable_path]
-        if port is not None:
-            args.extend(["-p", str(port)])
-        if username is not None:
-            args.extend(["-l", username])
-        if subsystem is not None:
-            args.extend(["--subsystem", subsystem, host])
-        else:
-            args.extend([host] + command)
-        return args
-
-
-register_ssh_vendor("lsh", LSHSubprocessVendor())
-
-
-class PLinkSubprocessVendor(SubprocessVendor):
-    """SSH vendor that uses the 'plink' executable from Putty."""
-
-    executable_path = "plink"
-
-    def _get_vendor_specific_argv(
-        self, username, host, port, subsystem=None, command=None
-    ):
-        """Build PuTTY plink command line arguments.
-
-        Args:
-            username: SSH username.
-            host: Hostname to connect to.
-            port: Port number (optional).
-            subsystem: SSH subsystem to invoke (e.g., 'sftp').
-            command: Command to execute (alternative to subsystem).
-
-        Returns:
-            list: Command line arguments for plink.
-        """
-        self._check_hostname(host)
-        args = [self.executable_path, "-x", "-a", "-ssh", "-2", "-batch"]
-        if port is not None:
-            args.extend(["-P", str(port)])
-        if username is not None:
-            args.extend(["-l", username])
-        if subsystem is not None:
-            args.extend(["-s", host, subsystem])
-        else:
-            args.extend([host] + command)
-        return args
-
-
-register_ssh_vendor("plink", PLinkSubprocessVendor())
 
 
 def _paramiko_auth(username, password, host, port, paramiko_transport):
