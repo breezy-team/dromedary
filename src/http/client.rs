@@ -222,17 +222,11 @@ fn auth_cache_key(uri: &Uri) -> AuthCacheKey {
 fn cached_auth_header(cached: &CachedAuth, method: &Method, uri: &Uri) -> Option<String> {
     match cached {
         CachedAuth::Basic { user, password } => Some(build_basic_auth_header(user, password)),
-        CachedAuth::Digest(_) => {
-            // Can't mutate `&cached`; the caller already cloned and
-            // will re-store after calling us. This function is only
-            // used for the *preemptive* attach path, where the
-            // caller owns the mutation. We wire that by passing a
-            // cloned state in from the caller — but the caller only
-            // has `&CachedAuth` here. Easier: build via a short-lived
-            // clone and let the caller re-store.
-            let CachedAuth::Digest(state) = cached else {
-                unreachable!()
-            };
+        CachedAuth::Digest(state) => {
+            // `build_digest_auth_header` mutates nonce_count. This
+            // function only reads the cached state; the caller owns
+            // the mutation and re-stores after. We work on a local
+            // clone — `&CachedAuth` doesn't give us a write path.
             let mut s = state.clone();
             Some(build_digest_auth_header(
                 &mut s,
@@ -240,6 +234,7 @@ fn cached_auth_header(cached: &CachedAuth, method: &Method, uri: &Uri) -> Option
                 uri.path(),
             ))
         }
+        CachedAuth::Negotiate { token } => Some(format!("Negotiate {}", token)),
     }
 }
 
@@ -315,6 +310,30 @@ impl CredentialProvider for NoCredentialProvider {
     }
 }
 
+/// Source of an HTTP Negotiate / Kerberos initial token.
+///
+/// The token is what goes after `Negotiate ` in the Authorization
+/// header. Typically produced by a GSSAPI client library
+/// (`kerberos.authGSSClient*` on Python); dromedary ships a Python
+/// callback hook so the actual GSSAPI integration lives in the
+/// caller rather than being a hard Rust dependency.
+pub trait NegotiateProvider: Send + Sync {
+    /// Return the initial token for `HTTP@<host>`. `None` means
+    /// Negotiate isn't available (no credentials, no ticket, or
+    /// library missing); the caller falls back to Digest/Basic.
+    fn initial_token(&self, host: &str) -> Option<String>;
+}
+
+/// A [`NegotiateProvider`] that always returns `None`. The default
+/// when no callback is registered.
+pub struct NoNegotiateProvider;
+
+impl NegotiateProvider for NoNegotiateProvider {
+    fn initial_token(&self, _host: &str) -> Option<String> {
+        None
+    }
+}
+
 /// Cached per-origin authentication state. Once the server accepts
 /// our credentials we preemptively attach the same auth header to
 /// subsequent requests to the same host+port, matching urllib's
@@ -328,6 +347,13 @@ enum CachedAuth {
         password: String,
     },
     Digest(DigestAuthState),
+    /// Negotiate auth. Kerberos tokens are single-use per server
+    /// challenge — we cache the token only for the immediate retry,
+    /// not for future requests (see the Python
+    /// `NegotiateAuthHandler.auth_params_reusable` comment).
+    Negotiate {
+        token: String,
+    },
 }
 
 /// Per-host auth cache key: `(scheme_lower, host, port_or_default)`.
@@ -392,12 +418,20 @@ pub struct HttpClient {
     auth_cache: AuthCache,
     /// How we look up `(user, password)` when a challenge arrives.
     credentials: Box<dyn CredentialProvider>,
+    /// Source of Negotiate (Kerberos) initial tokens. Defaults to a
+    /// no-op provider; the PyO3 layer swaps in a callback that
+    /// delegates to Python's `kerberos` module.
+    negotiate: Box<dyn NegotiateProvider>,
 }
 
 impl HttpClient {
     /// Build a new client honouring the given config.
     pub fn new(config: HttpClientConfig) -> Result<Self> {
-        Self::with_credentials(config, Box::new(NoCredentialProvider))
+        Self::with_providers(
+            config,
+            Box::new(NoCredentialProvider),
+            Box::new(NoNegotiateProvider),
+        )
     }
 
     /// Build a new client with a custom credential provider.
@@ -405,12 +439,24 @@ impl HttpClient {
         config: HttpClientConfig,
         credentials: Box<dyn CredentialProvider>,
     ) -> Result<Self> {
+        Self::with_providers(config, credentials, Box::new(NoNegotiateProvider))
+    }
+
+    /// Build a new client with custom credential and negotiate
+    /// providers. The general-purpose constructor — the simpler
+    /// `new` / `with_credentials` helpers delegate here.
+    pub fn with_providers(
+        config: HttpClientConfig,
+        credentials: Box<dyn CredentialProvider>,
+        negotiate: Box<dyn NegotiateProvider>,
+    ) -> Result<Self> {
         let base_config = build_config(&config)?;
         let agent = Agent::new_with_config(base_config);
         Ok(Self {
             agent,
             auth_cache: AuthCache::new(),
             credentials,
+            negotiate,
         })
     }
 
@@ -537,14 +583,8 @@ impl HttpClient {
                     .put(cache_key.clone(), CachedAuth::Digest(s));
                 h
             }
+            CachedAuth::Negotiate { token } => format!("Negotiate {}", token),
         };
-        // For Basic, only cache on success below (keeps us from
-        // memoising wrong credentials forever).
-        if matches!(new_auth, CachedAuth::Basic { .. }) {
-            // Deferred: we only persist basic-auth once the retry
-            // succeeds. Stash `new_auth` on the stack and put it in
-            // the cache below.
-        }
         retry_headers.push(("Authorization".into(), hdr));
         let _ = scheme; // scheme name currently only used for logging
 
@@ -552,11 +592,20 @@ impl HttpClient {
         if retry.status < 400 {
             // Cache the working credentials so future requests to
             // this origin don't need the 401 roundtrip.
-            if let CachedAuth::Basic { .. } = &new_auth {
-                self.auth_cache.put(cache_key, new_auth);
+            match &new_auth {
+                CachedAuth::Basic { .. } => {
+                    self.auth_cache.put(cache_key, new_auth);
+                }
+                CachedAuth::Digest(_) => {
+                    // Already cached above — we needed the bumped
+                    // nonce_count regardless of outcome.
+                }
+                CachedAuth::Negotiate { .. } => {
+                    // Kerberos tokens are single-use per challenge.
+                    // Don't cache; the next 401 will request a fresh
+                    // token from the provider.
+                }
             }
-            // Digest was already cached above (we needed the bumped
-            // nonce_count regardless of outcome).
         }
         Ok(retry)
     }
@@ -566,23 +615,23 @@ impl HttpClient {
     /// header generation. Returns `None` when no scheme matches or
     /// credentials weren't available.
     ///
-    /// Scheme preference follows the order `DigestAuthHandler`
-    /// (handler_order=490) > `BasicAuthHandler` (handler_order=500)
-    /// in the old urllib code. Negotiate is not handled here yet;
-    /// stage 7e adds it via a separate provider callback.
+    /// Scheme preference follows the handler_order values from the
+    /// old urllib code: NegotiateAuthHandler (480) > Digest (490) >
+    /// Basic (500). Lower-ordered handlers mean "prefer this".
     fn pick_auth_scheme(
         &self,
         uri: &Uri,
         challenges: &[&str],
         _method: &Method,
     ) -> Option<(&'static str, CachedAuth)> {
-        // Prefer Digest if offered; fall back to Basic.
+        let mut negotiate_seen = false;
         let mut digest_remainder: Option<&str> = None;
         let mut basic_remainder: Option<&str> = None;
         for ch in challenges {
             let (scheme, remainder) = parse_auth_header(ch);
             let remainder = remainder.unwrap_or("");
             match scheme.as_str() {
+                "negotiate" => negotiate_seen = true,
                 "digest" if digest_remainder.is_none() => {
                     digest_remainder = Some(remainder);
                 }
@@ -596,6 +645,15 @@ impl HttpClient {
         let protocol = uri.scheme_str().unwrap_or("http");
         let host = uri.host().unwrap_or_default();
         let port = uri.port_u16();
+
+        if negotiate_seen {
+            if let Some(token) = self.negotiate.initial_token(host) {
+                return Some(("negotiate", CachedAuth::Negotiate { token }));
+            }
+            // Fall through to Digest / Basic when the provider says
+            // it can't produce a token for this host (no Kerberos
+            // ticket, library absent, etc.).
+        }
 
         if let Some(raw) = digest_remainder {
             if let Some(challenge) = parse_digest_challenge(raw) {
@@ -1219,8 +1277,23 @@ mod tests {
         }
     }
 
+    struct FixedToken(&'static str);
+    impl NegotiateProvider for FixedToken {
+        fn initial_token(&self, _host: &str) -> Option<String> {
+            Some(self.0.into())
+        }
+    }
+
     fn fresh_client(creds: Box<dyn CredentialProvider>) -> HttpClient {
         HttpClient::with_credentials(HttpClientConfig::default(), creds)
+            .expect("config should build")
+    }
+
+    fn client_with_negotiate(
+        creds: Box<dyn CredentialProvider>,
+        neg: Box<dyn NegotiateProvider>,
+    ) -> HttpClient {
+        HttpClient::with_providers(HttpClientConfig::default(), creds, neg)
             .expect("config should build")
     }
 
@@ -1348,6 +1421,68 @@ mod tests {
         let uri: Uri = "http://example.com/resource".parse().unwrap();
         let hdr = cached_auth_header(&cached, &Method::GET, &uri).unwrap();
         assert_eq!(hdr, "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==");
+    }
+
+    #[test]
+    fn pick_auth_scheme_prefers_negotiate_over_digest_and_basic() {
+        let client = client_with_negotiate(
+            Box::new(FixedCreds {
+                user: "u",
+                password: "p",
+            }),
+            Box::new(FixedToken("YIIDSS...base64...")),
+        );
+        let uri: Uri = "http://example.com/".parse().unwrap();
+        let challenges = [
+            "Negotiate",
+            r#"Digest realm="r", nonce="n", qop="auth""#,
+            r#"Basic realm="r""#,
+        ];
+        let got = client
+            .pick_auth_scheme(&uri, &challenges, &Method::GET)
+            .unwrap();
+        assert_eq!(got.0, "negotiate");
+        match got.1 {
+            CachedAuth::Negotiate { token } => {
+                assert_eq!(token, "YIIDSS...base64...");
+            }
+            _ => panic!("expected Negotiate"),
+        }
+    }
+
+    #[test]
+    fn pick_auth_scheme_falls_back_when_negotiate_provider_returns_none() {
+        // Provider says "no ticket available" → we should fall
+        // through to Digest/Basic rather than fail.
+        struct NoToken;
+        impl NegotiateProvider for NoToken {
+            fn initial_token(&self, _: &str) -> Option<String> {
+                None
+            }
+        }
+        let client = client_with_negotiate(
+            Box::new(FixedCreds {
+                user: "u",
+                password: "p",
+            }),
+            Box::new(NoToken),
+        );
+        let uri: Uri = "http://example.com/".parse().unwrap();
+        let challenges = ["Negotiate", r#"Basic realm="r""#];
+        let got = client
+            .pick_auth_scheme(&uri, &challenges, &Method::GET)
+            .unwrap();
+        assert_eq!(got.0, "basic");
+    }
+
+    #[test]
+    fn cached_auth_header_negotiate_formats_with_scheme_prefix() {
+        let cached = CachedAuth::Negotiate {
+            token: "TOKEN-BYTES".into(),
+        };
+        let uri: Uri = "http://example.com/".parse().unwrap();
+        let hdr = cached_auth_header(&cached, &Method::GET, &uri).unwrap();
+        assert_eq!(hdr, "Negotiate TOKEN-BYTES");
     }
 
     #[test]

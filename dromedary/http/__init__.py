@@ -69,6 +69,50 @@ def get_credential_lookup():
     return _http_rs.get_credential_lookup()
 
 
+def set_negotiate_provider(func):
+    """Register a Negotiate / Kerberos initial-token provider.
+
+    The callable is invoked as ``func(host)`` and should return a
+    base64-encoded GSSAPI token string to send after ``Negotiate ``
+    in the Authorization header, or ``None`` if no token is
+    available (no Kerberos ticket, library missing, wrong realm).
+    Pass ``None`` to clear any previously-registered callback.
+    """
+    _http_rs.set_negotiate_provider(func)
+
+
+def get_negotiate_provider():
+    """Return the currently-registered Negotiate provider, or None."""
+    return _http_rs.get_negotiate_provider()
+
+
+def _default_kerberos_provider(host):
+    """Default Negotiate provider using the Python `kerberos` module.
+
+    Matches the behaviour of breezy's old NegotiateAuthHandler: if
+    the `kerberos` module isn't installed, or the GSSAPI context
+    setup fails for any reason, we return None so the auth layer
+    falls back to Digest/Basic.
+    """
+    try:
+        import kerberos
+    except ModuleNotFoundError:
+        return None
+    ret, vc = kerberos.authGSSClientInit(f"HTTP@{host}")
+    if ret < 1:
+        return None
+    ret = kerberos.authGSSClientStep(vc, "")
+    if ret < 0:
+        return None
+    return kerberos.authGSSClientResponse(vc)
+
+
+# Install the default provider at import time. Callers that want to
+# disable Kerberos can set_negotiate_provider(None); callers that
+# want to swap in an alternative (e.g. NTLM) replace it outright.
+_http_rs.set_negotiate_provider(_default_kerberos_provider)
+
+
 def get_credentials(protocol, host, port=None, path=None, realm=None):
     """Look up stored credentials for an HTTP connection."""
     return _http_rs.get_credentials(protocol, host, port=port, path=path, realm=realm)

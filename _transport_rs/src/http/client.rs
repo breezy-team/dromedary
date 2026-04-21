@@ -18,7 +18,8 @@ use std::time::Duration;
 
 use dromedary::http::client::{
     ActivityCallback, ActivityDirection, ClientError, CredentialProvider,
-    HttpClient as RsHttpClient, HttpClientConfig, HttpResponse as RsHttpResponse, RequestOptions,
+    HttpClient as RsHttpClient, HttpClientConfig, HttpResponse as RsHttpResponse,
+    NegotiateProvider, RequestOptions,
 };
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::import_exception;
@@ -67,6 +68,18 @@ impl CredentialProvider for PythonCredentialProvider {
     }
 }
 
+/// NegotiateProvider that delegates to the Python callback
+/// registered via `set_negotiate_provider`. Dromedary ships a
+/// default implementation in `dromedary.http` that uses the
+/// Python `kerberos` module.
+struct PythonNegotiateProvider;
+
+impl NegotiateProvider for PythonNegotiateProvider {
+    fn initial_token(&self, host: &str) -> Option<String> {
+        super::invoke_negotiate_provider(host)
+    }
+}
+
 #[pyclass(module = "dromedary._transport_rs.http", frozen)]
 pub(crate) struct HttpClient {
     inner: RsHttpClient,
@@ -108,8 +121,12 @@ impl HttpClient {
             user_agent,
             read_timeout: timeout,
         };
-        let inner = RsHttpClient::with_credentials(cfg, Box::new(PythonCredentialProvider))
-            .map_err(client_err_to_py)?;
+        let inner = RsHttpClient::with_providers(
+            cfg,
+            Box::new(PythonCredentialProvider),
+            Box::new(PythonNegotiateProvider),
+        )
+        .map_err(client_err_to_py)?;
         Ok(Self {
             inner,
             defaults: Mutex::new(RequestOptions::default()),
