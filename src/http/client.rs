@@ -22,6 +22,7 @@ use ureq::config::Config;
 use ureq::http::{Method, Request, Response, Uri};
 use ureq::tls::{Certificate, PemItem, RootCerts, TlsConfig};
 use ureq::{Agent, Body, Proxy};
+use url::Url;
 
 use crate::http::{evaluate_proxy_bypass, get_proxy_env_var, getproxies_environment, ProxyBypass};
 
@@ -66,6 +67,113 @@ impl From<std::io::Error> for ClientError {
 
 pub type Result<T> = std::result::Result<T, ClientError>;
 
+/// Per-request knobs that callers sometimes need to override. The
+/// defaults match breezy's urllib-layer behaviour: no redirect
+/// following, so 3xx responses surface as-is for the caller to
+/// translate into a `RedirectRequested` if they want.
+#[derive(Debug, Clone)]
+pub struct RequestOptions {
+    /// Follow 301/302/303/307/308 redirects automatically.
+    pub follow_redirects: bool,
+    /// Maximum number of redirects to follow before giving up.
+    /// Mirrors the Python `HTTPRedirectHandler.max_redirections`
+    /// default (10).
+    pub max_redirects: u32,
+    /// Maximum number of visits to the same URL in a redirect chain.
+    /// Mirrors the Python `HTTPRedirectHandler.max_repeats` default
+    /// (4).
+    pub max_repeats: u32,
+}
+
+impl Default for RequestOptions {
+    fn default() -> Self {
+        Self {
+            follow_redirects: false,
+            max_redirects: 10,
+            max_repeats: 4,
+        }
+    }
+}
+
+/// HTTP status codes we follow as redirects when
+/// `follow_redirects=true`. 300 / 304 / 305 / 306 are intentionally
+/// excluded, matching Python `HTTPRedirectHandler.redirect_request`
+/// which raises on anything outside (301, 302, 303, 307, 308).
+fn is_redirect(code: u16) -> bool {
+    matches!(code, 301 | 302 | 303 | 307 | 308)
+}
+
+/// Drive a redirect loop around any single-round-trip function.
+///
+/// Extracted from [`HttpClient::request_with`] so tests can exercise
+/// the loop without a real network round-trip. The closure is
+/// invoked once per hop with the target URL; it should return the
+/// raw response without following any redirects of its own.
+fn drive_redirects(
+    options: &RequestOptions,
+    url: &str,
+    mut send: impl FnMut(&str) -> Result<HttpResponse>,
+) -> Result<HttpResponse> {
+    let mut visited: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut current_url = url.to_string();
+    let mut redirects = 0u32;
+
+    loop {
+        let resp = send(&current_url)?;
+
+        if !options.follow_redirects || !is_redirect(resp.status) {
+            // Non-redirect, or caller opted out: if this *is* a 3xx
+            // and we have a Location, expose it as `redirected_to`
+            // so the transport layer can raise RedirectRequested
+            // without re-parsing the headers.
+            if is_redirect(resp.status) {
+                if let Some(target) = redirect_target(&resp, &current_url) {
+                    return Ok(HttpResponse {
+                        redirected_to: Some(target),
+                        ..resp
+                    });
+                }
+            }
+            return Ok(resp);
+        }
+
+        // Pick the redirect target from Location / URI; if neither
+        // is present the Python impl silently returns the response,
+        // so we do too.
+        let Some(newurl) = redirect_target(&resp, &current_url) else {
+            return Ok(resp);
+        };
+
+        redirects += 1;
+        let visits = visited.entry(newurl.clone()).or_insert(0);
+        *visits += 1;
+        if *visits > options.max_repeats || redirects > options.max_redirects {
+            return Err(ClientError::InvalidRequest(format!(
+                "too many redirects (at {} after {} hops)",
+                newurl, redirects
+            )));
+        }
+
+        current_url = newurl;
+        // Carry headers and body forward unchanged; the Python
+        // HTTPRedirectHandler.redirect_request does the same.
+    }
+}
+
+/// Resolve the redirect target for a 3xx response: prefer
+/// `Location:`, fall back to `URI:`. Matches the Python handler
+/// which also accepts the antiquated `URI` header. Returns `None`
+/// if neither header is present or the value fails to parse as a
+/// URL even after joining with the request URL.
+fn redirect_target(resp: &HttpResponse, current_url: &str) -> Option<String> {
+    let raw = resp.header("location").or_else(|| resp.header("uri"))?;
+    // Use the `url` crate to resolve relative redirect URLs. This
+    // matches Python's `urllib.parse.urljoin`: absolute URLs
+    // override, relative ones are joined to the current document.
+    let base = Url::parse(current_url).ok()?;
+    base.join(raw).ok().map(|u| u.to_string())
+}
+
 /// Options for building an [`HttpClient`].
 #[derive(Default)]
 pub struct HttpClientConfig {
@@ -106,10 +214,8 @@ impl HttpClient {
         Ok(Self { agent })
     }
 
-    /// Perform an HTTP request. `body` is sent verbatim; pass an
-    /// empty slice for bodyless methods. Arbitrary methods (e.g.
-    /// WebDAV's `PROPFIND`) are accepted as long as they parse as
-    /// valid HTTP method tokens.
+    /// Perform an HTTP request with default options (no redirect
+    /// following). Convenience wrapper over [`Self::request_with`].
     pub fn request(
         &self,
         method: &str,
@@ -117,36 +223,65 @@ impl HttpClient {
         headers: &[(String, String)],
         body: &[u8],
     ) -> Result<HttpResponse> {
-        let uri: Uri = url
-            .parse()
-            .map_err(|_| ClientError::InvalidRequest(format!("bad URL: {}", url)))?;
+        self.request_with(method, url, headers, body, &RequestOptions::default())
+    }
+
+    /// Perform an HTTP request and optionally follow redirects.
+    ///
+    /// The redirect loop matches breezy's
+    /// `HTTPRedirectHandler.http_error_302` semantics: 301, 302,
+    /// 303, 307, and 308 are followed; the request method and
+    /// headers are carried unchanged (the Python version doesn't
+    /// rewrite POST→GET on 303 either); `Location:` wins over
+    /// `URI:` if both appear. Relative redirect URLs are resolved
+    /// against the request URL.
+    ///
+    /// When `follow_redirects` is false, the first 3xx response is
+    /// returned with `redirected_to` set to the target URL so the
+    /// caller can decide what to do (typically raise
+    /// `RedirectRequested` from the transport layer).
+    pub fn request_with(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+        options: &RequestOptions,
+    ) -> Result<HttpResponse> {
         let method = Method::from_bytes(method.as_bytes())
             .map_err(|_| ClientError::InvalidRequest(format!("bad method: {}", method)))?;
 
-        // Build the http::Request manually so arbitrary methods and
-        // the request body flow through `Agent::run` without the
-        // typestate constraints of the per-verb builders.
-        let mut builder = Request::builder().method(method).uri(&uri);
+        drive_redirects(options, url, |target| {
+            self.send_once(&method, target, headers, body)
+        })
+    }
+
+    /// Single transport round-trip. No redirect handling.
+    fn send_once(
+        &self,
+        method: &Method,
+        url: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> Result<HttpResponse> {
+        let uri: Uri = url
+            .parse()
+            .map_err(|_| ClientError::InvalidRequest(format!("bad URL: {}", url)))?;
+
+        let mut builder = Request::builder().method(method.clone()).uri(&uri);
         for (k, v) in headers {
             builder = builder.header(k, v);
         }
-        // `body.to_vec()` because the http::Request needs `'static`
-        // for the body. We're already buffering in HttpResponse.body
-        // so the duplicate allocation isn't a regression over the
-        // Python implementation.
         let req: Request<Vec<u8>> = builder
             .body(body.to_vec())
             .map_err(|e| ClientError::InvalidRequest(e.to_string()))?;
 
-        // Attach the proxy (if any) at request scope via
-        // `configure_request`, then run through the same agent so
-        // connections still pool correctly.
         let req = match self.choose_proxy(&uri)? {
             Some(proxy) => self.agent.configure_request(req).proxy(Some(proxy)).build(),
             None => req,
         };
         let response = self.agent.run(req)?;
-        HttpResponse::from_ureq(response)
+        HttpResponse::from_ureq(response, url.to_string())
     }
 
     /// Decide whether the request to `uri` should go through a
@@ -285,10 +420,17 @@ pub struct HttpResponse {
     /// handler-layer auth retries that Stage 6b will add. Stage 7
     /// swaps this for a streaming body to plug into `RangeFile`.
     pub body: Vec<u8>,
+    /// URL of the final response after any redirect following. For
+    /// non-redirected requests this equals the original URL.
+    pub final_url: String,
+    /// When the client reached a 3xx but `follow_redirects` was
+    /// false, this carries the `Location`-resolved URL the caller
+    /// would have been redirected to. `None` otherwise.
+    pub redirected_to: Option<String>,
 }
 
 impl HttpResponse {
-    fn from_ureq(mut resp: Response<Body>) -> Result<Self> {
+    fn from_ureq(mut resp: Response<Body>, final_url: String) -> Result<Self> {
         let status = resp.status().as_u16();
         // HTTP/2 has no reason phrase — fall back to the canonical
         // text for the status code so callers always get something.
@@ -309,6 +451,8 @@ impl HttpResponse {
             reason,
             headers,
             body,
+            final_url,
+            redirected_to: None,
         })
     }
 
@@ -441,9 +585,200 @@ mod tests {
                 ("X-Custom".to_string(), "b".to_string()),
             ],
             body: Vec::new(),
+            final_url: "http://example.com/".into(),
+            redirected_to: None,
         };
         assert_eq!(resp.header("content-type"), Some("text/plain"));
         assert_eq!(resp.headers_all("x-custom"), vec!["a", "b"]);
         assert_eq!(resp.header("missing"), None);
+    }
+
+    #[test]
+    fn redirect_target_prefers_location() {
+        let resp = HttpResponse {
+            status: 302,
+            reason: "Found".into(),
+            headers: vec![
+                ("Location".into(), "/new".into()),
+                ("URI".into(), "/ignored".into()),
+            ],
+            body: Vec::new(),
+            final_url: "http://example.com/".into(),
+            redirected_to: None,
+        };
+        assert_eq!(
+            redirect_target(&resp, "http://example.com/old"),
+            Some("http://example.com/new".into())
+        );
+    }
+
+    #[test]
+    fn redirect_target_falls_back_to_uri_header() {
+        let resp = HttpResponse {
+            status: 301,
+            reason: "Moved".into(),
+            headers: vec![("URI".into(), "http://other.example/".into())],
+            body: Vec::new(),
+            final_url: "http://example.com/".into(),
+            redirected_to: None,
+        };
+        assert_eq!(
+            redirect_target(&resp, "http://example.com/"),
+            Some("http://other.example/".into())
+        );
+    }
+
+    #[test]
+    fn redirect_target_returns_none_if_missing() {
+        let resp = HttpResponse {
+            status: 302,
+            reason: "Found".into(),
+            headers: vec![],
+            body: Vec::new(),
+            final_url: "http://example.com/".into(),
+            redirected_to: None,
+        };
+        assert_eq!(redirect_target(&resp, "http://example.com/"), None);
+    }
+
+    #[test]
+    fn redirect_target_joins_relative_path() {
+        let resp = HttpResponse {
+            status: 303,
+            reason: "See Other".into(),
+            headers: vec![("Location".into(), "../b".into())],
+            body: Vec::new(),
+            final_url: "http://example.com/a/c".into(),
+            redirected_to: None,
+        };
+        assert_eq!(
+            redirect_target(&resp, "http://example.com/a/c"),
+            Some("http://example.com/b".into())
+        );
+    }
+
+    /// Build a `HttpResponse` with the given code and optional
+    /// `Location`. Keeps the test bodies short.
+    fn mk_resp(code: u16, location: Option<&str>, url: &str) -> HttpResponse {
+        let mut headers = Vec::new();
+        if let Some(l) = location {
+            headers.push(("Location".into(), l.into()));
+        }
+        HttpResponse {
+            status: code,
+            reason: "".into(),
+            headers,
+            body: Vec::new(),
+            final_url: url.into(),
+            redirected_to: None,
+        }
+    }
+
+    #[test]
+    fn drive_redirects_returns_non_3xx_as_is() {
+        let opts = RequestOptions::default();
+        let resp = drive_redirects(&opts, "http://a/", |u| Ok(mk_resp(200, None, u))).unwrap();
+        assert_eq!(resp.status, 200);
+        assert!(resp.redirected_to.is_none());
+    }
+
+    #[test]
+    fn drive_redirects_without_follow_sets_redirected_to() {
+        let opts = RequestOptions::default(); // follow_redirects=false
+        let resp = drive_redirects(&opts, "http://a/", |u| {
+            Ok(mk_resp(302, Some("http://b/"), u))
+        })
+        .unwrap();
+        assert_eq!(resp.status, 302);
+        assert_eq!(resp.redirected_to.as_deref(), Some("http://b/"));
+    }
+
+    #[test]
+    fn drive_redirects_follows_when_enabled() {
+        let opts = RequestOptions {
+            follow_redirects: true,
+            ..RequestOptions::default()
+        };
+        let mut hops = 0;
+        let resp = drive_redirects(&opts, "http://a/", |u| {
+            hops += 1;
+            // First hop returns 302 → /b, second returns 200.
+            if u == "http://a/" {
+                Ok(mk_resp(302, Some("http://a/b"), u))
+            } else {
+                Ok(mk_resp(200, None, u))
+            }
+        })
+        .unwrap();
+        assert_eq!(hops, 2);
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.final_url, "http://a/b");
+    }
+
+    #[test]
+    fn drive_redirects_rejects_too_many_hops() {
+        let opts = RequestOptions {
+            follow_redirects: true,
+            max_redirects: 2,
+            max_repeats: 10,
+        };
+        // Chain that bounces between /a and /b forever, but each
+        // distinct URL stays under max_repeats so the cap we hit is
+        // max_redirects.
+        let mut toggle = false;
+        let err = drive_redirects(&opts, "http://a/", |_u| {
+            toggle = !toggle;
+            let next = if toggle { "http://a/b" } else { "http://a/c" };
+            Ok(mk_resp(302, Some(next), "http://a/"))
+        })
+        .unwrap_err();
+        match err {
+            ClientError::InvalidRequest(msg) => assert!(msg.contains("too many redirects")),
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn drive_redirects_detects_loops() {
+        let opts = RequestOptions {
+            follow_redirects: true,
+            max_redirects: 100,
+            max_repeats: 2,
+        };
+        // Every request redirects back to /a — we cap at
+        // max_repeats visits to the same URL.
+        let err = drive_redirects(&opts, "http://a/", |u| {
+            Ok(mk_resp(302, Some("http://a/b"), u))
+        })
+        .unwrap_err();
+        match err {
+            ClientError::InvalidRequest(msg) => assert!(msg.contains("too many redirects")),
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn drive_redirects_stops_when_location_absent() {
+        // A 3xx with no Location isn't a redirect per Python's
+        // handler — it just gets returned as-is.
+        let opts = RequestOptions {
+            follow_redirects: true,
+            ..RequestOptions::default()
+        };
+        let resp = drive_redirects(&opts, "http://a/", |u| Ok(mk_resp(302, None, u))).unwrap();
+        assert_eq!(resp.status, 302);
+        assert!(resp.redirected_to.is_none());
+    }
+
+    #[test]
+    fn is_redirect_table() {
+        for &code in &[301, 302, 303, 307, 308] {
+            assert!(is_redirect(code), "{} should be a redirect", code);
+        }
+        // 300/304/305/306 are deliberately excluded — see the
+        // comment on HTTPRedirectHandler.redirect_request.
+        for &code in &[200, 300, 304, 305, 306, 400, 401, 404, 500] {
+            assert!(!is_redirect(code), "{} should not be a redirect", code);
+        }
     }
 }
