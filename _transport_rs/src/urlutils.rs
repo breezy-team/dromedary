@@ -391,7 +391,12 @@ impl UrlObject {
         if let Some(port) = self.port {
             netloc = format!("{}:{}", netloc, port);
         }
-        format!("{}://{}{}", self.scheme, netloc, self.quoted_path)
+        let sep = if self.quoted_path.starts_with('/') || self.quoted_path.is_empty() {
+            ""
+        } else {
+            "/"
+        };
+        format!("{}://{}{}{}", self.scheme, netloc, sep, self.quoted_path)
     }
 
     #[pyo3(signature = (offset = None))]

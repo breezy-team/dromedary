@@ -1,4 +1,4 @@
-use crate::Transport;
+use crate::{Transport, TransportDecorator};
 use dromedary::pyo3::PyTransport;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -27,10 +27,16 @@ fn resolve_inner(py: Python, url: &str, decorated: Option<Py<PyAny>>) -> PyResul
     Ok(func.call1((rest,))?.unbind())
 }
 
-#[pyclass(extends=Transport, subclass)]
-pub(crate) struct FakeNFSTransportDecorator {
-    decorated: Py<PyAny>,
+fn wrap_inner(decorated: &Py<PyAny>, py: Python) -> Transport {
+    let py_inner: Box<dyn dromedary::Transport + Send + Sync> =
+        Box::new(PyTransport::from(decorated.clone_ref(py)));
+    Transport(Box::new(dromedary::fakenfs::FakeNfsTransport::new(
+        py_inner,
+    )))
 }
+
+#[pyclass(extends=TransportDecorator, subclass)]
+pub(crate) struct FakeNFSTransportDecorator;
 
 #[pymethods]
 impl FakeNFSTransportDecorator {
@@ -41,21 +47,16 @@ impl FakeNFSTransportDecorator {
         url: &str,
         _decorated: Option<Py<PyAny>>,
         _from_transport: Option<Py<PyAny>>,
-    ) -> PyResult<(Self, Transport)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         let _ = _from_transport;
         let decorated = resolve_inner(py, url, _decorated)?;
-        let py_inner: Box<dyn dromedary::Transport + Send + Sync> =
-            Box::new(PyTransport::from(decorated.clone_ref(py)));
-        let wrapped = dromedary::fakenfs::FakeNfsTransport::new(py_inner);
-        Ok((
-            FakeNFSTransportDecorator { decorated },
-            Transport(Box::new(wrapped)),
-        ))
-    }
-
-    #[getter]
-    fn _decorated(&self, py: Python) -> Py<PyAny> {
-        self.decorated.clone_ref(py)
+        let wrapped = wrap_inner(&decorated, py);
+        Ok(PyClassInitializer::from(wrapped)
+            .add_subclass(TransportDecorator {
+                decorated,
+                prefix: PREFIX,
+            })
+            .add_subclass(FakeNFSTransportDecorator))
     }
 
     #[classmethod]
@@ -69,19 +70,19 @@ impl FakeNFSTransportDecorator {
         py: Python<'a>,
         offset: Option<Py<PyAny>>,
     ) -> PyResult<Bound<'a, FakeNFSTransportDecorator>> {
-        let decorated = slf.decorated.clone_ref(py);
+        let decorator: &TransportDecorator = slf.as_super();
+        let decorated = decorator.decorated.clone_ref(py);
         let decorated_clone = match offset {
             Some(o) => decorated.call_method1(py, "clone", (o,))?,
             None => decorated.call_method0(py, "clone")?,
         };
-        let py_inner: Box<dyn dromedary::Transport + Send + Sync> =
-            Box::new(PyTransport::from(decorated_clone.clone_ref(py)));
-        let wrapped = dromedary::fakenfs::FakeNfsTransport::new(py_inner);
-        let init = PyClassInitializer::from(Transport(Box::new(wrapped))).add_subclass(
-            FakeNFSTransportDecorator {
+        let wrapped = wrap_inner(&decorated_clone, py);
+        let init = PyClassInitializer::from(wrapped)
+            .add_subclass(TransportDecorator {
                 decorated: decorated_clone,
-            },
-        );
+                prefix: PREFIX,
+            })
+            .add_subclass(FakeNFSTransportDecorator);
         Bound::new(py, init)
     }
 }
