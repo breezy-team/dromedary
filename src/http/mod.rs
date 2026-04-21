@@ -4,6 +4,9 @@
 //! to be wired in: locating the CA certificate bundle and the User-Agent
 //! default. The Python wrapper in `dromedary.http` delegates to these.
 
+pub mod response;
+pub use response::{handle_response, InFile, RangeFile, ResponseError, ResponseFile, ResponseKind};
+
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 

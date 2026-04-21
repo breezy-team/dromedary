@@ -1,5 +1,7 @@
 //! Python bindings for the HTTP helper functions in `dromedary::http`.
 
+mod response;
+
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
@@ -93,6 +95,8 @@ pub(crate) fn register(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(digest_kd, m)?)?;
     m.add_function(wrap_pyfunction!(digest_algorithm_supported, m)?)?;
     m.add_function(wrap_pyfunction!(get_new_cnonce, m)?)?;
+
+    response::register(m)?;
 
     let locations = PyList::new(py, dromedary::http::SSL_CA_CERTS_KNOWN_LOCATIONS)?;
     m.add("SSL_CA_CERTS_KNOWN_LOCATIONS", locations)?;
