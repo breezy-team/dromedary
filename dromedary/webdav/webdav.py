@@ -452,94 +452,6 @@ def _extract_dir_content(url, infile):
     return elements
 
 
-class DavResponse(urllib.Response):
-    """Custom HTTPResponse.
-
-    DAV have some reponses for which the body is of no interest.
-    """
-
-    _body_ignored_responses = urllib.Response._body_ignored_responses + [
-        201,
-        405,
-        409,
-        412,
-    ]
-
-    def begin(self):
-        """Begin to read the response from the server.
-
-        Overrides httplib behavior to prevent premature connection closing
-        for certain status codes that WebDAV uses.
-
-        httplib incorrectly close the connection far too easily. Let's try to
-        workaround that (as urllib does, but for more cases...).
-        """
-        urllib.Response.begin(self)
-        if self.status in (201, 204):
-            self.will_close = False
-
-
-# Takes DavResponse into account:
-class DavHTTPConnection(urllib.HTTPConnection):
-    """HTTP connection class that uses DavResponse for WebDAV support."""
-
-    response_class = DavResponse
-
-
-class DavHTTPSConnection(urllib.HTTPSConnection):
-    """HTTPS connection class that uses DavResponse for WebDAV support."""
-
-    response_class = DavResponse
-
-
-class DavConnectionHandler(urllib.ConnectionHandler):
-    """Custom connection handler.
-
-    We need to use the DavConnectionHTTPxConnection class to take
-    into account our own DavResponse objects, to be able to
-    declare our own body ignored responses, sigh.
-    """
-
-    def http_request(self, request):
-        """Handle HTTP requests using WebDAV-aware connection class.
-
-        Args:
-            request: The HTTP request to process.
-
-        Returns:
-            The processed request with WebDAV connection captured.
-        """
-        return self.capture_connection(request, DavHTTPConnection)
-
-    def https_request(self, request):
-        """Handle HTTPS requests using WebDAV-aware connection class.
-
-        Args:
-            request: The HTTPS request to process.
-
-        Returns:
-            The processed request with WebDAV connection captured.
-        """
-        return self.capture_connection(request, DavHTTPSConnection)
-
-
-class DavOpener(urllib.Opener):
-    """Dav specific needs regarding HTTP(S)."""
-
-    def __init__(self, report_activity=None, ca_certs=None):
-        """Initialize WebDAV-specific HTTP(S) opener.
-
-        Args:
-            report_activity: Optional callback for activity reporting.
-            ca_certs: Optional path to CA certificates for SSL verification.
-        """
-        super().__init__(
-            connection=DavConnectionHandler,
-            report_activity=report_activity,
-            ca_certs=ca_certs,
-        )
-
-
 class HttpDavTransport(urllib.HttpTransport):
     """An transport able to put files using http[s] on a DAV server.
 
@@ -554,7 +466,6 @@ class HttpDavTransport(urllib.HttpTransport):
     # ends with a 'code != 201' to mention 'mkdir failed'.
 
     _debuglevel = 0
-    _opener_class = DavOpener
 
     def is_readonly(self):
         """Check if transport is read-only.
