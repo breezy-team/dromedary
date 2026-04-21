@@ -17,8 +17,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use dromedary::http::client::{
-    ClientError, HttpClient as RsHttpClient, HttpClientConfig, HttpResponse as RsHttpResponse,
-    RequestOptions,
+    ClientError, CredentialProvider, HttpClient as RsHttpClient, HttpClientConfig,
+    HttpResponse as RsHttpResponse, RequestOptions,
 };
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::import_exception;
@@ -46,6 +46,24 @@ fn client_err_to_py(err: ClientError) -> PyErr {
             // for the old handler-layer errors.
             ConnectionError::new_err(e.to_string())
         }
+    }
+}
+
+/// CredentialProvider impl that delegates to the Python callback
+/// registered via `set_credential_lookup`. All state lives in the
+/// parent module's `CREDENTIAL_LOOKUP` so multiple clients share
+/// the same callback.
+struct PythonCredentialProvider;
+
+impl CredentialProvider for PythonCredentialProvider {
+    fn lookup(
+        &self,
+        protocol: &str,
+        host: &str,
+        port: Option<u16>,
+        realm: Option<&str>,
+    ) -> (Option<String>, Option<String>) {
+        super::invoke_credential_lookup(protocol, host, port, realm)
     }
 }
 
@@ -90,7 +108,8 @@ impl HttpClient {
             user_agent,
             read_timeout: timeout,
         };
-        let inner = RsHttpClient::new(cfg).map_err(client_err_to_py)?;
+        let inner = RsHttpClient::with_credentials(cfg, Box::new(PythonCredentialProvider))
+            .map_err(client_err_to_py)?;
         Ok(Self {
             inner,
             defaults: Mutex::new(RequestOptions::default()),

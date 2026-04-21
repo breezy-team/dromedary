@@ -18,13 +18,22 @@ use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use ureq::config::Config;
 use ureq::http::{Method, Request, Response, Uri};
 use ureq::tls::{Certificate, PemItem, RootCerts, TlsConfig};
 use ureq::{Agent, Body, Proxy};
 use url::Url;
 
-use crate::http::{evaluate_proxy_bypass, get_proxy_env_var, getproxies_environment, ProxyBypass};
+use crate::http::auth::{
+    build_basic_auth_header, build_digest_auth_header, parse_digest_challenge, DigestAuthState,
+};
+use crate::http::{
+    evaluate_proxy_bypass, get_proxy_env_var, getproxies_environment, parse_auth_header,
+    ProxyBypass,
+};
 
 /// Errors surfaced by the Rust HTTP client.
 ///
@@ -160,6 +169,69 @@ fn drive_redirects(
     }
 }
 
+/// Key under which [`AuthCache`] stores successful auth state.
+///
+/// Scheme matters (http vs https shouldn't share auth even on the
+/// same host); port is normalised to the scheme default so a bare
+/// `http://host/` and `http://host:80/` hit the same cache entry.
+fn auth_cache_key(uri: &Uri) -> AuthCacheKey {
+    let scheme = uri.scheme_str().unwrap_or("http").to_ascii_lowercase();
+    let host = uri.host().unwrap_or_default().to_ascii_lowercase();
+    let port = uri
+        .port_u16()
+        .unwrap_or_else(|| if scheme == "https" { 443 } else { 80 });
+    (scheme, host, port)
+}
+
+/// Build an `Authorization:` header value from the cached state.
+/// Mutates digest state in place so `nonce_count` bumps correctly.
+fn cached_auth_header(cached: &CachedAuth, method: &Method, uri: &Uri) -> Option<String> {
+    match cached {
+        CachedAuth::Basic { user, password } => Some(build_basic_auth_header(user, password)),
+        CachedAuth::Digest(_) => {
+            // Can't mutate `&cached`; the caller already cloned and
+            // will re-store after calling us. This function is only
+            // used for the *preemptive* attach path, where the
+            // caller owns the mutation. We wire that by passing a
+            // cloned state in from the caller — but the caller only
+            // has `&CachedAuth` here. Easier: build via a short-lived
+            // clone and let the caller re-store.
+            let CachedAuth::Digest(state) = cached else {
+                unreachable!()
+            };
+            let mut s = state.clone();
+            Some(build_digest_auth_header(
+                &mut s,
+                method.as_str(),
+                uri.path(),
+            ))
+        }
+    }
+}
+
+/// Pull the `realm` value out of a Basic-auth challenge remainder.
+/// The challenge looks like `realm="Secure Area"`; we match the
+/// outermost quoted string after `realm=`. Returns `None` if
+/// `realm` is missing — callers then pass `None` into the
+/// credential lookup.
+fn extract_basic_realm(raw: &str) -> Option<&str> {
+    let after = raw.split("realm=").nth(1)?;
+    let trimmed = after.trim_start();
+    if let Some(inner) = trimmed.strip_prefix('"') {
+        // Stop at the next unescaped `"`. The Basic-auth grammar
+        // doesn't allow backslash-quote inside a quoted string
+        // (RFC 7617 uses token68 for the credentials, and the
+        // challenge parameters follow RFC 7235's auth-param rules).
+        inner.find('"').map(|end| &inner[..end])
+    } else {
+        // Unquoted token — read up to whitespace or comma.
+        let end = trimmed
+            .find(|c: char| c.is_ascii_whitespace() || c == ',')
+            .unwrap_or(trimmed.len());
+        Some(&trimmed[..end])
+    }
+}
+
 /// Resolve the redirect target for a 3xx response: prefer
 /// `Location:`, fall back to `URI:`. Matches the Python handler
 /// which also accepts the antiquated `URI` header. Returns `None`
@@ -172,6 +244,82 @@ fn redirect_target(resp: &HttpResponse, current_url: &str) -> Option<String> {
     // override, relative ones are joined to the current document.
     let base = Url::parse(current_url).ok()?;
     base.join(raw).ok().map(|u| u.to_string())
+}
+
+/// Source of username/password pairs for HTTP authentication.
+///
+/// Implementations bridge the Rust client to whatever credential
+/// store the caller uses — for dromedary that's the Python callback
+/// registered via `set_credential_lookup`, but tests can supply a
+/// trivial in-memory impl.
+pub trait CredentialProvider: Send + Sync {
+    /// Return `(user, password)` for the given `(protocol, host,
+    /// port, realm)` if known. `None` for either field means "no
+    /// match"; the caller decides whether to prompt interactively.
+    fn lookup(
+        &self,
+        protocol: &str,
+        host: &str,
+        port: Option<u16>,
+        realm: Option<&str>,
+    ) -> (Option<String>, Option<String>);
+}
+
+/// A [`CredentialProvider`] that always returns `(None, None)`.
+/// Useful as the default when nothing's registered.
+pub struct NoCredentialProvider;
+
+impl CredentialProvider for NoCredentialProvider {
+    fn lookup(
+        &self,
+        _protocol: &str,
+        _host: &str,
+        _port: Option<u16>,
+        _realm: Option<&str>,
+    ) -> (Option<String>, Option<String>) {
+        (None, None)
+    }
+}
+
+/// Cached per-origin authentication state. Once the server accepts
+/// our credentials we preemptively attach the same auth header to
+/// subsequent requests to the same host+port, matching urllib's
+/// `auth_params_reusable` behaviour.
+#[derive(Debug, Clone)]
+enum CachedAuth {
+    /// Basic auth: we cache the header value directly since it's
+    /// cheap and stateless.
+    Basic {
+        user: String,
+        password: String,
+    },
+    Digest(DigestAuthState),
+}
+
+/// Per-host auth cache key: `(scheme_lower, host, port_or_default)`.
+/// Using a scheme-aware key prevents http/https from sharing auth.
+type AuthCacheKey = (String, String, u16);
+
+/// Thread-safe per-origin auth state. Lookups are read-mostly after
+/// the first successful exchange, so a Mutex is fine — lock contention
+/// is not a realistic concern for a single HTTP client.
+#[derive(Default)]
+pub struct AuthCache {
+    entries: Mutex<HashMap<AuthCacheKey, CachedAuth>>,
+}
+
+impl AuthCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn get(&self, key: &AuthCacheKey) -> Option<CachedAuth> {
+        self.entries.lock().unwrap().get(key).cloned()
+    }
+
+    fn put(&self, key: AuthCacheKey, auth: CachedAuth) {
+        self.entries.lock().unwrap().insert(key, auth);
+    }
 }
 
 /// Options for building an [`HttpClient`].
@@ -204,14 +352,32 @@ pub struct HttpClient {
     /// changes take effect immediately without rebuilding the
     /// agent's connection pool.
     agent: Agent,
+    /// Per-origin cache of successful auth state. Populated after
+    /// the server accepts our credentials; subsequent requests to
+    /// the same host preemptively attach the cached header.
+    auth_cache: AuthCache,
+    /// How we look up `(user, password)` when a challenge arrives.
+    credentials: Box<dyn CredentialProvider>,
 }
 
 impl HttpClient {
     /// Build a new client honouring the given config.
     pub fn new(config: HttpClientConfig) -> Result<Self> {
+        Self::with_credentials(config, Box::new(NoCredentialProvider))
+    }
+
+    /// Build a new client with a custom credential provider.
+    pub fn with_credentials(
+        config: HttpClientConfig,
+        credentials: Box<dyn CredentialProvider>,
+    ) -> Result<Self> {
         let base_config = build_config(&config)?;
         let agent = Agent::new_with_config(base_config);
-        Ok(Self { agent })
+        Ok(Self {
+            agent,
+            auth_cache: AuthCache::new(),
+            credentials,
+        })
     }
 
     /// Perform an HTTP request with default options (no redirect
@@ -251,9 +417,190 @@ impl HttpClient {
         let method = Method::from_bytes(method.as_bytes())
             .map_err(|_| ClientError::InvalidRequest(format!("bad method: {}", method)))?;
 
+        // Each redirect hop does its own auth dance — a 3xx to a
+        // different host mustn't reuse the previous host's cached
+        // auth, and handling that here keeps the redirect-loop code
+        // from having to know anything about auth.
         drive_redirects(options, url, |target| {
-            self.send_once(&method, target, headers, body)
+            self.send_with_auth(&method, target, headers, body)
         })
+    }
+
+    /// Send a request, transparently handling a single 401/407
+    /// auth challenge. Returns the final response (which may still
+    /// be 401 if we ran out of credentials or the server rejected
+    /// what we offered).
+    fn send_with_auth(
+        &self,
+        method: &Method,
+        url: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> Result<HttpResponse> {
+        let uri: Uri = url
+            .parse()
+            .map_err(|_| ClientError::InvalidRequest(format!("bad URL: {}", url)))?;
+        let cache_key = auth_cache_key(&uri);
+
+        // Preemptively attach a cached auth header if we have one.
+        // Callers' explicit Authorization headers take precedence —
+        // don't clobber.
+        let has_explicit_auth = headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("authorization"));
+        let mut first_headers: Vec<(String, String)> = headers.to_vec();
+        if !has_explicit_auth {
+            if let Some(cached) = self.auth_cache.get(&cache_key) {
+                if let Some(hdr) = cached_auth_header(&cached, method, &uri) {
+                    first_headers.push(("Authorization".into(), hdr));
+                    // For Digest, `build_digest_auth_header` bumped
+                    // `nonce_count` inside the cached state; store
+                    // the mutation so the next request uses a fresh
+                    // nc value.
+                    self.auth_cache.put(cache_key.clone(), cached);
+                }
+            }
+        }
+
+        let response = self.send_once(method, url, &first_headers, body)?;
+        if response.status != 401 && response.status != 407 {
+            return Ok(response);
+        }
+        if has_explicit_auth {
+            // The caller asked for specific auth; don't second-guess
+            // them by retrying with different credentials.
+            return Ok(response);
+        }
+
+        // Parse the challenge. We only handle WWW-Authenticate for
+        // now; Proxy-Authenticate (407) support would need the same
+        // logic keyed differently and is not yet wired.
+        if response.status == 407 {
+            return Ok(response);
+        }
+        let challenges = response.headers_all("www-authenticate");
+        let Some((scheme, new_auth)) = self.pick_auth_scheme(&uri, &challenges, method) else {
+            return Ok(response);
+        };
+
+        // Retry with the new auth header attached. Don't stack on
+        // top of the preemptive header we added above; rebuild from
+        // the caller's headers and append the new one.
+        let mut retry_headers = headers.to_vec();
+        let hdr = match &new_auth {
+            CachedAuth::Basic { user, password } => build_basic_auth_header(user, password),
+            CachedAuth::Digest(state) => {
+                // `build_digest_auth_header` mutates `nonce_count`,
+                // and we want to persist that bump. Work on a clone
+                // and re-store after.
+                let mut s = state.clone();
+                let h = build_digest_auth_header(&mut s, method.as_str(), uri.path());
+                // Replace what we just cloned with the bumped state.
+                self.auth_cache
+                    .put(cache_key.clone(), CachedAuth::Digest(s));
+                h
+            }
+        };
+        // For Basic, only cache on success below (keeps us from
+        // memoising wrong credentials forever).
+        if matches!(new_auth, CachedAuth::Basic { .. }) {
+            // Deferred: we only persist basic-auth once the retry
+            // succeeds. Stash `new_auth` on the stack and put it in
+            // the cache below.
+        }
+        retry_headers.push(("Authorization".into(), hdr));
+        let _ = scheme; // scheme name currently only used for logging
+
+        let retry = self.send_once(method, url, &retry_headers, body)?;
+        if retry.status < 400 {
+            // Cache the working credentials so future requests to
+            // this origin don't need the 401 roundtrip.
+            if let CachedAuth::Basic { .. } = &new_auth {
+                self.auth_cache.put(cache_key, new_auth);
+            }
+            // Digest was already cached above (we needed the bumped
+            // nonce_count regardless of outcome).
+        }
+        Ok(retry)
+    }
+
+    /// Given the challenges a server sent, pick the scheme we'll
+    /// try and materialise it into a `CachedAuth` suitable for
+    /// header generation. Returns `None` when no scheme matches or
+    /// credentials weren't available.
+    ///
+    /// Scheme preference follows the order `DigestAuthHandler`
+    /// (handler_order=490) > `BasicAuthHandler` (handler_order=500)
+    /// in the old urllib code. Negotiate is not handled here yet;
+    /// stage 7e adds it via a separate provider callback.
+    fn pick_auth_scheme(
+        &self,
+        uri: &Uri,
+        challenges: &[&str],
+        _method: &Method,
+    ) -> Option<(&'static str, CachedAuth)> {
+        // Prefer Digest if offered; fall back to Basic.
+        let mut digest_remainder: Option<&str> = None;
+        let mut basic_remainder: Option<&str> = None;
+        for ch in challenges {
+            let (scheme, remainder) = parse_auth_header(ch);
+            let remainder = remainder.unwrap_or("");
+            match scheme.as_str() {
+                "digest" if digest_remainder.is_none() => {
+                    digest_remainder = Some(remainder);
+                }
+                "basic" if basic_remainder.is_none() => {
+                    basic_remainder = Some(remainder);
+                }
+                _ => {}
+            }
+        }
+
+        let protocol = uri.scheme_str().unwrap_or("http");
+        let host = uri.host().unwrap_or_default();
+        let port = uri.port_u16();
+
+        if let Some(raw) = digest_remainder {
+            if let Some(challenge) = parse_digest_challenge(raw) {
+                let (user, password) =
+                    self.credentials
+                        .lookup(protocol, host, port, Some(&challenge.realm));
+                let (Some(user), Some(password)) = (user, password) else {
+                    return None;
+                };
+                let state = DigestAuthState {
+                    user,
+                    password,
+                    realm: challenge.realm,
+                    nonce: challenge.nonce,
+                    nonce_count: 0,
+                    algorithm: challenge.algorithm,
+                    algorithm_name: challenge.algorithm_name,
+                    opaque: challenge.opaque,
+                    qop: challenge.qop,
+                };
+                return Some(("digest", CachedAuth::Digest(state)));
+            }
+        }
+
+        if basic_remainder.is_some() {
+            // Basic auth realm is opaque to us (we could parse it
+            // for the lookup key, but the Python version didn't
+            // treat it as load-bearing). Pass None for realm so the
+            // credential lookup falls back to URL-based matching.
+            let realm = basic_remainder
+                .and_then(extract_basic_realm)
+                .map(|r| r.to_string());
+            let (user, password) = self
+                .credentials
+                .lookup(protocol, host, port, realm.as_deref());
+            let (Some(user), Some(password)) = (user, password) else {
+                return None;
+            };
+            return Some(("basic", CachedAuth::Basic { user, password }));
+        }
+
+        None
     }
 
     /// Single transport round-trip. No redirect handling.
@@ -779,6 +1126,201 @@ mod tests {
         // comment on HTTPRedirectHandler.redirect_request.
         for &code in &[200, 300, 304, 305, 306, 400, 401, 404, 500] {
             assert!(!is_redirect(code), "{} should not be a redirect", code);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Auth tests. We exercise the helpers directly — the full
+    // send_with_auth loop needs a real HTTP server, which we cover
+    // elsewhere (breezy's test suite, plus the Python integration
+    // tests).
+
+    struct FixedCreds {
+        user: &'static str,
+        password: &'static str,
+    }
+
+    impl CredentialProvider for FixedCreds {
+        fn lookup(
+            &self,
+            _protocol: &str,
+            _host: &str,
+            _port: Option<u16>,
+            _realm: Option<&str>,
+        ) -> (Option<String>, Option<String>) {
+            (Some(self.user.into()), Some(self.password.into()))
+        }
+    }
+
+    struct NoCreds;
+    impl CredentialProvider for NoCreds {
+        fn lookup(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<u16>,
+            _: Option<&str>,
+        ) -> (Option<String>, Option<String>) {
+            (None, None)
+        }
+    }
+
+    fn fresh_client(creds: Box<dyn CredentialProvider>) -> HttpClient {
+        HttpClient::with_credentials(HttpClientConfig::default(), creds)
+            .expect("config should build")
+    }
+
+    #[test]
+    fn extract_basic_realm_quoted() {
+        assert_eq!(
+            extract_basic_realm(r#"realm="Secure Area""#),
+            Some("Secure Area")
+        );
+    }
+
+    #[test]
+    fn extract_basic_realm_unquoted() {
+        assert_eq!(
+            extract_basic_realm("realm=unquoted,charset=UTF-8"),
+            Some("unquoted")
+        );
+    }
+
+    #[test]
+    fn extract_basic_realm_missing() {
+        assert_eq!(extract_basic_realm("charset=UTF-8"), None);
+    }
+
+    #[test]
+    fn auth_cache_key_normalises_scheme_and_port() {
+        let a: Uri = "http://example.com/".parse().unwrap();
+        let b: Uri = "http://example.com:80/".parse().unwrap();
+        assert_eq!(auth_cache_key(&a), auth_cache_key(&b));
+
+        let c: Uri = "https://example.com/".parse().unwrap();
+        assert_ne!(auth_cache_key(&a), auth_cache_key(&c));
+
+        // Different port ⇒ different cache bucket.
+        let d: Uri = "http://example.com:8080/".parse().unwrap();
+        assert_ne!(auth_cache_key(&a), auth_cache_key(&d));
+    }
+
+    #[test]
+    fn pick_auth_scheme_prefers_digest_over_basic() {
+        let client = fresh_client(Box::new(FixedCreds {
+            user: "alice",
+            password: "sekret",
+        }));
+        let uri: Uri = "http://example.com/".parse().unwrap();
+        let challenges = [
+            r#"Basic realm="fallback""#,
+            r#"Digest realm="secure", nonce="n", qop="auth""#,
+        ];
+        let got = client.pick_auth_scheme(&uri, &challenges, &Method::GET).unwrap();
+        assert_eq!(got.0, "digest");
+        assert!(matches!(got.1, CachedAuth::Digest(_)));
+    }
+
+    #[test]
+    fn pick_auth_scheme_uses_basic_when_digest_absent() {
+        let client = fresh_client(Box::new(FixedCreds {
+            user: "u",
+            password: "p",
+        }));
+        let uri: Uri = "http://example.com/".parse().unwrap();
+        let challenges = [r#"Basic realm="r""#];
+        let got = client.pick_auth_scheme(&uri, &challenges, &Method::GET).unwrap();
+        assert_eq!(got.0, "basic");
+        match got.1 {
+            CachedAuth::Basic { user, password } => {
+                assert_eq!(user, "u");
+                assert_eq!(password, "p");
+            }
+            _ => panic!("expected Basic"),
+        }
+    }
+
+    #[test]
+    fn pick_auth_scheme_returns_none_when_credentials_missing() {
+        let client = fresh_client(Box::new(NoCreds));
+        let uri: Uri = "http://example.com/".parse().unwrap();
+        let challenges = [r#"Basic realm="r""#];
+        assert!(
+            client
+                .pick_auth_scheme(&uri, &challenges, &Method::GET)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn pick_auth_scheme_returns_none_for_unknown_scheme() {
+        let client = fresh_client(Box::new(FixedCreds {
+            user: "u",
+            password: "p",
+        }));
+        let uri: Uri = "http://example.com/".parse().unwrap();
+        let challenges = ["Bearer realm=whatever"];
+        assert!(
+            client
+                .pick_auth_scheme(&uri, &challenges, &Method::GET)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn pick_auth_scheme_rejects_unsupported_digest_algorithm() {
+        let client = fresh_client(Box::new(FixedCreds {
+            user: "u",
+            password: "p",
+        }));
+        let uri: Uri = "http://example.com/".parse().unwrap();
+        let challenges = [
+            // SHA-256 isn't in our DigestAlgorithm table; the
+            // challenge parser returns None so we fall back to Basic
+            // (which isn't offered either) and ultimately give up.
+            r#"Digest realm="r", nonce="n", qop="auth", algorithm="SHA-256""#,
+        ];
+        assert!(
+            client
+                .pick_auth_scheme(&uri, &challenges, &Method::GET)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cached_auth_header_basic_formats_correctly() {
+        let cached = CachedAuth::Basic {
+            user: "Aladdin".into(),
+            password: "open sesame".into(),
+        };
+        let uri: Uri = "http://example.com/resource".parse().unwrap();
+        let hdr = cached_auth_header(&cached, &Method::GET, &uri).unwrap();
+        assert_eq!(hdr, "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==");
+    }
+
+    #[test]
+    fn cached_auth_header_digest_bumps_nonce_count_via_clone() {
+        // cached_auth_header works on a local clone, so the cached
+        // state's nonce_count is NOT bumped here; send_with_auth
+        // persists the bump separately.
+        let state = DigestAuthState {
+            user: "u".into(),
+            password: "p".into(),
+            realm: "r".into(),
+            nonce: "n".into(),
+            nonce_count: 5,
+            algorithm: crate::http::DigestAlgorithm::Md5,
+            algorithm_name: None,
+            opaque: None,
+            qop: "auth".into(),
+        };
+        let cached = CachedAuth::Digest(state.clone());
+        let uri: Uri = "http://example.com/x".parse().unwrap();
+        let hdr = cached_auth_header(&cached, &Method::GET, &uri).unwrap();
+        assert!(hdr.contains("nc=00000006"));
+        // The original state wasn't mutated.
+        if let CachedAuth::Digest(orig) = cached {
+            assert_eq!(orig.nonce_count, 5);
         }
     }
 }

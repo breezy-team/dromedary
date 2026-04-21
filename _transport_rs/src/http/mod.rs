@@ -26,6 +26,60 @@ lazy_static! {
     static ref CREDENTIAL_LOOKUP: Mutex<Option<Py<PyAny>>> = Mutex::new(None);
 }
 
+/// Invoke the registered credential-lookup callback with the given
+/// arguments. Returns `(None, None)` if no callback is set, or if
+/// the callback raises — we don't surface those errors because the
+/// auth layer treats them as "no credentials available".
+pub(super) fn invoke_credential_lookup(
+    protocol: &str,
+    host: &str,
+    port: Option<u16>,
+    realm: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    Python::attach(|py| {
+        let cb = {
+            let guard = CREDENTIAL_LOOKUP.lock().unwrap();
+            guard.as_ref().map(|p| p.clone_ref(py))
+        };
+        let Some(cb) = cb else {
+            return (None, None);
+        };
+        let kwargs = pyo3::types::PyDict::new(py);
+        // The Python callback signature is
+        // `(protocol, host, port=None, path=None, realm=None)`; we
+        // leave `path` as None because the Rust client doesn't
+        // track it per-request (breezy's urllib version did, but
+        // the value was rarely used by downstream credential stores).
+        let _ = kwargs.set_item("port", port);
+        let _ = kwargs.set_item("path", py.None());
+        let _ = kwargs.set_item("realm", realm);
+        let result = cb.bind(py).call((protocol, host), Some(&kwargs));
+        match result {
+            Ok(obj) => {
+                let tup = match obj.cast::<PyTuple>() {
+                    Ok(t) => t,
+                    Err(_) => return (None, None),
+                };
+                if tup.len() != 2 {
+                    return (None, None);
+                }
+                let user = tup
+                    .get_item(0)
+                    .ok()
+                    .and_then(|v| v.extract::<Option<String>>().ok())
+                    .flatten();
+                let password = tup
+                    .get_item(1)
+                    .ok()
+                    .and_then(|v| v.extract::<Option<String>>().ok())
+                    .flatten();
+                (user, password)
+            }
+            Err(_) => (None, None),
+        }
+    })
+}
+
 #[pyfunction]
 #[pyo3(signature = (use_cache=true))]
 fn get_ca_path(use_cache: bool) -> String {
