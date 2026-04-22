@@ -1124,12 +1124,42 @@ impl HttpTransport {
         coalesced: &[(usize, usize, Vec<(usize, usize)>)],
         offsets_order: &[(usize, usize)],
     ) -> std::result::Result<Vec<Result<(u64, Vec<u8>)>>, ReadvPassError> {
-        let max_get_ranges = self.readv_tuning().max_get_ranges.max(1);
+        let tuning = self.readv_tuning();
+        let max_get_ranges = tuning.max_get_ranges.max(1);
+        let get_max_size = tuning.get_max_size; // 0 = unlimited
         let hint = *self.range_hint.lock().unwrap();
+        // Slice the coalesced list into batches honouring both the
+        // per-request range count and per-request total-bytes caps.
+        // `RangeHint::None` collapses everything into one full-file
+        // GET; `Single` is one chunk per request; `Multi` packs as
+        // much as the caps allow.
         let batches: Vec<&[(usize, usize, Vec<(usize, usize)>)]> = match hint {
             RangeHint::None => vec![coalesced],
             RangeHint::Single => coalesced.chunks(1).collect::<Vec<_>>(),
-            RangeHint::Multi => coalesced.chunks(max_get_ranges).collect::<Vec<_>>(),
+            RangeHint::Multi => {
+                let mut batches: Vec<&[(usize, usize, Vec<(usize, usize)>)]> = Vec::new();
+                let mut start = 0;
+                let mut acc_bytes = 0usize;
+                let mut acc_ranges = 0usize;
+                for (i, coal) in coalesced.iter().enumerate() {
+                    let length = coal.1;
+                    let would_exceed_size =
+                        get_max_size > 0 && acc_bytes + length > get_max_size && acc_ranges > 0;
+                    let would_exceed_ranges = acc_ranges >= max_get_ranges;
+                    if would_exceed_size || would_exceed_ranges {
+                        batches.push(&coalesced[start..i]);
+                        start = i;
+                        acc_bytes = 0;
+                        acc_ranges = 0;
+                    }
+                    acc_bytes += length;
+                    acc_ranges += 1;
+                }
+                if start < coalesced.len() {
+                    batches.push(&coalesced[start..]);
+                }
+                batches
+            }
         };
 
         let mut results: Vec<Result<(u64, Vec<u8>)>> = Vec::with_capacity(offsets_order.len());
