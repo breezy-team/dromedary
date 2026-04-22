@@ -435,6 +435,56 @@ mod tests {
     }
 
     #[test]
+    fn unknown_format_xml_rejected() {
+        // Valid XML but not a multistatus — Python raises
+        // InvalidHttpResponse with msg="Unknown xml response".
+        let result = parse_propfind_stat(b"<document/>", "/url");
+        assert!(matches!(result, Err(Error::InvalidHttpResponse { .. })));
+        // Same for listdir.
+        let result = parse_propfind_dir(b"<document/>", "/url");
+        assert!(matches!(result, Err(Error::InvalidHttpResponse { .. })));
+    }
+
+    #[test]
+    fn listdir_first_entry_without_resourcetype_rejected() {
+        // lighttpd returns no resourcetype elements at all. Without a
+        // collection marker on the first entry, it's indistinguishable
+        // from a file, so listdir must fail with NotADirectory.
+        let body = br#"<?xml version="1.0"?>
+<D:multistatus xmlns:D="DAV:">
+  <D:response><D:href>/dir/</D:href></D:response>
+  <D:response><D:href>/dir/a</D:href></D:response>
+  <D:response><D:href>/dir/b</D:href></D:response>
+</D:multistatus>"#;
+        let result = parse_propfind_dir(body, "/dir/");
+        assert!(matches!(result, Err(Error::NotADirectoryError(_))));
+    }
+
+    #[test]
+    fn apache_lp1_lp2_prefixes_parsed() {
+        // Apache mod_dav's allprop response uses `lp1:` and `lp2:`
+        // prefixes for the live and dead properties respectively.
+        let body = br#"<?xml version="1.0" encoding="utf-8"?>
+<D:multistatus xmlns:D="DAV:">
+    <D:response xmlns:lp1="DAV:" xmlns:lp2="http://apache.org/dav/props/">
+        <D:href>/executable</D:href>
+        <D:propstat>
+            <D:prop>
+                <lp1:resourcetype/>
+                <lp1:getcontentlength>12</lp1:getcontentlength>
+                <lp2:executable>T</lp2:executable>
+            </D:prop>
+            <D:status>HTTP/1.1 200 OK</D:status>
+        </D:propstat>
+    </D:response>
+</D:multistatus>"#;
+        let stat = parse_propfind_stat(body, "/executable").unwrap();
+        assert_eq!(stat.size, 12);
+        assert!(!stat.is_dir);
+        assert!(stat.is_exec);
+    }
+
+    #[test]
     fn href_outside_response_stack_ignored() {
         // An `href` at a different stack depth (e.g. inside a
         // propstat) must not be picked up as the response's href.
