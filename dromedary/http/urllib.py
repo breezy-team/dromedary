@@ -175,6 +175,93 @@ class HttpTransport(_http_rs.HttpTransport):
         return code, BytesIO(body)
 
     # ------------------------------------------------------------------
+    # Historical breezy-facing helpers. These were public-ish API on
+    # the pre-Rust urllib transport; breezy's own tests and a handful
+    # of production code paths reach into them, so we keep them as
+    # thin shims over the Rust readv / range-header logic.
+
+    def _get(self, relpath, offsets, tail_amount=0):
+        """Range-GET ``relpath`` returning ``(code, seekable_bytes)``.
+
+        `offsets` is either `None` (fetch the whole file) or a list of
+        `_CoalescedOffset` objects from `_coalesce_offsets`. The second
+        element of the returned tuple is a `BytesIO` big enough that
+        `.seek(abs_offset, SEEK_SET)` followed by `.read(length)`
+        produces the bytes that were originally requested — i.e. a
+        sparse file-in-memory.
+
+        The Python urllib transport used to return a live HTTP body
+        that handled the sparseness via content-range parsing. With
+        the Rust readv machinery doing that work for us, we
+        reconstitute the same sparse-file shape by dropping each
+        range's data at its absolute offset in a BytesIO.
+        """
+        from io import BytesIO
+
+        if not offsets and not tail_amount:
+            # Whole-file fetch.
+            data = self._get_bytes_inner(relpath)
+            return 200, BytesIO(data)
+
+        # Expand the coalesced-offset structs into the (start, length)
+        # pairs readv wants. _CoalescedOffset carries a `ranges` list
+        # of (sub_offset, sub_length) pairs relative to `start`.
+        pairs = []
+        if offsets:
+            for coal in offsets:
+                for sub_off, sub_len in coal.ranges:
+                    pairs.append((coal.start + sub_off, sub_len))
+        if tail_amount:
+            # Need the total file length to compute absolute tail
+            # offset; use the Rust stat / HEAD helper.
+            resp = self._head(relpath)
+            length = int(resp.getheader("content-length") or 0)
+            pairs.append((max(length - tail_amount, 0), tail_amount))
+
+        # Compute an upper bound so the BytesIO is large enough to
+        # seek into for each returned range. We size it to the
+        # highest (offset + length) any caller will seek+read.
+        highest = max(start + length for start, length in pairs)
+        out = BytesIO(b"\0" * highest)
+        for offset, chunk in self.readv(relpath, pairs):
+            out.seek(offset)
+            out.write(chunk)
+        out.seek(0)
+        return 206, out
+
+    def _get_bytes_inner(self, relpath):
+        """Fetch the entire body of `relpath` as bytes.
+
+        Separate helper so ``_get`` can call it without going through
+        the Python ``get()`` wrapper that returns a file-like object.
+        """
+        f = self.get(relpath)
+        try:
+            return f.read()
+        finally:
+            if hasattr(f, "close"):
+                f.close()
+
+    @staticmethod
+    def _range_header(ranges, tail_amount):
+        """Build an HTTP Range header value from coalesced offsets.
+
+        Historical public-ish API — breezy's TestRangeHeader unit
+        tests call this directly to verify the byte-range encoding.
+        The Rust side does the same formatting internally inside
+        `HttpTransport::attempted_range_header`; this Python staticmethod
+        reimplements the simple case the tests need without going
+        through a full HTTP round-trip.
+        """
+        strings = [
+            "%d-%d" % (offset.start, offset.start + offset.length - 1)
+            for offset in ranges
+        ]
+        if tail_amount:
+            strings.append("-%d" % tail_amount)
+        return ",".join(strings)
+
+    # ------------------------------------------------------------------
     # Breezy-facing redirect fix-up. The Rust side surfaces a 3xx as
     # RedirectRequested(source, target); breezy then calls this to
     # build a transport to retry the request against.

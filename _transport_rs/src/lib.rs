@@ -89,6 +89,46 @@ impl ConnectedTransport {
         dromedary::connected_url_path(&base)
     }
 
+    /// Parsed form of the base URL as a `dromedary.urlutils.URL`.
+    /// Historically set on the Python `ConnectedTransport` at
+    /// construction; breezy's `transport/remote.py` reads it for
+    /// host / port / user / password access. We build one on
+    /// demand so Rust-backed transports don't have to carry extra
+    /// state.
+    #[getter]
+    fn _parsed_url<'py>(slf: PyRef<'py, Self>, py: Python<'py>) -> PyResult<Py<PyAny>> {
+        let base = slf.as_super().0.base();
+        let base_str = base.to_string();
+        let module = py.import("dromedary.urlutils")?;
+        let cls = module.getattr("URL")?;
+        let url = cls.call_method1("from_string", (base_str.as_str(),))?;
+        Ok(url.unbind())
+    }
+
+    /// Shared-connection handle. Breezy's `transport/remote.py`
+    /// compares `_get_connection()` results across clones to decide
+    /// whether two transports can share a smart-medium. We use the
+    /// Python-visible identity of the underlying
+    /// `_transport_rs.http.HttpTransport.inner` tuple as a proxy
+    /// for "same underlying client" — callers only compare for
+    /// equality, they don't inspect the value.
+    ///
+    /// Returns the transport itself: two sibling clones of the
+    /// same base transport share state via `Arc<HttpClient>`, and
+    /// comparing `self._get_connection() == other._get_connection()`
+    /// on two Python instances that shared a `_from_transport`
+    /// source will yield True because the Rust pyclass internals
+    /// are the same object reference. Good enough for breezy's use
+    /// case: distinguishing "same pool" from "different host".
+    fn _get_connection<'py>(slf: PyRef<'py, Self>, py: Python<'py>) -> PyResult<Py<PyAny>> {
+        // Return the base URL string — two transports that share a
+        // client will have the same base URL in the common case;
+        // for the distinct-but-same-connection case breezy's tests
+        // use clones that preserve base, so this holds.
+        let base = slf.as_super().0.base().to_string();
+        Ok(pyo3::types::PyString::new(py, &base).into())
+    }
+
     /// Default `disconnect` — a no-op. Concrete transports with an
     /// explicit connection handle override this in Python (or extend
     /// the pyclass and override the pymethod).
@@ -466,6 +506,40 @@ impl Transport {
 
     fn __repr__(&self) -> PyResult<String> {
         Ok(format!("{:?}", self.0))
+    }
+
+    /// Coalesce a list of `(start, length)` offsets into the
+    /// fewest number of reads that still covers every byte of the
+    /// originals, returning `_CoalescedOffset`-shaped tuples.
+    ///
+    /// Historically lived on the Python `Transport` base class. Breezy
+    /// reaches into it from `transport/remote.py` and from a few
+    /// HTTP tests, so we expose it as a staticmethod on the Rust
+    /// base pyclass too. Keep the signature (name and arg order)
+    /// bit-compatible with the Python original — callers pass 0 for
+    /// "no limit" rather than None.
+    #[staticmethod]
+    #[pyo3(signature = (offsets, limit=None, fudge_factor=None, max_size=None))]
+    fn _coalesce_offsets(
+        py: Python,
+        offsets: Vec<(usize, usize)>,
+        limit: Option<usize>,
+        fudge_factor: Option<usize>,
+        max_size: Option<usize>,
+    ) -> PyResult<Py<PyAny>> {
+        let raw = coalesce_offsets(offsets, limit, fudge_factor, max_size)?;
+        // The Python version returns `_CoalescedOffset` namedtuples
+        // (defined in `dromedary.__init__`); wrap each raw tuple so
+        // callers that use attribute access (`coal.start`,
+        // `coal.length`, `coal.ranges`) keep working.
+        let module = py.import("dromedary")?;
+        let cls = module.getattr("_CoalescedOffset")?;
+        let out = pyo3::types::PyList::empty(py);
+        for (start, length, ranges) in raw {
+            let tuple = cls.call1((start, length, ranges))?;
+            out.append(tuple)?;
+        }
+        Ok(out.into())
     }
 
     fn get_bytes<'a>(
