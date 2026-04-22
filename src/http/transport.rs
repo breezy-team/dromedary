@@ -1137,6 +1137,290 @@ mod tests {
     fn format_range_header_tail_only() {
         assert_eq!(format_range_header(&[], 100), "-100");
     }
+
+    // ----- abspath / clone_concrete -----
+
+    #[test]
+    fn abspath_empty_returns_base() {
+        let t = HttpTransport::new("http://example.com/a/", fresh_client()).unwrap();
+        assert_eq!(t.abspath("").unwrap().as_str(), "http://example.com/a/");
+        assert_eq!(t.abspath(".").unwrap().as_str(), "http://example.com/a/");
+    }
+
+    #[test]
+    fn abspath_rejects_non_ascii() {
+        let t = HttpTransport::new("http://example.com/", fresh_client()).unwrap();
+        assert!(matches!(t.abspath("héllo"), Err(Error::UrlError(_))));
+    }
+
+    #[test]
+    fn abspath_unescapes_unreserved_characters() {
+        // RFC 3986 unreserved chars (A-Z a-z 0-9 - . _ ~) must come
+        // out un-escaped so clone()s of sibling branches are prefix-
+        // comparable (lp:842223).
+        let t = HttpTransport::new("http://example.com/", fresh_client()).unwrap();
+        let url = t.abspath("%2D%2E%30%39%41%5A%5F%61%7A%7E").unwrap();
+        assert_eq!(url.as_str(), "http://example.com/-.09AZ_az~");
+    }
+
+    #[test]
+    fn abspath_drops_trailing_slash_from_relpath() {
+        // Matches Python `URL.clone(relpath)` semantics: callers that
+        // want directory-shape use clone() (which re-adds the slash),
+        // abspath is path-only.
+        let t = HttpTransport::new("http://example.com/", fresh_client()).unwrap();
+        assert_eq!(
+            t.abspath("foo/").unwrap().as_str(),
+            "http://example.com/foo"
+        );
+    }
+
+    #[test]
+    fn clone_concrete_adds_trailing_slash_when_missing() {
+        let t = HttpTransport::new("http://example.com/a/", fresh_client()).unwrap();
+        // Offset without a trailing slash — the clone should still
+        // be directory-shaped so downstream joins work correctly.
+        let cloned = t.clone_concrete(Some("b")).unwrap();
+        assert_eq!(cloned.base().as_str(), "http://example.com/a/b/");
+    }
+
+    #[test]
+    fn clone_concrete_preserves_existing_trailing_slash() {
+        let t = HttpTransport::new("http://example.com/a/", fresh_client()).unwrap();
+        let cloned = t.clone_concrete(Some("b/")).unwrap();
+        assert_eq!(cloned.base().as_str(), "http://example.com/a/b/");
+    }
+
+    #[test]
+    fn clone_concrete_none_returns_identical_base() {
+        let t = HttpTransport::new("http://example.com/a/", fresh_client()).unwrap();
+        let cloned = t.clone_concrete(None).unwrap();
+        assert_eq!(cloned.base().as_str(), "http://example.com/a/");
+    }
+
+    // ----- segment parameters -----
+
+    #[test]
+    fn segment_parameters_parsed_from_base_url() {
+        let t = HttpTransport::new(
+            "http://example.com/path/,key1=val1,key2=val2",
+            fresh_client(),
+        )
+        .unwrap();
+        let params = t.get_segment_parameters().unwrap();
+        assert_eq!(params.get("key1"), Some(&"val1".to_string()));
+        assert_eq!(params.get("key2"), Some(&"val2".to_string()));
+        // base() reports the joined form so the segment params
+        // survive any serialisation round-trip.
+        assert!(t.base().as_str().contains("key1=val1"));
+        assert!(t.base().as_str().contains("key2=val2"));
+    }
+
+    #[test]
+    fn segment_parameters_dont_appear_on_the_wire() {
+        // `remote_url` is the URL we hand the server — segment params
+        // are a dromedary-internal convention and must stay local.
+        let t = HttpTransport::new(
+            "http://example.com/path/,key=val",
+            fresh_client(),
+        )
+        .unwrap();
+        let remote = t.remote_url("file").unwrap();
+        assert!(!remote.as_str().contains(','));
+        assert!(!remote.as_str().contains("key=val"));
+    }
+
+    #[test]
+    fn set_segment_parameter_round_trip() {
+        let mut t = HttpTransport::new("http://example.com/", fresh_client()).unwrap();
+        t.set_segment_parameter("arm", Some("board")).unwrap();
+        assert_eq!(
+            t.get_segment_parameters().unwrap().get("arm"),
+            Some(&"board".to_string())
+        );
+        // Setting value=None removes the parameter.
+        t.set_segment_parameter("arm", None).unwrap();
+        assert!(t.get_segment_parameters().unwrap().get("arm").is_none());
+        // Removing a nonexistent parameter is a no-op, not an error.
+        t.set_segment_parameter("nonexistent", None).unwrap();
+    }
+
+    #[test]
+    fn set_segment_parameter_rejects_equals_in_key() {
+        let mut t = HttpTransport::new("http://example.com/", fresh_client()).unwrap();
+        assert!(t.set_segment_parameter("k=bad", Some("v")).is_err());
+    }
+
+    #[test]
+    fn set_segment_parameter_rejects_comma_in_value() {
+        let mut t = HttpTransport::new("http://example.com/", fresh_client()).unwrap();
+        // Commas separate parameters, so a value containing one would
+        // be indistinguishable from two parameters on the next parse.
+        assert!(t.set_segment_parameter("k", Some("bad,value")).is_err());
+    }
+
+    #[test]
+    fn clone_clears_segment_parameters() {
+        // Matches Python ConnectedTransport semantics: clone drops
+        // segment parameters because they belong to the specific
+        // base URL, not to the connection.
+        let t = HttpTransport::new(
+            "http://example.com/a/,key=val",
+            fresh_client(),
+        )
+        .unwrap();
+        let cloned = t.clone_concrete(None).unwrap();
+        assert!(cloned.get_segment_parameters().unwrap().is_empty());
+    }
+
+    // ----- ConnectedTransport trait getters -----
+
+    #[test]
+    fn connected_scheme_is_unqualified() {
+        let t = HttpTransport::new("http+urllib://example.com/", fresh_client()).unwrap();
+        // `+urllib` is stripped at construction, so scheme() reports
+        // the unqualified form even though the caller gave a suffix.
+        assert_eq!(
+            <HttpTransport as crate::ConnectedTransport>::scheme(&t),
+            "http"
+        );
+    }
+
+    #[test]
+    fn connected_host_and_port() {
+        let t = HttpTransport::new("http://example.com:8080/", fresh_client()).unwrap();
+        assert_eq!(
+            <HttpTransport as crate::ConnectedTransport>::host(&t),
+            Some("example.com".to_string())
+        );
+        assert_eq!(
+            <HttpTransport as crate::ConnectedTransport>::port(&t),
+            Some(8080)
+        );
+    }
+
+    #[test]
+    fn connected_port_absent_for_default_port() {
+        // Url::port() returns None when the scheme's default port is
+        // used (80 for http, 443 for https) — callers that want the
+        // default port fall back themselves.
+        let t = HttpTransport::new("http://example.com/", fresh_client()).unwrap();
+        assert_eq!(
+            <HttpTransport as crate::ConnectedTransport>::port(&t),
+            None
+        );
+    }
+
+    #[test]
+    fn connected_user_and_password_are_percent_decoded() {
+        let t = HttpTransport::new(
+            "http://jo%40home:p%40ss@example.com/",
+            fresh_client(),
+        )
+        .unwrap();
+        assert_eq!(
+            <HttpTransport as crate::ConnectedTransport>::user(&t),
+            Some("jo@home".to_string())
+        );
+        assert_eq!(
+            <HttpTransport as crate::ConnectedTransport>::password(&t),
+            Some("p@ss".to_string())
+        );
+    }
+
+    #[test]
+    fn connected_user_and_password_absent_when_not_in_url() {
+        let t = HttpTransport::new("http://example.com/", fresh_client()).unwrap();
+        assert_eq!(
+            <HttpTransport as crate::ConnectedTransport>::user(&t),
+            None
+        );
+        assert_eq!(
+            <HttpTransport as crate::ConnectedTransport>::password(&t),
+            None
+        );
+    }
+
+    // ----- classify_reuse_for -----
+
+    #[test]
+    fn classify_reuse_same_origin_same_path() {
+        let base = url::Url::parse("http://host/path/").unwrap();
+        assert_eq!(
+            crate::classify_reuse_for(&base, "http://host/path/"),
+            crate::ReuseMatch::Same
+        );
+    }
+
+    #[test]
+    fn classify_reuse_same_origin_normalises_trailing_slash() {
+        // `/path` and `/path/` are the same transport.
+        let base = url::Url::parse("http://host/path/").unwrap();
+        assert_eq!(
+            crate::classify_reuse_for(&base, "http://host/path"),
+            crate::ReuseMatch::Same
+        );
+    }
+
+    #[test]
+    fn classify_reuse_same_origin_different_path() {
+        let base = url::Url::parse("http://host/path/").unwrap();
+        assert_eq!(
+            crate::classify_reuse_for(&base, "http://host/other/"),
+            crate::ReuseMatch::Sibling
+        );
+    }
+
+    #[test]
+    fn classify_reuse_different_scheme_rejected() {
+        let base = url::Url::parse("http://host/path/").unwrap();
+        assert_eq!(
+            crate::classify_reuse_for(&base, "https://host/path/"),
+            crate::ReuseMatch::None
+        );
+    }
+
+    #[test]
+    fn classify_reuse_impl_qualifier_stripped() {
+        // `http://` and `http+urllib://` address the same origin —
+        // the qualifier is implementation choice, not part of identity.
+        let base = url::Url::parse("http://host/path/").unwrap();
+        assert_eq!(
+            crate::classify_reuse_for(&base, "http+urllib://host/path/"),
+            crate::ReuseMatch::Same
+        );
+    }
+
+    #[test]
+    fn classify_reuse_different_host_or_port_rejected() {
+        let base = url::Url::parse("http://host/path/").unwrap();
+        assert_eq!(
+            crate::classify_reuse_for(&base, "http://other/path/"),
+            crate::ReuseMatch::None
+        );
+        assert_eq!(
+            crate::classify_reuse_for(&base, "http://host:9090/path/"),
+            crate::ReuseMatch::None
+        );
+    }
+
+    #[test]
+    fn classify_reuse_different_user_rejected() {
+        let base = url::Url::parse("http://alice@host/path/").unwrap();
+        assert_eq!(
+            crate::classify_reuse_for(&base, "http://bob@host/path/"),
+            crate::ReuseMatch::None
+        );
+    }
+
+    #[test]
+    fn classify_reuse_unparseable_url_returns_none() {
+        let base = url::Url::parse("http://host/").unwrap();
+        assert_eq!(
+            crate::classify_reuse_for(&base, "not a url"),
+            crate::ReuseMatch::None
+        );
+    }
 }
 
 /// Internal control flow between `readv_eager` and `readv_one_pass`.
