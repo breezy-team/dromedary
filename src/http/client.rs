@@ -123,12 +123,13 @@ impl ActivityDirection {
 
 /// Reports byte transfers to the surrounding progress UI.
 ///
-/// Called once after the request body is sent (with `Write`) and
-/// once after the full response body is received (with `Read`). For
-/// streaming bodies we'll want finer-grained reporting; for now one
-/// call per direction per request matches what breezy's progress
-/// bar actually displays.
-pub type ActivityCallback = Box<dyn Fn(usize, ActivityDirection) + Send + Sync>;
+/// Stored as an `Arc` so it can be shared between the upload-side
+/// report (fired once before sending the request body) and the
+/// download-side reader wrapper that tallies bytes as the
+/// response streams. Each call receives a chunk size and a
+/// direction; callbacks should be cheap because they may fire
+/// thousands of times per large download.
+pub type ActivityCallback = std::sync::Arc<dyn Fn(usize, ActivityDirection) + Send + Sync>;
 
 /// Per-request knobs that callers sometimes need to override. The
 /// defaults match breezy's urllib-layer behaviour: no redirect
@@ -918,25 +919,12 @@ impl HttpClient {
             }
         }
         let response = self.agent.run(req)?;
-        let resp = HttpResponse::from_ureq(response, url.to_string())?;
-        // Report the *expected* body size (from Content-Length) up
-        // front. When the header is missing we skip reporting for
-        // this response — the body is streamed on demand and we
-        // can't know the final size ahead of draining. For breezy's
-        // progress-bar use case a single up-front report is what
-        // the old urllib-based transport did too (it called
-        // `report_activity(len(body), 'read')` once after buffering
-        // the whole response).
-        if let Some(cb) = activity {
-            if let Some(v) = resp.header("content-length") {
-                if let Ok(n) = v.parse::<usize>() {
-                    if n > 0 {
-                        cb(n, ActivityDirection::Read);
-                    }
-                }
-            }
-        }
-        Ok(resp)
+        // Hand the callback to the response so reads from the
+        // streaming body keep reporting bytes to the UI. Cloning
+        // the Arc is cheap and keeps the callback alive for as long
+        // as the response does.
+        let activity_owned = activity.cloned();
+        HttpResponse::from_ureq(response, url.to_string(), activity_owned)
     }
 
     /// Decide whether the request to `uri` should go through a
@@ -1118,13 +1106,42 @@ pub struct HttpResponse {
 /// transitions to `Buffered` so subsequent reads are cheap and
 /// idempotent.
 enum BodyState {
-    /// Body hasn't been fully consumed yet. The `BodyReader` is
-    /// `'static` because `ureq::Body::into_reader()` hands us
-    /// owned reader chain.
-    Streaming(ureq::BodyReader<'static>),
+    /// Body hasn't been fully consumed yet. We wrap ureq's
+    /// `BodyReader` with `CountingReader` so every byte transferred
+    /// out of the stream ticks the activity callback — that way
+    /// progress bars advance smoothly as the response downloads
+    /// rather than jumping once at the end.
+    Streaming(CountingReader<ureq::BodyReader<'static>>),
     /// Body was fully drained into a buffer. Cursor tracks how
     /// much of it has been handed out through `read()`.
     Buffered(std::io::Cursor<Vec<u8>>),
+}
+
+/// Wraps a `Read` with an optional activity callback that fires
+/// after each successful read. The callback is invoked with the
+/// number of bytes read and `ActivityDirection::Read` so callers
+/// can tally incoming bytes for progress UI.
+pub struct CountingReader<R: std::io::Read> {
+    inner: R,
+    callback: Option<ActivityCallback>,
+}
+
+impl<R: std::io::Read> CountingReader<R> {
+    fn new(inner: R, callback: Option<ActivityCallback>) -> Self {
+        Self { inner, callback }
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            if let Some(cb) = &self.callback {
+                cb(n, ActivityDirection::Read);
+            }
+        }
+        Ok(n)
+    }
 }
 
 impl std::fmt::Debug for HttpResponse {
@@ -1140,7 +1157,11 @@ impl std::fmt::Debug for HttpResponse {
 }
 
 impl HttpResponse {
-    fn from_ureq(resp: Response<Body>, final_url: String) -> Result<Self> {
+    fn from_ureq(
+        resp: Response<Body>,
+        final_url: String,
+        activity: Option<ActivityCallback>,
+    ) -> Result<Self> {
         let status = resp.status().as_u16();
         // HTTP/2 has no reason phrase — fall back to the canonical
         // text for the status code so callers always get something.
@@ -1158,7 +1179,7 @@ impl HttpResponse {
             headers,
             final_url,
             redirected_to: None,
-            body: BodyState::Streaming(body.into_reader()),
+            body: BodyState::Streaming(CountingReader::new(body.into_reader(), activity)),
         })
     }
 

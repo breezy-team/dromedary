@@ -217,7 +217,7 @@ impl HttpClient {
 /// reporting is advisory; a broken progress-bar hook shouldn't fail
 /// the actual HTTP request.
 fn make_activity_callback(cb: Py<PyAny>) -> ActivityCallback {
-    Box::new(move |bytes: usize, dir: ActivityDirection| {
+    std::sync::Arc::new(move |bytes: usize, dir: ActivityDirection| {
         Python::attach(|py| {
             // `call1` can raise; ignore the result so a buggy hook
             // doesn't propagate into the HTTP path.
