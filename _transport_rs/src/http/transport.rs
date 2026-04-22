@@ -42,7 +42,12 @@ use super::client::{
 /// `dyn Transport` downcast.
 #[pyclass(extends=ConnectedTransport, subclass, module = "dromedary._transport_rs.http")]
 pub(crate) struct HttpTransport {
-    inner: Arc<RsHttpTransport>,
+    // `pub(crate)` rather than private so sibling modules (notably
+    // `webdav`) can construct an HttpTransport pyclass parent that
+    // points at their own transport's embedded HttpTransport —
+    // necessary for `extends=HttpTransport` pyclasses to share the
+    // inherited `request` / `_post` / ... methods.
+    pub(crate) inner: Arc<RsHttpTransport>,
 }
 
 #[pymethods]
@@ -281,7 +286,14 @@ impl HttpTransport {
 
 /// Build the three-layer `Transport → ConnectedTransport →
 /// HttpTransport` initializer PyO3 needs for pyclass construction.
-fn http_transport_initializer(inner: Arc<RsHttpTransport>) -> PyClassInitializer<HttpTransport> {
+///
+/// `pub(crate)` so `webdav::transport` can extend the chain with a
+/// fourth `add_subclass(HttpDavTransport {...})` layer, reusing the
+/// HttpTransport parent's `inner` pointer to share the HTTP client
+/// and range-hint state with the DAV transport above it.
+pub(crate) fn http_transport_initializer(
+    inner: Arc<RsHttpTransport>,
+) -> PyClassInitializer<HttpTransport> {
     let base_box: Box<dyn dromedary::Transport> = Box::new(Clone::clone(&*inner));
     PyClassInitializer::from(Transport(base_box))
         .add_subclass(ConnectedTransport)
