@@ -621,6 +621,26 @@ impl HttpClient {
         options: &RequestOptions,
         activity: Option<&ActivityCallback>,
     ) -> Result<HttpResponse> {
+        self.request_with_origin_url(method, url, url, headers, body, options, activity)
+    }
+
+    /// Like [`Self::request_with`] but carries an `origin_url` that
+    /// may differ from `url` — specifically, one that still has the
+    /// userinfo section the transport strips before putting a URL
+    /// on the wire. When the server challenges with 401, the auth
+    /// machinery uses `origin_url` to extract embedded credentials
+    /// without having to re-register them through a separate
+    /// `CredentialProvider`.
+    pub fn request_with_origin_url(
+        &self,
+        method: &str,
+        url: &str,
+        origin_url: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+        options: &RequestOptions,
+        activity: Option<&ActivityCallback>,
+    ) -> Result<HttpResponse> {
         let method = Method::from_bytes(method.as_bytes())
             .map_err(|_| ClientError::InvalidRequest(format!("bad method: {}", method)))?;
 
@@ -629,7 +649,7 @@ impl HttpClient {
         // auth, and handling that here keeps the redirect-loop code
         // from having to know anything about auth.
         drive_redirects(options, url, |target| {
-            self.send_with_auth(&method, target, headers, body, activity)
+            self.send_with_auth(&method, target, origin_url, headers, body, activity)
         })
     }
 
@@ -641,6 +661,7 @@ impl HttpClient {
         &self,
         method: &Method,
         url: &str,
+        origin_url: &str,
         headers: &[(String, String)],
         body: &[u8],
         activity: Option<&ActivityCallback>,
@@ -648,6 +669,9 @@ impl HttpClient {
         let uri: Uri = url
             .parse()
             .map_err(|_| ClientError::InvalidRequest(format!("bad URL: {}", url)))?;
+        // Used only for userinfo extraction on 401 — the wire URL
+        // (`url`) has already had its creds stripped.
+        let origin_uri: Uri = origin_url.parse().unwrap_or_else(|_| uri.clone());
 
         // Resolve the proxy ahead of time so both the preemptive
         // header attach and the 407 retry can use the same key.
@@ -758,11 +782,14 @@ impl HttpClient {
             .into_iter()
             .map(str::to_string)
             .collect();
+        // Pass `origin_uri` (which still has the userinfo, if any)
+        // rather than `uri` (stripped) so the auth picker can
+        // extract URL-embedded credentials for the retry.
         self.retry_with_auth(
             &challenges,
             method,
             url,
-            &uri,
+            &origin_uri,
             headers,
             body,
             activity,
@@ -931,18 +958,40 @@ impl HttpClient {
         // Origin auth looks up creds for the request URL's host/port.
         // Proxy auth looks them up against the *proxy's* host/port —
         // the credential store is keyed on where the creds will be
-        // sent, not where the request is ultimately going. When the
-        // proxy URL embeds a userinfo section (the classic
-        // `all_proxy=http://joe:pw@proxy/` shape), we prefer those
+        // sent, not where the request is ultimately going. For
+        // either side, when the URL embeds a userinfo section (the
+        // classic `http://joe:pw@host/` or
+        // `all_proxy=http://joe:pw@proxy/` shapes), we prefer those
         // over the CredentialProvider so callers don't have to wire
-        // a separate store up for every test proxy.
+        // a separate store up for every test scenario.
         let (protocol, host, port, embedded) = match kind {
-            AuthKind::Origin => (
-                uri.scheme_str().unwrap_or("http").to_string(),
-                uri.host().unwrap_or_default().to_string(),
-                uri.port_u16(),
-                None,
-            ),
+            AuthKind::Origin => {
+                let user_raw = uri.authority().map(http::uri::Authority::as_str).and_then(
+                    |a| a.split_once('@').map(|(userinfo, _)| userinfo),
+                );
+                let embedded = user_raw.and_then(|userinfo| {
+                    let (u, p) = match userinfo.split_once(':') {
+                        Some((u, p)) => (u, p),
+                        None => (userinfo, ""),
+                    };
+                    let user = percent_encoding::percent_decode_str(u)
+                        .decode_utf8()
+                        .ok()
+                        .map(|s| s.into_owned())?;
+                    let password = percent_encoding::percent_decode_str(p)
+                        .decode_utf8()
+                        .ok()
+                        .map(|s| s.into_owned())
+                        .unwrap_or_default();
+                    Some((user, password))
+                });
+                (
+                    uri.scheme_str().unwrap_or("http").to_string(),
+                    uri.host().unwrap_or_default().to_string(),
+                    uri.port_u16(),
+                    embedded,
+                )
+            }
             AuthKind::Proxy => proxy_connection_parts(proxy_url),
         };
         let host_str = host.as_str();

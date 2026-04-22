@@ -139,7 +139,15 @@ impl HttpTransport {
         };
         let resp = self
             .client
-            .request_with(method, url, headers, body, &opts, None)
+            .request_with_origin_url(
+                method,
+                url,
+                self.base.as_str(),
+                headers,
+                body,
+                &opts,
+                None,
+            )
             .map_err(client_err_to_transport_err)?;
 
         let code = resp.status;
