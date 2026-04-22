@@ -53,7 +53,7 @@ fn client_err_to_py(err: ClientError) -> PyErr {
 /// registered via `set_credential_lookup`. All state lives in the
 /// parent module's `CREDENTIAL_LOOKUP` so multiple clients share
 /// the same callback.
-struct PythonCredentialProvider;
+pub(super) struct PythonCredentialProvider;
 
 impl CredentialProvider for PythonCredentialProvider {
     fn lookup(
@@ -71,7 +71,7 @@ impl CredentialProvider for PythonCredentialProvider {
 /// registered via `set_negotiate_provider`. Dromedary ships a
 /// default implementation in `dromedary.http` that uses the
 /// Python `kerberos` module.
-struct PythonNegotiateProvider;
+pub(super) struct PythonNegotiateProvider;
 
 impl NegotiateProvider for PythonNegotiateProvider {
     fn initial_token(&self, host: &str) -> Option<String> {

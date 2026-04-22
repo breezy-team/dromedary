@@ -40,6 +40,7 @@ enum RangeHint {
 /// root URL (always ends with `/`); `unqualified_scheme` is the
 /// HTTP scheme without any `+impl` qualifier so we can hand back
 /// clean URLs from `external_url` and `_remote_path`.
+#[derive(Clone)]
 pub struct HttpTransport {
     base: Url,
     unqualified_scheme: String,
@@ -71,6 +72,18 @@ impl HttpTransport {
             client: self.client.clone(),
             range_hint: self.range_hint.clone(),
         }
+    }
+
+    /// Concrete version of [`Transport::clone`]. Same semantics —
+    /// optionally apply an offset — but returns `Self` so callers
+    /// that need the concrete type (the PyO3 wrapper, mostly) don't
+    /// have to downcast a `Box<dyn Transport>`.
+    pub fn clone_concrete(&self, offset: Option<&UrlFragment>) -> Result<Self> {
+        let new_base = match offset {
+            Some(o) => self.abspath(o)?,
+            None => self.base.clone(),
+        };
+        Ok(self.clone_at(new_base))
     }
 
     /// The URL a server sees for `relpath`. Credentials are stripped
@@ -930,7 +943,7 @@ mod tests {
     #[test]
     fn transport_clone_with_offset_resolves_against_base() {
         let t = HttpTransport::new("http://example.com/a/", fresh_client()).unwrap();
-        let cloned = t.clone(Some("b/")).unwrap();
+        let cloned = Transport::clone(&t, Some("b/")).unwrap();
         assert_eq!(cloned.base().as_str(), "http://example.com/a/b/");
     }
 
