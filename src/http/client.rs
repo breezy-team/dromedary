@@ -233,6 +233,46 @@ fn auth_cache_key(uri: &Uri) -> AuthCacheKey {
     (scheme, host, port)
 }
 
+/// Break a proxy URL down into the parts the credential-lookup path
+/// needs. Returns `(scheme, host, port, embedded_creds)`. When the
+/// proxy URL carries a userinfo section (e.g.
+/// `http://joe:pw@proxy:3128/`) we lift those out so the 407 retry
+/// can send them as Proxy-Authorization without consulting the
+/// CredentialProvider — matching urllib's behaviour where an
+/// embedded user/password on the proxy URL was authoritative.
+fn proxy_connection_parts(
+    proxy_url: &str,
+) -> (String, String, Option<u16>, Option<(String, String)>) {
+    let parsed = match Url::parse(proxy_url) {
+        Ok(u) => u,
+        Err(_) => return (String::new(), String::new(), None, None),
+    };
+    let scheme = parsed.scheme().to_string();
+    let host = parsed.host_str().unwrap_or("").to_string();
+    let port = parsed.port();
+    let user = parsed.username();
+    let embedded = if user.is_empty() {
+        None
+    } else {
+        let user = percent_encoding::percent_decode_str(user)
+            .decode_utf8()
+            .ok()
+            .map(|s| s.into_owned())
+            .unwrap_or_default();
+        let password = parsed
+            .password()
+            .and_then(|p| {
+                percent_encoding::percent_decode_str(p)
+                    .decode_utf8()
+                    .ok()
+                    .map(|s| s.into_owned())
+            })
+            .unwrap_or_default();
+        Some((user, password))
+    };
+    (scheme, host, port, embedded)
+}
+
 /// Key under which proxy auth is cached. Proxy credentials bind to
 /// the proxy URL, not the origin, so we key on the proxy's own URL.
 /// reqwest's `Proxy` type doesn't expose the URL back for inspection,
@@ -635,8 +675,32 @@ impl HttpClient {
             }
         }
         if !has_explicit_proxy_auth {
-            if let Some(key) = &proxy_key {
-                if let Some(hdr) = self.attach_cached(&self.proxy_auth_cache, key, method, &uri) {
+            // Preemptive proxy auth: if the proxy URL embeds
+            // user:password and we haven't cached anything yet, go
+            // ahead and send Basic right away. Matches urllib's
+            // behaviour — saves one round-trip on every request for
+            // the common `all_proxy=http://joe:pw@host/` setup.
+            let cache_had_entry = if let Some(key) = &proxy_key {
+                if let Some(hdr) =
+                    self.attach_cached(&self.proxy_auth_cache, key, method, &uri)
+                {
+                    first_headers.push(("Proxy-Authorization".into(), hdr));
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if !cache_had_entry && !proxy_url.is_empty() {
+                let (_scheme, _host, _port, embedded) = proxy_connection_parts(&proxy_url);
+                if let Some((user, password)) = embedded {
+                    let hdr = build_basic_auth_header(&user, &password);
+                    // Cache so subsequent requests skip the parse.
+                    if let Some(key) = &proxy_key {
+                        self.proxy_auth_cache
+                            .put(key.clone(), CachedAuth::Basic { user, password });
+                    }
                     first_headers.push(("Proxy-Authorization".into(), hdr));
                 }
             }
@@ -750,7 +814,7 @@ impl HttpClient {
         kind: AuthKind,
     ) -> Result<HttpResponse> {
         let refs: Vec<&str> = challenges.iter().map(String::as_str).collect();
-        let Some((_scheme, new_auth)) = self.pick_auth_scheme_for(&refs, uri, kind) else {
+        let Some((_scheme, new_auth)) = self.pick_auth_scheme_for(&refs, uri, kind, proxy_url) else {
             // No scheme we can handle, or no credentials for the
             // ones on offer. Hand the 401/407 back to the caller.
             return Ok(HttpResponse {
@@ -817,7 +881,7 @@ impl HttpClient {
         challenges: &[&str],
         _method: &Method,
     ) -> Option<(&'static str, CachedAuth)> {
-        self.pick_auth_scheme_for(challenges, uri, AuthKind::Origin)
+        self.pick_auth_scheme_for(challenges, uri, AuthKind::Origin, "")
     }
 
     /// Given the challenges a server sent, pick the scheme we'll
@@ -843,7 +907,8 @@ impl HttpClient {
         &self,
         challenges: &[&str],
         uri: &Uri,
-        _kind: AuthKind,
+        kind: AuthKind,
+        proxy_url: &str,
     ) -> Option<(&'static str, CachedAuth)> {
         let mut negotiate_seen = false;
         let mut digest_remainder: Option<&str> = None;
@@ -863,12 +928,28 @@ impl HttpClient {
             }
         }
 
-        let protocol = uri.scheme_str().unwrap_or("http");
-        let host = uri.host().unwrap_or_default();
-        let port = uri.port_u16();
+        // Origin auth looks up creds for the request URL's host/port.
+        // Proxy auth looks them up against the *proxy's* host/port —
+        // the credential store is keyed on where the creds will be
+        // sent, not where the request is ultimately going. When the
+        // proxy URL embeds a userinfo section (the classic
+        // `all_proxy=http://joe:pw@proxy/` shape), we prefer those
+        // over the CredentialProvider so callers don't have to wire
+        // a separate store up for every test proxy.
+        let (protocol, host, port, embedded) = match kind {
+            AuthKind::Origin => (
+                uri.scheme_str().unwrap_or("http").to_string(),
+                uri.host().unwrap_or_default().to_string(),
+                uri.port_u16(),
+                None,
+            ),
+            AuthKind::Proxy => proxy_connection_parts(proxy_url),
+        };
+        let host_str = host.as_str();
+        let protocol_str = protocol.as_str();
 
         if negotiate_seen {
-            if let Some(token) = self.negotiate.initial_token(host) {
+            if let Some(token) = self.negotiate.initial_token(host_str) {
                 return Some(("negotiate", CachedAuth::Negotiate { token }));
             }
             // Fall through to Digest / Basic when the provider says
@@ -878,9 +959,15 @@ impl HttpClient {
 
         if let Some(raw) = digest_remainder {
             if let Some(challenge) = parse_digest_challenge(raw) {
-                let (user, password) =
-                    self.credentials
-                        .lookup(protocol, host, port, Some(&challenge.realm));
+                let (user, password) = match &embedded {
+                    Some((u, p)) => (Some(u.clone()), Some(p.clone())),
+                    None => self.credentials.lookup(
+                        protocol_str,
+                        host_str,
+                        port,
+                        Some(&challenge.realm),
+                    ),
+                };
                 let (Some(user), Some(password)) = (user, password) else {
                     return None;
                 };
@@ -907,9 +994,12 @@ impl HttpClient {
             let realm = basic_remainder
                 .and_then(extract_basic_realm)
                 .map(|r| r.to_string());
-            let (user, password) = self
-                .credentials
-                .lookup(protocol, host, port, realm.as_deref());
+            let (user, password) = match &embedded {
+                Some((u, p)) => (Some(u.clone()), Some(p.clone())),
+                None => self
+                    .credentials
+                    .lookup(protocol_str, host_str, port, realm.as_deref()),
+            };
             let (Some(user), Some(password)) = (user, password) else {
                 return None;
             };
@@ -1867,10 +1957,10 @@ mod tests {
 
     #[test]
     fn pick_auth_scheme_for_proxy_uses_credentials() {
-        // AuthKind::Proxy currently routes through the same
-        // credential provider; verify it works end-to-end on the
-        // scheme-picking side. If we later key credentials on the
-        // proxy URL this test should be updated accordingly.
+        // Proxy auth without an embedded userinfo falls through to
+        // the credential provider — that branch still needs to work
+        // for callers that register a Python hook instead of
+        // sticking the password in the proxy URL.
         let client = fresh_client(Box::new(FixedCreds {
             user: "px-u",
             password: "px-p",
@@ -1878,7 +1968,7 @@ mod tests {
         let uri: Uri = "http://example.com/".parse().unwrap();
         let challenges = [r#"Basic realm="proxy""#];
         let got = client
-            .pick_auth_scheme_for(&challenges, &uri, AuthKind::Proxy)
+            .pick_auth_scheme_for(&challenges, &uri, AuthKind::Proxy, "http://proxy:3128")
             .unwrap();
         assert_eq!(got.0, "basic");
         match got.1 {
