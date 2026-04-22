@@ -44,6 +44,57 @@ pub enum Error {
     DirectoryNotEmptyError(Option<String>),
 
     ResourceBusy(Option<String>),
+
+    /// HTTP server returned a status code we couldn't interpret, or
+    /// the response body was malformed beyond what RangeFile could
+    /// parse. Maps to `dromedary.errors.InvalidHttpResponse`.
+    InvalidHttpResponse {
+        path: String,
+        msg: String,
+    },
+
+    /// HTTP server returned a status code we *can* interpret but
+    /// didn't expect at this point. Maps to
+    /// `dromedary.errors.UnexpectedHttpStatus`.
+    UnexpectedHttpStatus {
+        path: String,
+        code: u16,
+        extra: Option<String>,
+    },
+
+    /// HTTP server's response to a Range request was malformed or
+    /// rejected our range. Maps to `dromedary.errors.InvalidHttpRange`.
+    InvalidHttpRange {
+        path: String,
+        range: String,
+        msg: String,
+    },
+
+    /// HTTP server returned 400 (Bad Request) without us asking for
+    /// a Range — usually a client-side bug or malformed URL. Maps to
+    /// `dromedary.errors.BadHttpRequest`.
+    BadHttpRequest {
+        path: String,
+        reason: String,
+    },
+
+    /// HTTP server redirected us but we weren't asked to follow.
+    /// Carries the original and target URLs so callers can retry on
+    /// a fresh transport. Maps to `dromedary.errors.RedirectRequested`.
+    RedirectRequested {
+        source: String,
+        target: String,
+        is_permanent: bool,
+    },
+
+    /// HTTP server tried to redirect us somewhere that doesn't fit
+    /// the transport's URL shape (e.g. a different scheme). Maps to
+    /// `dromedary.errors.UnusableRedirect`.
+    UnusableRedirect {
+        source: String,
+        target: String,
+        reason: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

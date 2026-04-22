@@ -30,6 +30,12 @@ import_exception!(dromedary.errors, PathError);
 import_exception!(dromedary.errors, DirectoryNotEmpty);
 import_exception!(dromedary.errors, NotADirectory);
 import_exception!(dromedary.errors, ResourceBusy);
+import_exception!(dromedary.errors, InvalidHttpResponse);
+import_exception!(dromedary.errors, UnexpectedHttpStatus);
+import_exception!(dromedary.errors, InvalidHttpRange);
+import_exception!(dromedary.errors, BadHttpRequest);
+import_exception!(dromedary.errors, RedirectRequested);
+import_exception!(dromedary.errors, UnusableRedirect);
 import_exception!(dromedary.urlutils, InvalidURL);
 
 #[pyclass(subclass)]
@@ -123,6 +129,24 @@ pub(crate) fn map_transport_err_to_py_err(
             ShortReadvError::new_err((path, offset, expected, got))
         }
         Error::ResourceBusy(name) => ResourceBusy::new_err((pick_path(name),)),
+        Error::InvalidHttpResponse { path, msg } => InvalidHttpResponse::new_err((path, msg)),
+        Error::UnexpectedHttpStatus { path, code, extra } => {
+            UnexpectedHttpStatus::new_err((path, code, extra))
+        }
+        Error::InvalidHttpRange { path, range, msg } => {
+            InvalidHttpRange::new_err((path, range, msg))
+        }
+        Error::BadHttpRequest { path, reason } => BadHttpRequest::new_err((path, reason)),
+        Error::RedirectRequested {
+            source,
+            target,
+            is_permanent,
+        } => RedirectRequested::new_err((source, target, is_permanent)),
+        Error::UnusableRedirect {
+            source,
+            target,
+            reason,
+        } => UnusableRedirect::new_err((source, target, reason)),
     }
 }
 
