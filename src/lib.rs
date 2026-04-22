@@ -781,6 +781,9 @@ pub mod gio;
 
 pub mod http;
 
+#[cfg(feature = "webdav")]
+pub mod webdav;
+
 pub mod log;
 
 pub mod memory;
