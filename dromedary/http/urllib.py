@@ -164,9 +164,15 @@ class HttpTransport(_http_rs.HttpTransport):
     def _post(self, body_bytes):
         """POST `body_bytes` to .bzr/smart on this transport.
 
-        Returns ``(response_code, response_body_bytes)``.
+        Returns ``(response_code, response_body_filelike)``. The Rust
+        pyclass returns raw bytes; breezy's smart-HTTP medium calls
+        ``.read(count)`` on the result, so we wrap the bytes in a
+        BytesIO for that specific caller.
         """
-        return super()._post(".bzr/smart", body_bytes)
+        from io import BytesIO
+
+        code, body = super()._post(".bzr/smart", body_bytes)
+        return code, BytesIO(body)
 
     # ------------------------------------------------------------------
     # Breezy-facing redirect fix-up. The Rust side surfaces a 3xx as
