@@ -14,7 +14,7 @@ pub use auth::{
 };
 pub use client::{ClientError, HttpClient, HttpClientConfig, HttpResponse};
 pub use response::{handle_response, InFile, RangeFile, ResponseError, ResponseFile, ResponseKind};
-pub use transport::HttpTransport;
+pub use transport::{HttpTransport, ReadvTuning};
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;

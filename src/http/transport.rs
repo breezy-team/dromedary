@@ -45,6 +45,40 @@ enum RangeHint {
 /// `unqualified_scheme` is the HTTP scheme without any `+impl`
 /// qualifier so we can hand back clean URLs from `external_url`
 /// and `_remote_path`.
+/// Per-transport readv tunables. Defaults match the historical
+/// urllib HttpTransport values; tests poke individual fields to
+/// force specific batching behaviour. Stored behind an `Arc<Mutex>`
+/// so clones share the same tuning state.
+#[derive(Debug, Clone)]
+pub struct ReadvTuning {
+    /// Max number of separate offsets to coalesce into one
+    /// `_CoalescedOffset` group. `0` means "no limit". Mirrors the
+    /// Python `_max_readv_combine` attribute.
+    pub max_readv_combine: usize,
+    /// "Fudge factor" — bytes to read between offsets before
+    /// preferring a seek. Default 128. Mirrors
+    /// `_bytes_to_read_before_seek`.
+    pub bytes_to_read_before_seek: usize,
+    /// Max byte size of a single coalesced range. `0` = no limit.
+    /// Mirrors `_get_max_size`.
+    pub get_max_size: usize,
+    /// Max number of byte ranges packed into one HTTP Range header.
+    /// Mirrors `_max_get_ranges`.
+    pub max_get_ranges: usize,
+}
+
+impl Default for ReadvTuning {
+    fn default() -> Self {
+        Self {
+            max_readv_combine: 0,
+            bytes_to_read_before_seek: 128,
+            get_max_size: 0,
+            // Apache's default range cap is ~400; pick well under that.
+            max_get_ranges: 200,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct HttpTransport {
     base: Url,
@@ -59,6 +93,7 @@ pub struct HttpTransport {
     segment_parameters: std::collections::BTreeMap<String, String>,
     client: Arc<HttpClient>,
     range_hint: Arc<Mutex<RangeHint>>,
+    readv_tuning: Arc<Mutex<ReadvTuning>>,
 }
 
 impl HttpTransport {
@@ -74,6 +109,7 @@ impl HttpTransport {
             segment_parameters,
             client,
             range_hint: Arc::new(Mutex::new(RangeHint::Multi)),
+            readv_tuning: Arc::new(Mutex::new(ReadvTuning::default())),
         })
     }
 
@@ -95,6 +131,7 @@ impl HttpTransport {
             segment_parameters: std::collections::BTreeMap::new(),
             client: self.client.clone(),
             range_hint: self.range_hint.clone(),
+            readv_tuning: self.readv_tuning.clone(),
         }
     }
 
@@ -316,6 +353,21 @@ impl HttpTransport {
             RangeHint::Single => Some("single"),
             RangeHint::None => None,
         }
+    }
+
+    /// Apply a [`ReadvTuning`] update — shared across all clones
+    /// because the tuning sits behind an `Arc<Mutex>`. Used by the
+    /// PyO3 wrapper's `_max_readv_combine` / `_max_get_ranges` /
+    /// `_get_max_size` / `_bytes_to_read_before_seek` setters so
+    /// breezy's test-harness tunables reach the readv coalescer.
+    pub fn set_readv_tuning(&self, tuning: ReadvTuning) {
+        *self.readv_tuning.lock().unwrap() = tuning;
+    }
+
+    /// Read the current [`ReadvTuning`] snapshot. Cloned to avoid
+    /// holding the lock across the readv call.
+    pub fn readv_tuning(&self) -> ReadvTuning {
+        self.readv_tuning.lock().unwrap().clone()
     }
 
     /// Accessor for the shared `HttpClient`. Exposed so the PyO3
@@ -1008,17 +1060,27 @@ impl HttpTransport {
                 v.sort();
                 v
             };
-            let coalesced =
-                match crate::readv::coalesce_offsets(&sorted, Some(0), Some(128), Some(0)) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        out.push(Err(Error::InvalidHttpResponse {
-                            path: relpath.to_string(),
-                            msg: format!("overlapping ranges: {}", e),
-                        }));
-                        return out;
-                    }
-                };
+            let tuning = self.readv_tuning();
+            // `coalesce_offsets` treats `Some(0)` as the unlimited
+            // sentinel; pass `None` for defaults and `Some(n)` for
+            // explicit limits so the callee's own defaults don't
+            // override our config.
+            let opt = |v: usize| if v == 0 { None } else { Some(v) };
+            let coalesced = match crate::readv::coalesce_offsets(
+                &sorted,
+                opt(tuning.max_readv_combine),
+                Some(tuning.bytes_to_read_before_seek),
+                opt(tuning.get_max_size),
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    out.push(Err(Error::InvalidHttpResponse {
+                        path: relpath.to_string(),
+                        msg: format!("overlapping ranges: {}", e),
+                    }));
+                    return out;
+                }
+            };
 
             match self.readv_one_pass(relpath, &coalesced, &remaining) {
                 Ok(pass_out) => {
@@ -1062,14 +1124,12 @@ impl HttpTransport {
         coalesced: &[(usize, usize, Vec<(usize, usize)>)],
         offsets_order: &[(usize, usize)],
     ) -> std::result::Result<Vec<Result<(u64, Vec<u8>)>>, ReadvPassError> {
-        // Apache's default range cap is ~400; pick well under that.
-        const MAX_GET_RANGES: usize = 200;
-
+        let max_get_ranges = self.readv_tuning().max_get_ranges.max(1);
         let hint = *self.range_hint.lock().unwrap();
         let batches: Vec<&[(usize, usize, Vec<(usize, usize)>)]> = match hint {
             RangeHint::None => vec![coalesced],
             RangeHint::Single => coalesced.chunks(1).collect::<Vec<_>>(),
-            RangeHint::Multi => coalesced.chunks(MAX_GET_RANGES).collect::<Vec<_>>(),
+            RangeHint::Multi => coalesced.chunks(max_get_ranges).collect::<Vec<_>>(),
         };
 
         let mut results: Vec<Result<(u64, Vec<u8>)>> = Vec::with_capacity(offsets_order.len());

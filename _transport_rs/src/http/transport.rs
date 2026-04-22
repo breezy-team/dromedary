@@ -164,6 +164,58 @@ impl HttpTransport {
         self.inner.degrade_range_hint()
     }
 
+    // Readv-tuning getters / setters. These mirror the Python
+    // urllib HttpTransport's instance attributes that breezy's
+    // tests poke at to force specific batching behaviour:
+    // `_max_readv_combine`, `_bytes_to_read_before_seek`,
+    // `_get_max_size`, `_max_get_ranges`. Each setter swaps the
+    // single named field while leaving the others untouched, so
+    // tests that override one don't reset the others.
+
+    #[getter]
+    fn _max_readv_combine(&self) -> usize {
+        self.inner.readv_tuning().max_readv_combine
+    }
+    #[setter]
+    fn set__max_readv_combine(&self, v: usize) {
+        let mut t = self.inner.readv_tuning();
+        t.max_readv_combine = v;
+        self.inner.set_readv_tuning(t);
+    }
+
+    #[getter]
+    fn _bytes_to_read_before_seek(&self) -> usize {
+        self.inner.readv_tuning().bytes_to_read_before_seek
+    }
+    #[setter]
+    fn set__bytes_to_read_before_seek(&self, v: usize) {
+        let mut t = self.inner.readv_tuning();
+        t.bytes_to_read_before_seek = v;
+        self.inner.set_readv_tuning(t);
+    }
+
+    #[getter]
+    fn _get_max_size(&self) -> usize {
+        self.inner.readv_tuning().get_max_size
+    }
+    #[setter]
+    fn set__get_max_size(&self, v: usize) {
+        let mut t = self.inner.readv_tuning();
+        t.get_max_size = v;
+        self.inner.set_readv_tuning(t);
+    }
+
+    #[getter]
+    fn _max_get_ranges(&self) -> usize {
+        self.inner.readv_tuning().max_get_ranges
+    }
+    #[setter]
+    fn set__max_get_ranges(&self, v: usize) {
+        let mut t = self.inner.readv_tuning();
+        t.max_get_ranges = v;
+        self.inner.set_readv_tuning(t);
+    }
+
     /// Unqualified HTTP scheme (`"http"` or `"https"`) — strips any
     /// `+impl` qualifier present in the base URL. Exposed for
     /// breezy's test harness which reads it directly.
