@@ -912,6 +912,17 @@ mod tests {
     }
 
     #[test]
+    fn evaluate_proxy_bypass_leading_star_glob() {
+        // `*example.com` with prefix-only matching still works
+        // because `*` eats the leading label(s). Matches breezy's
+        // TestHttpProxyWhiteBox.test_evaluate_proxy_bypass_true.
+        assert_eq!(
+            evaluate_proxy_bypass("bzr.example.com", Some("*example.com")),
+            ProxyBypass::Bypass
+        );
+    }
+
+    #[test]
     fn evaluate_proxy_bypass_question_glob() {
         // `?` matches exactly one character.
         assert_eq!(
@@ -964,6 +975,27 @@ mod tests {
         assert_eq!(
             evaluate_proxy_bypass("foo.com", Some(" bar.com , foo.com ,")),
             ProxyBypass::Bypass
+        );
+    }
+
+    #[test]
+    fn evaluate_proxy_bypass_empty_list_entries() {
+        // A `no_proxy` value that's entirely empty or commas-only
+        // or contains empty inner entries should be equivalent to
+        // "no bypass list entries matched": callers fall through to
+        // the default proxy behaviour. Mirrors breezy's
+        // TestHttpProxyWhiteBox.test_evaluate_proxy_bypass_empty_entries.
+        assert_eq!(
+            evaluate_proxy_bypass("example.com", Some("")),
+            ProxyBypass::Undecided
+        );
+        assert_eq!(
+            evaluate_proxy_bypass("example.com", Some(",")),
+            ProxyBypass::Undecided
+        );
+        assert_eq!(
+            evaluate_proxy_bypass("example.com", Some("foo,,bar")),
+            ProxyBypass::Undecided
         );
     }
 
@@ -1021,6 +1053,16 @@ mod tests {
     fn parse_auth_header_no_remainder() {
         let (scheme, rest) = parse_auth_header("Negotiate");
         assert_eq!(scheme, "negotiate");
+        assert_eq!(rest, None);
+    }
+
+    #[test]
+    fn parse_auth_header_empty() {
+        // Empty header: scheme is "" (lowercased of ""), no remainder.
+        // Matches the Python `AbstractAuthHandler._parse_auth_header`
+        // behaviour exercised by breezy's TestAuthHeader.test_empty_header.
+        let (scheme, rest) = parse_auth_header("");
+        assert_eq!(scheme, "");
         assert_eq!(rest, None);
     }
 

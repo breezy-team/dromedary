@@ -1524,6 +1524,33 @@ mod tests {
     }
 
     #[test]
+    fn drive_redirects_follows_mixed_code_chain() {
+        // Mirrors breezy's TestHTTPSilentRedirections.test_five_redirections:
+        // a chain mixing 301 / 302 / 303 / 307 codes must be
+        // followed all the way when follow_redirects=true. Each
+        // hop uses a different redirect code to ensure none of
+        // them are treated as a terminal response.
+        let opts = RequestOptions {
+            follow_redirects: true,
+            max_redirects: 10,
+            max_repeats: 10,
+        };
+        let resp = drive_redirects(&opts, "http://a/1/a", |u| {
+            let (code, target) = match u {
+                "http://a/1/a" => (301, Some("http://a/2/a")),
+                "http://a/2/a" => (302, Some("http://a/3/a")),
+                "http://a/3/a" => (303, Some("http://a/4/a")),
+                "http://a/4/a" => (307, Some("http://a/5/a")),
+                _ => (200, None),
+            };
+            Ok(mk_resp(code, target, u))
+        })
+        .unwrap();
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.final_url, "http://a/5/a");
+    }
+
+    #[test]
     fn drive_redirects_rejects_too_many_hops() {
         let opts = RequestOptions {
             follow_redirects: true,
@@ -1697,6 +1724,49 @@ mod tests {
             .unwrap();
         assert_eq!(got.0, "digest");
         assert!(matches!(got.1, CachedAuth::Digest(_)));
+    }
+
+    #[test]
+    fn pick_auth_scheme_passes_none_port_when_uri_has_no_port() {
+        // Regression test for https://bugs.launchpad.net/bzr/+bug/654684:
+        // the credential lookup should still succeed when the URI
+        // omits a port (common for `http://host/path`). The Python
+        // side historically surfaced `None` as the port and the
+        // auth-config store matched credentials on host only; the
+        // Rust client propagates the same None to the provider.
+        struct SeesPort(std::sync::Mutex<Option<Option<u16>>>);
+        impl CredentialProvider for SeesPort {
+            fn lookup(
+                &self,
+                _protocol: &str,
+                _host: &str,
+                port: Option<u16>,
+                _realm: Option<&str>,
+            ) -> (Option<String>, Option<String>) {
+                *self.0.lock().unwrap() = Some(port);
+                (Some("joe".into()), Some("foo".into()))
+            }
+        }
+        let seen = std::sync::Arc::new(SeesPort(std::sync::Mutex::new(None)));
+        struct Shared(std::sync::Arc<SeesPort>);
+        impl CredentialProvider for Shared {
+            fn lookup(
+                &self,
+                protocol: &str,
+                host: &str,
+                port: Option<u16>,
+                realm: Option<&str>,
+            ) -> (Option<String>, Option<String>) {
+                self.0.lookup(protocol, host, port, realm)
+            }
+        }
+        let client = fresh_client(Box::new(Shared(seen.clone())));
+        let uri: Uri = "http://localhost/path".parse().unwrap();
+        let challenges = [r#"Basic realm="R""#];
+        client
+            .pick_auth_scheme(&uri, &challenges, &Method::GET)
+            .unwrap();
+        assert_eq!(*seen.0.lock().unwrap(), Some(None));
     }
 
     #[test]

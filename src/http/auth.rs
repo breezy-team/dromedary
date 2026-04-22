@@ -183,6 +183,23 @@ mod tests {
     }
 
     #[test]
+    fn basic_header_does_not_embed_newlines() {
+        // Regression test for https://bugs.launchpad.net/bzr/+bug/1606203:
+        // Python's base64 module wrapped at 76 chars and embedded
+        // '\n' into long-credential Authorization headers, which
+        // the server rejected as a malformed line. Long creds here
+        // exercise the wrap-trigger path.
+        let user = "user".repeat(10); // 40 chars
+        let password = "password".repeat(5); // 40 chars
+        let hdr = build_basic_auth_header(&user, &password);
+        assert!(
+            !hdr.contains('\n'),
+            "header must not embed newlines: {:?}",
+            hdr
+        );
+    }
+
+    #[test]
     fn parse_digest_challenge_happy_path() {
         let raw = r#"realm="Example", nonce="abc123", qop="auth", algorithm="MD5", opaque="o"#
             .to_string()
