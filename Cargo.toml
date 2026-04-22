@@ -51,6 +51,12 @@ base64 = "0.22"
 # keeps our sync API shape; `rustls-tls-native-roots` wires rustls
 # with the platform's native trust store.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "gzip", "blocking"] }
+# Lightweight dep used only for typed error classification — we
+# downcast reqwest's error chain to `hyper::Error` so we can
+# distinguish protocol-level parse failures (bad HTTP version, bad
+# status line) from connection-level ones (DNS/TCP/TLS) without
+# string-matching the error message.
+hyper = { version = "1", default-features = false }
 http = "1"
 quick-xml = { version = "0.37", optional = true }
 gio = { version = "0.22", optional = true }

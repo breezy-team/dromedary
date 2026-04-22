@@ -611,11 +611,54 @@ fn client_err_to_transport_err(err: crate::http::client::ClientError) -> Error {
             msg,
         },
         ClientError::Io(e) => Error::Io(e),
-        // DNS / TCP / TLS failures — these surface as
-        // `dromedary.errors.ConnectionError` on the Python side so
-        // breezy's retry loop can catch them the way it used to.
-        ClientError::Transport(e) => Error::ConnectionError(e.to_string()),
+        ClientError::Transport(e) => {
+            // Classify: protocol-level parse errors (bad HTTP
+            // version, bad status line, truncated framing) map to
+            // `InvalidHttpResponse` — a semantic "server misbehaved"
+            // that breezy's tests explicitly distinguish from
+            // network-level failures. Everything else (DNS, TCP,
+            // TLS) maps to `ConnectionError` for the retry loop.
+            //
+            // reqwest walks the error source chain for the typed
+            // tests below; we mirror that approach rather than
+            // string-matching the Display output, which would
+            // inevitably drift.
+            let msg = e.to_string();
+            if is_http_parse_error(&e) {
+                Error::InvalidHttpResponse {
+                    path: String::new(),
+                    msg,
+                }
+            } else {
+                Error::ConnectionError(msg)
+            }
+        }
     }
+}
+
+/// Walk a `reqwest::Error`'s cause chain looking for a
+/// `hyper::Error` and ask it whether this was a protocol-level
+/// parse failure. No string-matching: `hyper::Error::is_parse` /
+/// `is_parse_status` / `is_parse_too_large` are the authoritative
+/// classifiers.
+fn is_http_parse_error(err: &reqwest::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> =
+        std::error::Error::source(err);
+    while let Some(cause) = source {
+        if let Some(hyper_err) = cause.downcast_ref::<hyper::Error>() {
+            // `is_parse()` is the general "we couldn't decode this
+            // as HTTP" check; `is_parse_status()` covers specifically
+            // bad status lines (which `is_parse` also catches —
+            // included for clarity). `is_incomplete_message()` is
+            // the truncated-framing case breezy's BadProtocol tests
+            // also exercise.
+            return hyper_err.is_parse()
+                || hyper_err.is_parse_status()
+                || hyper_err.is_incomplete_message();
+        }
+        source = cause.source();
+    }
+    false
 }
 
 impl Transport for HttpTransport {
