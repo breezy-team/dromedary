@@ -223,9 +223,27 @@ class HttpTransport(_http_rs.HttpTransport):
         # highest (offset + length) any caller will seek+read.
         highest = max(start + length for start, length in pairs)
         out = BytesIO(b"\0" * highest)
-        for offset, chunk in self.readv(relpath, pairs):
-            out.seek(offset)
-            out.write(chunk)
+        from dromedary.errors import (
+            InvalidHttpRange as _InvalidHttpRange,
+            ShortReadvError as _ShortReadvError,
+        )
+
+        try:
+            for offset, chunk in self.readv(relpath, pairs):
+                out.seek(offset)
+                out.write(chunk)
+        except _ShortReadvError as e:
+            # Readv ran past the end of the file. At the `_get` API
+            # layer this means the caller asked for an out-of-range
+            # byte range — Python urllib raised InvalidHttpRange
+            # here, matching what breezy's TestRanges expect.
+            # Preserve the original ShortReadv context so callers
+            # debugging a live failure still see where it came from.
+            raise _InvalidHttpRange(
+                self._remote_path(relpath),
+                "bytes=%d-%d" % pairs[0] if pairs else "",
+                str(e),
+            ) from e
         out.seek(0)
         return 206, out
 
