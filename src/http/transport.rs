@@ -503,6 +503,43 @@ fn normalise_http_url(
 
 /// Format a list of (start, length) offsets + optional tail amount
 /// as an HTTP Range header value.
+/// Collapse `//` and `/./` path segments per RFC 3986 §5.2.4.
+///
+/// `url::Url::join` applies this to the base URL but leaves the
+/// output path alone when relative joins introduce stray `./` or
+/// double slashes. breezy's tests assert that abspath emits the
+/// canonical form — `abspath(".bzr/1//2/./3")` on
+/// `http://host/bzr/bzr.dev/` should yield `/bzr/bzr.dev/.bzr/1/2/3`.
+fn collapse_path_segments(path: &str) -> String {
+    let has_leading_slash = path.starts_with('/');
+    let has_trailing_slash = path.len() > 1 && path.ends_with('/');
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" => {}  // empty segment from `//` or leading `/`
+            "." => {} // drop current-directory markers
+            ".." => {
+                // Pop the previous segment if we have one; otherwise
+                // leave the `..` in place (url::Url already handled
+                // overflow against the base).
+                if parts.pop().is_none() {
+                    parts.push("..");
+                }
+            }
+            s => parts.push(s),
+        }
+    }
+    let mut out = String::with_capacity(path.len());
+    if has_leading_slash {
+        out.push('/');
+    }
+    out.push_str(&parts.join("/"));
+    if has_trailing_slash && !out.ends_with('/') {
+        out.push('/');
+    }
+    out
+}
+
 fn format_range_header(offsets: &[(usize, usize)], tail_amount: usize) -> String {
     let mut parts: Vec<String> = offsets
         .iter()
@@ -713,36 +750,42 @@ impl Transport for HttpTransport {
     }
 
     fn abspath(&self, relpath: &UrlFragment) -> Result<Url> {
-        if relpath.is_empty() || relpath == "." {
-            return Ok(self.base.clone());
-        }
         // URLs must be ASCII on the wire. Callers hand us pre-escaped
         // paths (via urlutils.escape); silently percent-encoding here
         // would hide bugs where that escape was skipped.
         if !relpath.is_ascii() {
             return Err(Error::UrlError(url::ParseError::InvalidDomainCharacter));
         }
-        // Unescape unreserved characters (RFC 3986: a-z A-Z 0-9 - . _ ~)
-        // that callers sometimes percent-encode needlessly. Keeps
-        // abspath output canonical so clone()s of sibling branches
-        // produce identical-looking base URLs. (lp:842223)
-        let normalised = crate::urlutils::unquote_unreserved(relpath);
-        let joined = self
-            .base
-            .join(&normalised)
-            .map_err(|_| Error::UrlError(url::ParseError::InvalidDomainCharacter))?;
+        let mut joined = if relpath.is_empty() || relpath == "." {
+            self.base.clone()
+        } else {
+            // Unescape unreserved characters (RFC 3986: a-z A-Z 0-9
+            // - . _ ~) that callers sometimes percent-encode
+            // needlessly. Keeps abspath output canonical so
+            // clone()s of sibling branches produce identical-
+            // looking base URLs. (lp:842223)
+            let normalised = crate::urlutils::unquote_unreserved(relpath);
+            self.base
+                .join(&normalised)
+                .map_err(|_| Error::UrlError(url::ParseError::InvalidDomainCharacter))?
+        };
+        // Collapse `//` and `./` path segments that `url::Url::join`
+        // leaves intact — the test suite expects RFC 3986 §5.2.4
+        // "remove_dot_segments" style normalisation at the abspath
+        // boundary. (url::Url does that for the base URL but not
+        // for the relative join output.)
+        let collapsed = collapse_path_segments(joined.path());
+        if collapsed != joined.path() {
+            joined.set_path(&collapsed);
+        }
         // Match the Python `URL.clone(relpath)` semantics of
         // dropping a trailing slash from the joined path. Callers
         // that explicitly want the directory form re-append `/`
         // themselves (e.g. clone() in the Python subclass).
-        let joined = if joined.path().len() > 1 && joined.path().ends_with('/') {
-            let mut u = joined;
-            let new_path = u.path().trim_end_matches('/').to_string();
-            u.set_path(&new_path);
-            u
-        } else {
-            joined
-        };
+        if joined.path().len() > 1 && joined.path().ends_with('/') {
+            let new_path = joined.path().trim_end_matches('/').to_string();
+            joined.set_path(&new_path);
+        }
         Ok(joined)
     }
 
@@ -1205,10 +1248,27 @@ mod tests {
     // ----- abspath / clone_concrete -----
 
     #[test]
-    fn abspath_empty_returns_base() {
+    fn abspath_empty_strips_trailing_slash() {
+        // `abspath` returns the file-form URL (no trailing slash)
+        // even when handed the empty string or "." — matching
+        // Python `URL.clone()`, which breezy's tests assert
+        // against. The directory form lives on `base()` (which
+        // keeps the trailing slash) and `clone()` (which re-adds
+        // one).
         let t = HttpTransport::new("http://example.com/a/", fresh_client()).unwrap();
-        assert_eq!(t.abspath("").unwrap().as_str(), "http://example.com/a/");
-        assert_eq!(t.abspath(".").unwrap().as_str(), "http://example.com/a/");
+        assert_eq!(t.abspath("").unwrap().as_str(), "http://example.com/a");
+        assert_eq!(t.abspath(".").unwrap().as_str(), "http://example.com/a");
+    }
+
+    #[test]
+    fn abspath_collapses_redundant_slashes_and_dots() {
+        // `abspath("foo/1//2/./3")` should canonicalise to
+        // `/foo/1/2/3` per RFC 3986 §5.2.4 "remove_dot_segments".
+        let t = HttpTransport::new("http://example.com/root/", fresh_client()).unwrap();
+        assert_eq!(
+            t.abspath(".bzr/1//2/./3").unwrap().as_str(),
+            "http://example.com/root/.bzr/1/2/3"
+        );
     }
 
     #[test]
