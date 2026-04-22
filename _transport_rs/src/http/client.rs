@@ -35,7 +35,7 @@ import_exception!(dromedary.errors, InvalidHttpResponse);
 /// become `ValueError`; IO errors after the response started
 /// become `OSError`. This matches how the Python urllib-handler
 /// stack used to funnel errors.
-fn client_err_to_py(err: ClientError) -> PyErr {
+pub(super) fn client_err_to_py(err: ClientError) -> PyErr {
     match err {
         ClientError::InvalidRequest(msg) => PyValueError::new_err(msg),
         ClientError::Io(e) => PyIOError::new_err(e.to_string()),
@@ -216,7 +216,7 @@ impl HttpClient {
 /// Errors inside the callback are silently swallowed. Activity
 /// reporting is advisory; a broken progress-bar hook shouldn't fail
 /// the actual HTTP request.
-fn make_activity_callback(cb: Py<PyAny>) -> ActivityCallback {
+pub(super) fn make_activity_callback(cb: Py<PyAny>) -> ActivityCallback {
     std::sync::Arc::new(move |bytes: usize, dir: ActivityDirection| {
         Python::attach(|py| {
             // `call1` can raise; ignore the result so a buggy hook
@@ -245,7 +245,7 @@ pub(crate) struct HttpResponse {
 }
 
 impl HttpResponse {
-    fn new(raw: RsHttpResponse) -> Self {
+    pub(super) fn new(raw: RsHttpResponse) -> Self {
         Self {
             inner: Mutex::new(raw),
         }
@@ -420,7 +420,7 @@ fn py_io_err(e: std::io::Error) -> PyErr {
 /// Coerce whatever Python hands us into `(name, value)` pairs. We
 /// accept either a dict or any iterable of two-tuples, matching the
 /// old `request` signature where callers could pass either.
-fn extract_headers(py: Python, obj: &Py<PyAny>) -> PyResult<Vec<(String, String)>> {
+pub(super) fn extract_headers(py: Python, obj: &Py<PyAny>) -> PyResult<Vec<(String, String)>> {
     let bound = obj.bind(py);
     if let Ok(d) = bound.cast::<pyo3::types::PyDict>() {
         let mut out = Vec::with_capacity(d.len());
@@ -450,7 +450,7 @@ fn extract_headers(py: Python, obj: &Py<PyAny>) -> PyResult<Vec<(String, String)
 /// Accept `bytes`, `bytearray`, `memoryview`, or `str` (encoded as
 /// UTF-8) as the request body. Matches how the Python side
 /// previously passed data to `connection._send_request`.
-fn extract_body(py: Python, obj: &Py<PyAny>) -> PyResult<Vec<u8>> {
+pub(super) fn extract_body(py: Python, obj: &Py<PyAny>) -> PyResult<Vec<u8>> {
     let bound = obj.bind(py);
     if let Ok(b) = bound.cast::<PyBytes>() {
         return Ok(b.as_bytes().to_vec());

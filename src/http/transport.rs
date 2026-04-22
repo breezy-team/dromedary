@@ -37,13 +37,19 @@ enum RangeHint {
 ///
 /// Holds an `Arc<HttpClient>` so clones share the same connection
 /// pool, auth cache, and credentials. `base` is the transport's
-/// root URL (always ends with `/`); `unqualified_scheme` is the
-/// HTTP scheme without any `+impl` qualifier so we can hand back
-/// clean URLs from `external_url` and `_remote_path`.
+/// root URL without segment parameters (always ends with `/`);
+/// `segment_parameters` stores the breezy-style `,key=value` suffix
+/// parameters separately so they never leak into requests on the
+/// wire but are still visible via `get_segment_parameters()` and
+/// the joined form reported by `Transport::base()`.
+/// `unqualified_scheme` is the HTTP scheme without any `+impl`
+/// qualifier so we can hand back clean URLs from `external_url`
+/// and `_remote_path`.
 #[derive(Clone)]
 pub struct HttpTransport {
     base: Url,
     unqualified_scheme: String,
+    segment_parameters: std::collections::BTreeMap<String, String>,
     client: Arc<HttpClient>,
     range_hint: Arc<Mutex<RangeHint>>,
 }
@@ -53,10 +59,12 @@ impl HttpTransport {
     /// `http` or `https` scheme (optionally with a `+impl` suffix
     /// like `http+urllib://`, which we ignore beyond logging).
     pub fn new(base: &str, client: Arc<HttpClient>) -> Result<Self> {
-        let (unqualified_scheme, normalised_base) = normalise_http_url(base)?;
+        let (unqualified_scheme, normalised_base, segment_parameters) =
+            normalise_http_url(base)?;
         Ok(Self {
             base: normalised_base,
             unqualified_scheme,
+            segment_parameters,
             client,
             range_hint: Arc::new(Mutex::new(RangeHint::Multi)),
         })
@@ -64,11 +72,14 @@ impl HttpTransport {
 
     /// Clone this transport at a new base URL. Shares the underlying
     /// `HttpClient` — so the auth cache, connection pool, and
-    /// credentials follow us.
+    /// credentials follow us. Segment parameters are cleared on the
+    /// clone (matching the Python `ConnectedTransport.clone` shape,
+    /// which did the same via `_raw_base`).
     fn clone_at(&self, new_base: Url) -> Self {
         Self {
             base: new_base,
             unqualified_scheme: self.unqualified_scheme.clone(),
+            segment_parameters: std::collections::BTreeMap::new(),
             client: self.client.clone(),
             range_hint: self.range_hint.clone(),
         }
@@ -78,9 +89,22 @@ impl HttpTransport {
     /// optionally apply an offset — but returns `Self` so callers
     /// that need the concrete type (the PyO3 wrapper, mostly) don't
     /// have to downcast a `Box<dyn Transport>`.
+    ///
+    /// `clone` differs from `abspath` in that the result is always
+    /// directory-shaped (ends in `/`): a transport's base URL is
+    /// conventionally a directory, and downstream `join`/`abspath`
+    /// calls only work right when the base ends with a slash.
     pub fn clone_concrete(&self, offset: Option<&UrlFragment>) -> Result<Self> {
         let new_base = match offset {
-            Some(o) => self.abspath(o)?,
+            Some(o) => {
+                let mut url = self.abspath(o)?;
+                if !url.path().ends_with('/') {
+                    let mut path = url.path().to_string();
+                    path.push('/');
+                    url.set_path(&path);
+                }
+                url
+            }
             None => self.base.clone(),
         };
         Ok(self.clone_at(new_base))
@@ -247,7 +271,7 @@ impl HttpTransport {
     /// Step the range hint down one rung after a server misbehaves.
     /// Returns false if we've already hit the floor (no ranges) —
     /// caller must surface the error to the user.
-    fn degrade_range_hint(&self) -> bool {
+    pub fn degrade_range_hint(&self) -> bool {
         let mut hint = self.range_hint.lock().unwrap();
         match *hint {
             RangeHint::Multi => {
@@ -260,6 +284,46 @@ impl HttpTransport {
             }
             RangeHint::None => false,
         }
+    }
+
+    /// Current range hint as a short string: `"multi"`, `"single"`,
+    /// or `None`. Matches the values the Python HttpTransport used
+    /// so tests that reach into `_range_hint` continue to work.
+    pub fn range_hint_str(&self) -> Option<&'static str> {
+        match *self.range_hint.lock().unwrap() {
+            RangeHint::Multi => Some("multi"),
+            RangeHint::Single => Some("single"),
+            RangeHint::None => None,
+        }
+    }
+
+    /// Accessor for the shared `HttpClient`. Exposed so the PyO3
+    /// wrapper can pass through `request(...)` with a Python-side
+    /// activity callback without re-resolving the client through
+    /// a second URL parse.
+    pub fn client(&self) -> &Arc<HttpClient> {
+        &self.client
+    }
+
+    /// OPTIONS request: returns the response headers or raises for
+    /// 404 / 403 / 405. Mirrors the Python `_options`.
+    pub fn options(&self, relpath: &UrlFragment) -> Result<Vec<(String, String)>> {
+        let abspath = self.remote_url(relpath)?.to_string();
+        let resp = self.request("OPTIONS", &abspath, &[], &[], false)?;
+        match resp.status {
+            404 => Err(Error::NoSuchFile(Some(abspath))),
+            403 | 405 => Err(Error::InvalidHttpResponse {
+                path: abspath,
+                msg: "OPTIONS not supported or forbidden for remote URL".into(),
+            }),
+            _ => Ok(resp.headers.clone()),
+        }
+    }
+
+    /// HEAD request: returns the raw response so callers can inspect
+    /// headers. Rejects non-200/404 statuses.
+    pub fn head(&self, relpath: &UrlFragment) -> Result<HttpResponse> {
+        self.head_request(relpath)
     }
 }
 
@@ -372,7 +436,9 @@ impl InFile for BufferedBody {
 /// changes between "special" (http/https/etc.) and "non-special"
 /// schemes, so we can't fix this up after-the-fact via
 /// `Url::set_scheme`.
-fn normalise_http_url(base: &str) -> Result<(String, Url)> {
+fn normalise_http_url(
+    base: &str,
+) -> Result<(String, Url, std::collections::BTreeMap<String, String>)> {
     let trimmed = base.trim();
     let scheme_end = trimmed
         .find("://")
@@ -389,13 +455,29 @@ fn normalise_http_url(base: &str) -> Result<(String, Url)> {
     }
     let rest = &trimmed[scheme_end..];
     let canonical = format!("{}{}", unqualified, rest);
-    let with_slash = if canonical.ends_with('/') {
-        canonical
+    // Segment parameters (`,key=value`) appended to the path are a
+    // breezy/dromedary Transport-layer convention (e.g. `,branch=foo`)
+    // that we store separately from the URL proper: they never go on
+    // the wire. Split them off here so the rest of the transport
+    // sees a clean URL.
+    let (base_part, params) = crate::urlutils::split_segment_parameters(&canonical)
+        .map_err(|_| Error::UrlError(url::ParseError::RelativeUrlWithoutBase))?;
+    let base_with_slash = if base_part.ends_with('/') {
+        base_part.to_string()
     } else {
-        format!("{}/", canonical)
+        format!("{}/", base_part)
     };
-    let parsed = Url::parse(&with_slash)?;
-    Ok((unqualified, parsed))
+    // RFC 3986 §6.2.2.2: percent-encoded unreserved characters must be
+    // decoded to their literal form for a URL to be in canonical form.
+    // Apply that here so cloning and abspath round-trip consistently with
+    // paths that came in needlessly-escaped (`%7E` → `~` etc.).
+    let base_with_slash = crate::urlutils::unquote_unreserved(&base_with_slash);
+    let parsed = Url::parse(&base_with_slash)?;
+    let segment_parameters: std::collections::BTreeMap<String, String> = params
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    Ok((unqualified, parsed, segment_parameters))
 }
 
 /// Format a list of (start, length) offsets + optional tail amount
@@ -508,7 +590,10 @@ fn client_err_to_transport_err(err: crate::http::client::ClientError) -> Error {
             msg,
         },
         ClientError::Io(e) => Error::Io(e),
-        ClientError::Transport(e) => Error::Io(std::io::Error::other(e.to_string())),
+        // DNS / TCP / TLS failures — these surface as
+        // `dromedary.errors.ConnectionError` on the Python side so
+        // breezy's retry loop can catch them the way it used to.
+        ClientError::Transport(e) => Error::ConnectionError(e.to_string()),
     }
 }
 
@@ -522,7 +607,21 @@ impl Transport for HttpTransport {
     }
 
     fn base(&self) -> Url {
-        self.base.clone()
+        if self.segment_parameters.is_empty() {
+            return self.base.clone();
+        }
+        let raw = self.base.as_str();
+        let params: std::collections::HashMap<&str, &str> = self
+            .segment_parameters
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        // join_segment_parameters can only fail for malformed inputs
+        // (`=` in key, `,` in value); our params came from set_segment
+        // which pre-validates, so this is infallible in practice.
+        let joined = crate::urlutils::join_segment_parameters(raw, &params)
+            .unwrap_or_else(|_| raw.to_string());
+        Url::parse(&joined).unwrap_or_else(|_| self.base.clone())
     }
 
     fn can_roundtrip_unix_modebits(&self) -> bool {
@@ -546,21 +645,40 @@ impl Transport for HttpTransport {
     }
 
     fn clone(&self, offset: Option<&UrlFragment>) -> Result<Box<dyn Transport>> {
-        let new_base = match offset {
-            Some(o) => self.abspath(o)?,
-            None => self.base.clone(),
-        };
-        Ok(Box::new(self.clone_at(new_base)))
+        Ok(Box::new(self.clone_concrete(offset)?))
     }
 
     fn abspath(&self, relpath: &UrlFragment) -> Result<Url> {
         if relpath.is_empty() || relpath == "." {
             return Ok(self.base.clone());
         }
+        // URLs must be ASCII on the wire. Callers hand us pre-escaped
+        // paths (via urlutils.escape); silently percent-encoding here
+        // would hide bugs where that escape was skipped.
+        if !relpath.is_ascii() {
+            return Err(Error::UrlError(url::ParseError::InvalidDomainCharacter));
+        }
+        // Unescape unreserved characters (RFC 3986: a-z A-Z 0-9 - . _ ~)
+        // that callers sometimes percent-encode needlessly. Keeps
+        // abspath output canonical so clone()s of sibling branches
+        // produce identical-looking base URLs. (lp:842223)
+        let normalised = crate::urlutils::unquote_unreserved(relpath);
         let joined = self
             .base
-            .join(relpath)
+            .join(&normalised)
             .map_err(|_| Error::UrlError(url::ParseError::InvalidDomainCharacter))?;
+        // Match the Python `URL.clone(relpath)` semantics of
+        // dropping a trailing slash from the joined path. Callers
+        // that explicitly want the directory form re-append `/`
+        // themselves (e.g. clone() in the Python subclass).
+        let joined = if joined.path().len() > 1 && joined.path().ends_with('/') {
+            let mut u = joined;
+            let new_path = u.path().trim_end_matches('/').to_string();
+            u.set_path(&new_path);
+            u
+        } else {
+            joined
+        };
         Ok(joined)
     }
 
@@ -603,14 +721,31 @@ impl Transport for HttpTransport {
         )))
     }
 
-    fn set_segment_parameter(&mut self, _key: &str, _value: Option<&str>) -> Result<()> {
-        Err(Error::TransportNotPossible(Some(
-            "http does not support segment parameters".into(),
-        )))
+    fn set_segment_parameter(&mut self, key: &str, value: Option<&str>) -> Result<()> {
+        if key.contains('=') {
+            return Err(Error::UrlError(url::ParseError::InvalidDomainCharacter));
+        }
+        match value {
+            Some(v) => {
+                if v.contains(',') {
+                    return Err(Error::UrlError(url::ParseError::InvalidDomainCharacter));
+                }
+                self.segment_parameters
+                    .insert(key.to_string(), v.to_string());
+            }
+            None => {
+                self.segment_parameters.remove(key);
+            }
+        }
+        Ok(())
     }
 
     fn get_segment_parameters(&self) -> Result<std::collections::HashMap<String, String>> {
-        Ok(std::collections::HashMap::new())
+        Ok(self
+            .segment_parameters
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect())
     }
 
     fn readlink(&self, _relpath: &UrlFragment) -> Result<String> {
@@ -731,6 +866,8 @@ impl Transport for HttpTransport {
     }
 }
 
+impl crate::ConnectedTransport for HttpTransport {}
+
 impl HttpTransport {
     /// Eager `readv` implementation: issue coalesced GET requests,
     /// degrade the range hint on failure, and return the results as
@@ -752,6 +889,11 @@ impl HttpTransport {
 
         let mut remaining = offsets_usize.clone();
         let mut out: Vec<Result<(u64, Vec<u8>)>> = Vec::with_capacity(remaining.len());
+        // The last per-pass error we saw. We prefer to surface the
+        // specific server/IO error once we run out of degradation
+        // rungs — "server misbehaved on range requests" is less
+        // useful than e.g. `InvalidHttpRange` or `ShortReadvError`.
+        let mut last_retry_err: Option<Error> = None;
 
         loop {
             let sorted: Vec<(usize, usize)> = {
@@ -776,16 +918,22 @@ impl HttpTransport {
                     out.extend(pass_out);
                     return out;
                 }
-                Err(ReadvPassError::Retry(new_remaining)) => {
+                Err(ReadvPassError::Retry {
+                    remaining: new_remaining,
+                    cause,
+                }) => {
                     // Server misbehaved; try again with a degraded
                     // range hint.
                     if !self.degrade_range_hint() {
-                        out.push(Err(Error::InvalidHttpResponse {
-                            path: relpath.to_string(),
-                            msg: "server repeatedly misbehaved on range requests".into(),
-                        }));
+                        out.push(Err(cause.or(last_retry_err).unwrap_or_else(|| {
+                            Error::InvalidHttpResponse {
+                                path: relpath.to_string(),
+                                msg: "server repeatedly misbehaved on range requests".into(),
+                            }
+                        })));
                         return out;
                     }
+                    last_retry_err = cause;
                     remaining = new_remaining;
                 }
                 Err(ReadvPassError::Hard(err)) => {
@@ -837,10 +985,15 @@ impl HttpTransport {
 
             let (_code, mut rf) = match self._get(relpath, range_header.as_deref()) {
                 Ok(pair) => pair,
-                Err(Error::InvalidHttpRange { .. })
-                | Err(Error::InvalidHttpResponse { .. })
-                | Err(Error::ShortReadvError(_, _, _, _)) => {
-                    return Err(ReadvPassError::Retry(offsets_order.to_vec()));
+                Err(
+                    e @ (Error::InvalidHttpRange { .. }
+                    | Error::InvalidHttpResponse { .. }
+                    | Error::ShortReadvError(_, _, _, _)),
+                ) => {
+                    return Err(ReadvPassError::Retry {
+                        remaining: offsets_order.to_vec(),
+                        cause: Some(e),
+                    });
                 }
                 Err(other) => return Err(ReadvPassError::Hard(other)),
             };
@@ -850,10 +1003,15 @@ impl HttpTransport {
                     let abs_start = coal_start + sub_offset;
                     let data = match rf.read_at(abs_start as u64, *sub_size) {
                         Ok(d) => d,
-                        Err(Error::ShortReadvError(_, _, _, _))
-                        | Err(Error::InvalidHttpRange { .. })
-                        | Err(Error::InvalidHttpResponse { .. }) => {
-                            return Err(ReadvPassError::Retry(offsets_order.to_vec()));
+                        Err(
+                            e @ (Error::ShortReadvError(_, _, _, _)
+                            | Error::InvalidHttpRange { .. }
+                            | Error::InvalidHttpResponse { .. }),
+                        ) => {
+                            return Err(ReadvPassError::Retry {
+                                remaining: offsets_order.to_vec(),
+                                cause: Some(e),
+                            });
                         }
                         Err(other) => return Err(ReadvPassError::Hard(other)),
                     };
@@ -892,14 +1050,14 @@ mod tests {
 
     #[test]
     fn normalise_http_url_keeps_trailing_slash() {
-        let (scheme, url) = normalise_http_url("http://example.com").unwrap();
+        let (scheme, url, _params) = normalise_http_url("http://example.com").unwrap();
         assert_eq!(scheme, "http");
         assert!(url.as_str().ends_with('/'));
     }
 
     #[test]
     fn normalise_http_url_strips_impl_suffix() {
-        let (scheme, _url) = normalise_http_url("http+urllib://example.com/").unwrap();
+        let (scheme, _url, _params) = normalise_http_url("http+urllib://example.com/").unwrap();
         // The unqualified scheme drops the +urllib qualifier so
         // external_url and remote_url emit the canonical form.
         assert_eq!(scheme, "http");
@@ -984,8 +1142,14 @@ mod tests {
 /// Internal control flow between `readv_eager` and `readv_one_pass`.
 enum ReadvPassError {
     /// Server misbehaved; step the range hint down and try again
-    /// with the given remaining offsets.
-    Retry(Vec<(usize, usize)>),
+    /// with the given remaining offsets. `cause` is the underlying
+    /// error (if any) that triggered the retry — surfaced to the
+    /// caller once the degradation ladder runs out, so the final
+    /// error is specific rather than a generic "server misbehaved".
+    Retry {
+        remaining: Vec<(usize, usize)>,
+        cause: Option<Error>,
+    },
     /// Hard error — surface to the caller.
     Hard(Error),
 }

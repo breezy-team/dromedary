@@ -95,6 +95,11 @@ pub enum Error {
         target: String,
         reason: String,
     },
+
+    /// Network-level failure talking to the server — DNS, TCP,
+    /// TLS handshake — distinct from an `Io` error during a
+    /// successful exchange. Maps to `dromedary.errors.ConnectionError`.
+    ConnectionError(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -594,6 +599,151 @@ pub trait Transport: std::fmt::Debug + 'static + Send + Sync {
     fn local_abspath(&self, relpath: &UrlFragment) -> Result<std::path::PathBuf>;
 
     fn copy(&self, rel_from: &UrlFragment, rel_to: &UrlFragment) -> Result<()>;
+}
+
+/// Transport that connects to a remote server.
+///
+/// Provides a common shape for transports that need to expose their
+/// connection endpoint (host, port, credentials) so higher-level code
+/// can reason about connection sharing — notably
+/// `get_transport_from_url(possible_transports=…)`, which walks existing
+/// transports looking for one that already talks to the same origin.
+///
+/// The default implementations all parse `Transport::base()` via the
+/// `connected_url_*` helpers below, so concrete transports rarely need
+/// to override anything; declaring `impl ConnectedTransport for MyT {}`
+/// is usually enough.
+pub trait ConnectedTransport: Transport {
+    fn scheme(&self) -> String {
+        connected_url_scheme(&self.base())
+    }
+
+    fn host(&self) -> Option<String> {
+        connected_url_host(&self.base())
+    }
+
+    fn port(&self) -> Option<u16> {
+        connected_url_port(&self.base())
+    }
+
+    fn user(&self) -> Option<String> {
+        connected_url_user(&self.base())
+    }
+
+    fn password(&self) -> Option<String> {
+        connected_url_password(&self.base())
+    }
+
+    fn path(&self) -> String {
+        connected_url_path(&self.base())
+    }
+
+    /// Drop any cached connection state. Default no-op — transports
+    /// with an explicit connection handle (SSH sessions, SFTP
+    /// channels) override this to tear it down.
+    fn disconnect(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// URL scheme (`"http"`, `"https"`, `"sftp"`, …).
+pub fn connected_url_scheme(url: &Url) -> String {
+    url.scheme().to_string()
+}
+
+/// Host portion of the URL, or `None` for URLs without a host
+/// component (e.g. `file:///`).
+pub fn connected_url_host(url: &Url) -> Option<String> {
+    url.host_str().map(|s| s.to_string())
+}
+
+/// TCP port if explicitly present in the URL. Callers that want the
+/// default port for the scheme should fall back themselves.
+pub fn connected_url_port(url: &Url) -> Option<u16> {
+    url.port()
+}
+
+/// URL-decoded username, or `None` if the URL has no userinfo.
+pub fn connected_url_user(url: &Url) -> Option<String> {
+    let raw = url.username();
+    if raw.is_empty() {
+        return None;
+    }
+    percent_encoding::percent_decode_str(raw)
+        .decode_utf8()
+        .ok()
+        .map(|s| s.into_owned())
+}
+
+/// URL-decoded password, or `None` if the URL has no password.
+pub fn connected_url_password(url: &Url) -> Option<String> {
+    let raw = url.password()?;
+    percent_encoding::percent_decode_str(raw)
+        .decode_utf8()
+        .ok()
+        .map(|s| s.into_owned())
+}
+
+/// Path portion of the URL (always starts with `/`).
+pub fn connected_url_path(url: &Url) -> String {
+    url.path().to_string()
+}
+
+/// Result of comparing a connected transport's base URL against
+/// another URL. Drives the `_reuse_for` / connection-pooling logic.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReuseMatch {
+    /// `other_base` addresses the same origin and the same path as
+    /// the base URL — callers return `self` unchanged.
+    Same,
+    /// `other_base` addresses the same origin but a different path.
+    /// Callers construct a sibling transport at `other_base` sharing
+    /// this transport's connection state.
+    Sibling,
+    /// Different origin (or unparseable URL). No reuse possible.
+    None,
+}
+
+/// Decide whether a transport at `base` can be reused for
+/// `other_base`. Pure function over URLs so the PyO3 layer and any
+/// pure-Rust caller share the same comparison rules. An unparseable
+/// `other_base` is treated as `None` rather than an error — reuse is
+/// advisory and the caller will construct a fresh transport.
+pub fn classify_reuse_for(base: &Url, other_base: &str) -> ReuseMatch {
+    let other = match Url::parse(other_base) {
+        Ok(u) => u,
+        Err(_) => return ReuseMatch::None,
+    };
+    // Compare against the unqualified form of `other`'s scheme so
+    // `http+urllib://` and `http://` are treated as equivalent for
+    // reuse purposes — they'd produce the same underlying transport.
+    let other_scheme = connected_url_scheme(&other);
+    let other_scheme_unqualified = other_scheme
+        .split_once('+')
+        .map(|(s, _)| s.to_string())
+        .unwrap_or(other_scheme);
+    if connected_url_scheme(base) != other_scheme_unqualified
+        || connected_url_host(base) != connected_url_host(&other)
+        || connected_url_port(base) != connected_url_port(&other)
+        || connected_url_user(base) != connected_url_user(&other)
+    {
+        return ReuseMatch::None;
+    }
+    // Normalise trailing slash so `/foo` and `/foo/` compare equal —
+    // `get_transport_from_url` can see either form from caller input.
+    let ensure_slash = |mut s: String| {
+        if !s.ends_with('/') {
+            s.push('/');
+        }
+        s
+    };
+    let self_path = ensure_slash(base.path().to_string());
+    let other_path = ensure_slash(other.path().to_string());
+    if self_path == other_path {
+        ReuseMatch::Same
+    } else {
+        ReuseMatch::Sibling
+    }
 }
 
 pub fn copy_to<T: Transport + ?Sized>(
