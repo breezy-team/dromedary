@@ -233,6 +233,22 @@ fn auth_cache_key(uri: &Uri) -> AuthCacheKey {
     (scheme, host, port)
 }
 
+/// Extract the userinfo segment from a URL string without parsing
+/// the URL — that way we preserve the distinction between
+/// `http://joe:@host/` (empty password) and `http://joe@host/`
+/// (password absent) that both `http::Uri` and `url::Url`
+/// normalise away. Returns the substring between `://` and `@` if
+/// there is one, else `None`.
+fn extract_userinfo_raw(url: &str) -> Option<String> {
+    let scheme_end = url.find("://")?;
+    let rest = &url[scheme_end + 3..];
+    // Authority ends at the first path/query/fragment char.
+    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..auth_end];
+    let (userinfo, _) = authority.split_once('@')?;
+    Some(userinfo.to_string())
+}
+
 /// Break a proxy URL down into the parts the credential-lookup path
 /// needs. Returns `(scheme, host, port, embedded_creds)`. When the
 /// proxy URL carries a userinfo section (e.g.
@@ -358,12 +374,19 @@ pub trait CredentialProvider: Send + Sync {
     /// Return `(user, password)` for the given `(protocol, host,
     /// port, realm)` if known. `None` for either field means "no
     /// match"; the caller decides whether to prompt interactively.
+    ///
+    /// `user_hint` carries a username the caller already knows
+    /// (typically the userinfo embedded in the request URL:
+    /// `http://joe@host/`). Providers that support prompting use
+    /// this as the default username so the user isn't asked "who
+    /// are you?" when the URL already tells us.
     fn lookup(
         &self,
         protocol: &str,
         host: &str,
         port: Option<u16>,
         realm: Option<&str>,
+        user_hint: Option<&str>,
     ) -> (Option<String>, Option<String>);
 }
 
@@ -378,6 +401,7 @@ impl CredentialProvider for NoCredentialProvider {
         _host: &str,
         _port: Option<u16>,
         _realm: Option<&str>,
+        _user_hint: Option<&str>,
     ) -> (Option<String>, Option<String>) {
         (None, None)
     }
@@ -669,9 +693,12 @@ impl HttpClient {
         let uri: Uri = url
             .parse()
             .map_err(|_| ClientError::InvalidRequest(format!("bad URL: {}", url)))?;
-        // Used only for userinfo extraction on 401 — the wire URL
-        // (`url`) has already had its creds stripped.
-        let origin_uri: Uri = origin_url.parse().unwrap_or_else(|_| uri.clone());
+        // String-wise extract the userinfo from the original URL so
+        // we preserve the distinction between "empty password"
+        // (`joe:@host/`) and "password absent" (`joe@host/`). Both
+        // `http::Uri` and `url::Url` normalise the former to the
+        // latter, which would lose test_empty_pass's signal.
+        let origin_userinfo = extract_userinfo_raw(origin_url);
 
         // Resolve the proxy ahead of time so both the preemptive
         // header attach and the 407 retry can use the same key.
@@ -761,6 +788,7 @@ impl HttpClient {
                 method,
                 url,
                 &uri,
+                None, // proxy userinfo handled via proxy_url, not origin_url
                 headers,
                 body,
                 activity,
@@ -782,14 +810,12 @@ impl HttpClient {
             .into_iter()
             .map(str::to_string)
             .collect();
-        // Pass `origin_uri` (which still has the userinfo, if any)
-        // rather than `uri` (stripped) so the auth picker can
-        // extract URL-embedded credentials for the retry.
         self.retry_with_auth(
             &challenges,
             method,
             url,
-            &origin_uri,
+            &uri,
+            origin_userinfo.as_deref(),
             headers,
             body,
             activity,
@@ -830,6 +856,7 @@ impl HttpClient {
         method: &Method,
         url: &str,
         uri: &Uri,
+        origin_userinfo: Option<&str>,
         headers: &[(String, String)],
         body: &[u8],
         activity: Option<&ActivityCallback>,
@@ -841,7 +868,9 @@ impl HttpClient {
         kind: AuthKind,
     ) -> Result<HttpResponse> {
         let refs: Vec<&str> = challenges.iter().map(String::as_str).collect();
-        let Some((_scheme, new_auth)) = self.pick_auth_scheme_for(&refs, uri, kind, proxy_url) else {
+        let Some((_scheme, new_auth)) =
+            self.pick_auth_scheme_for(&refs, uri, origin_userinfo, kind, proxy_url)
+        else {
             // No scheme we can handle, or no credentials for the
             // ones on offer. Hand the 401/407 back to the caller.
             return Ok(HttpResponse {
@@ -908,7 +937,7 @@ impl HttpClient {
         challenges: &[&str],
         _method: &Method,
     ) -> Option<(&'static str, CachedAuth)> {
-        self.pick_auth_scheme_for(challenges, uri, AuthKind::Origin, "")
+        self.pick_auth_scheme_for(challenges, uri, None, AuthKind::Origin, "")
     }
 
     /// Given the challenges a server sent, pick the scheme we'll
@@ -934,6 +963,7 @@ impl HttpClient {
         &self,
         challenges: &[&str],
         uri: &Uri,
+        origin_userinfo: Option<&str>,
         kind: AuthKind,
         proxy_url: &str,
     ) -> Option<(&'static str, CachedAuth)> {
@@ -964,35 +994,65 @@ impl HttpClient {
         // `all_proxy=http://joe:pw@proxy/` shapes), we prefer those
         // over the CredentialProvider so callers don't have to wire
         // a separate store up for every test scenario.
-        let (protocol, host, port, embedded) = match kind {
-            AuthKind::Origin => {
-                let user_raw = uri.authority().map(http::uri::Authority::as_str).and_then(
-                    |a| a.split_once('@').map(|(userinfo, _)| userinfo),
-                );
-                let embedded = user_raw.and_then(|userinfo| {
-                    let (u, p) = match userinfo.split_once(':') {
-                        Some((u, p)) => (u, p),
-                        None => (userinfo, ""),
-                    };
+        // Extract userinfo into either full credentials (both user and
+        // password present → authoritative) or a user hint (user only
+        // → pass to CredentialProvider so it can look up / prompt for
+        // the password). `test_empty_pass` distinguishes empty password
+        // (`joe:@host`, authoritative) from missing password
+        // (`joe@host`, hint).
+        fn split_userinfo(userinfo: &str) -> (Option<(String, String)>, Option<String>) {
+            match userinfo.split_once(':') {
+                Some((u, p)) => {
                     let user = percent_encoding::percent_decode_str(u)
                         .decode_utf8()
                         .ok()
-                        .map(|s| s.into_owned())?;
+                        .map(|s| s.into_owned());
                     let password = percent_encoding::percent_decode_str(p)
                         .decode_utf8()
                         .ok()
                         .map(|s| s.into_owned())
                         .unwrap_or_default();
-                    Some((user, password))
+                    match user {
+                        Some(u) => (Some((u, password)), None),
+                        None => (None, None),
+                    }
+                }
+                None => {
+                    // User-only, no ':'. Treat as a hint, not creds.
+                    let user = percent_encoding::percent_decode_str(userinfo)
+                        .decode_utf8()
+                        .ok()
+                        .map(|s| s.into_owned());
+                    (None, user)
+                }
+            }
+        }
+        let (protocol, host, port, embedded, user_hint) = match kind {
+            AuthKind::Origin => {
+                // Prefer the raw userinfo string supplied by the
+                // caller if any — it still has the empty-vs-absent
+                // distinction that URI parsers normalise away.
+                // Fall back to the URI's authority otherwise.
+                let user_raw = origin_userinfo.or_else(|| {
+                    uri.authority().map(http::uri::Authority::as_str).and_then(
+                        |a| a.split_once('@').map(|(userinfo, _)| userinfo),
+                    )
                 });
+                let (embedded, user_hint) = user_raw
+                    .map(split_userinfo)
+                    .unwrap_or((None, None));
                 (
                     uri.scheme_str().unwrap_or("http").to_string(),
                     uri.host().unwrap_or_default().to_string(),
                     uri.port_u16(),
                     embedded,
+                    user_hint,
                 )
             }
-            AuthKind::Proxy => proxy_connection_parts(proxy_url),
+            AuthKind::Proxy => {
+                let (s, h, p, e) = proxy_connection_parts(proxy_url);
+                (s, h, p, e, None)
+            }
         };
         let host_str = host.as_str();
         let protocol_str = protocol.as_str();
@@ -1015,6 +1075,7 @@ impl HttpClient {
                         host_str,
                         port,
                         Some(&challenge.realm),
+                        user_hint.as_deref(),
                     ),
                 };
                 let (Some(user), Some(password)) = (user, password) else {
@@ -1045,9 +1106,13 @@ impl HttpClient {
                 .map(|r| r.to_string());
             let (user, password) = match &embedded {
                 Some((u, p)) => (Some(u.clone()), Some(p.clone())),
-                None => self
-                    .credentials
-                    .lookup(protocol_str, host_str, port, realm.as_deref()),
+                None => self.credentials.lookup(
+                    protocol_str,
+                    host_str,
+                    port,
+                    realm.as_deref(),
+                    user_hint.as_deref(),
+                ),
             };
             let (Some(user), Some(password)) = (user, password) else {
                 return None;
@@ -1779,6 +1844,7 @@ mod tests {
             _host: &str,
             _port: Option<u16>,
             _realm: Option<&str>,
+            _user_hint: Option<&str>,
         ) -> (Option<String>, Option<String>) {
             (Some(self.user.into()), Some(self.password.into()))
         }
@@ -1791,6 +1857,7 @@ mod tests {
             _: &str,
             _: &str,
             _: Option<u16>,
+            _: Option<&str>,
             _: Option<&str>,
         ) -> (Option<String>, Option<String>) {
             (None, None)
@@ -1886,6 +1953,7 @@ mod tests {
                 _host: &str,
                 port: Option<u16>,
                 _realm: Option<&str>,
+                _user_hint: Option<&str>,
             ) -> (Option<String>, Option<String>) {
                 *self.0.lock().unwrap() = Some(port);
                 (Some("joe".into()), Some("foo".into()))
@@ -1900,8 +1968,9 @@ mod tests {
                 host: &str,
                 port: Option<u16>,
                 realm: Option<&str>,
+                user_hint: Option<&str>,
             ) -> (Option<String>, Option<String>) {
-                self.0.lookup(protocol, host, port, realm)
+                self.0.lookup(protocol, host, port, realm, user_hint)
             }
         }
         let client = fresh_client(Box::new(Shared(seen.clone())));
@@ -2017,7 +2086,7 @@ mod tests {
         let uri: Uri = "http://example.com/".parse().unwrap();
         let challenges = [r#"Basic realm="proxy""#];
         let got = client
-            .pick_auth_scheme_for(&challenges, &uri, AuthKind::Proxy, "http://proxy:3128")
+            .pick_auth_scheme_for(&challenges, &uri, None, AuthKind::Proxy, "http://proxy:3128")
             .unwrap();
         assert_eq!(got.0, "basic");
         match got.1 {

@@ -48,6 +48,13 @@ enum RangeHint {
 #[derive(Clone)]
 pub struct HttpTransport {
     base: Url,
+    /// The base string as supplied to `new`, used as the authoritative
+    /// source of any URL-embedded userinfo that `url::Url` would
+    /// otherwise normalise away (`http://joe:@host/` → `http://joe@host/`
+    /// loses the empty password `test_empty_pass` distinguishes from
+    /// "password absent"). Contains the full original URL including
+    /// any `+impl` scheme suffix, password, and path.
+    raw_base: String,
     unqualified_scheme: String,
     segment_parameters: std::collections::BTreeMap<String, String>,
     client: Arc<HttpClient>,
@@ -62,6 +69,7 @@ impl HttpTransport {
         let (unqualified_scheme, normalised_base, segment_parameters) = normalise_http_url(base)?;
         Ok(Self {
             base: normalised_base,
+            raw_base: base.to_string(),
             unqualified_scheme,
             segment_parameters,
             client,
@@ -76,6 +84,12 @@ impl HttpTransport {
     /// which did the same via `_raw_base`).
     fn clone_at(&self, new_base: Url) -> Self {
         Self {
+            // The clone's raw_base is the new canonical URL. We lose
+            // the original's literal text (including any empty
+            // password markers), but clones are typically produced
+            // by offsetting from the parent, and credentials in the
+            // URL only matter on the initial construction.
+            raw_base: new_base.to_string(),
             base: new_base,
             unqualified_scheme: self.unqualified_scheme.clone(),
             segment_parameters: std::collections::BTreeMap::new(),
@@ -142,7 +156,7 @@ impl HttpTransport {
             .request_with_origin_url(
                 method,
                 url,
-                self.base.as_str(),
+                &self.raw_base,
                 headers,
                 body,
                 &opts,
