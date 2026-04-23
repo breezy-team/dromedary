@@ -211,6 +211,24 @@ class HttpTransport(_http_rs.HttpTransport):
             for coal in offsets:
                 for sub_off, sub_len in coal.ranges:
                     pairs.append((coal.start + sub_off, sub_len))
+        # Reject zero-length ranges as syntactically invalid — the
+        # server-side form `bytes=start-end` with start > end is
+        # rejected by any conforming HTTP server, and breezy's
+        # test_syntactically_invalid_range_header counts on us
+        # raising InvalidHttpRange locally rather than either
+        # silently succeeding or letting the server surface the
+        # failure with its own error shape.
+        from dromedary.errors import (
+            InvalidHttpRange as _InvalidHttpRange,
+        )
+
+        if any(length <= 0 for _, length in pairs):
+            abspath = self._remote_path(relpath)
+            raise _InvalidHttpRange(
+                abspath,
+                ",".join(f"{s}-{s + l - 1}" for s, l in pairs),
+                "zero-length byte range",
+            )
         if tail_amount:
             # Need the total file length to compute absolute tail
             # offset; use the Rust stat / HEAD helper.
