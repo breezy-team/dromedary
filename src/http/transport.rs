@@ -695,10 +695,20 @@ fn response_err_to_transport_err(err: ResponseError) -> Error {
 fn client_err_to_transport_err(err: crate::http::client::ClientError) -> Error {
     use crate::http::client::ClientError;
     match err {
-        ClientError::InvalidRequest(msg) => Error::InvalidHttpResponse {
-            path: String::new(),
-            msg,
-        },
+        ClientError::InvalidRequest(msg) => {
+            // The client tags messages with `bad URL:` when the
+            // failure is the URL itself (request URL or proxy URL
+            // shape) — those map to InvalidURL on the Python side
+            // rather than the more generic InvalidHttpResponse.
+            if msg.starts_with("bad URL") {
+                Error::UrlError(url::ParseError::RelativeUrlWithoutBase)
+            } else {
+                Error::InvalidHttpResponse {
+                    path: String::new(),
+                    msg,
+                }
+            }
+        }
         ClientError::Io(e) => Error::Io(e),
         ClientError::Transport(e) => {
             // Classify: protocol-level parse errors (bad HTTP

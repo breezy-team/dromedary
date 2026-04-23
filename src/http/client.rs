@@ -1207,6 +1207,22 @@ impl HttpClient {
         let Some(proxy_url) = get_proxy_env_var(&env, scheme, Some("all")) else {
             return Ok(String::new());
         };
+        // Validate the proxy URL has a scheme — `host:port` without
+        // a scheme is a common typo and the Python urllib transport
+        // raised InvalidURL for it. Surfacing the same error here
+        // keeps breezy's `test_http_proxy_without_scheme` happy and
+        // gives users a clearer diagnostic than a downstream TLS or
+        // DNS failure on a malformed URL.
+        //
+        // Tagged with the `bad URL:` prefix the transport layer
+        // recognises and re-maps to `Error::UrlError` (which the
+        // Python side raises as `InvalidURL`).
+        if !proxy_url.contains("://") {
+            return Err(ClientError::InvalidRequest(format!(
+                "bad URL: proxy URL missing scheme: {}",
+                proxy_url
+            )));
+        }
         Ok(proxy_url)
     }
 }
