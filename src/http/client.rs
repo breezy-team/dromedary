@@ -233,6 +233,26 @@ fn auth_cache_key(uri: &Uri) -> AuthCacheKey {
     (scheme, host, port)
 }
 
+/// Remove the `user[:password]@` chunk between scheme and host,
+/// leaving everything else untouched. Used to hand reqwest a
+/// proxy URL without auth so reqwest doesn't auto-attach
+/// Proxy-Authorization — we want our own 407 retry path to
+/// negotiate that, matching urllib's behaviour.
+fn strip_userinfo(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let body_start = scheme_end + 3;
+    let rest = &url[body_start..];
+    // Authority ends at the first path/query/fragment marker.
+    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..auth_end];
+    let Some((_, host)) = authority.split_once('@') else {
+        return url.to_string();
+    };
+    format!("{}{}{}", &url[..body_start], host, &rest[auth_end..])
+}
+
 /// Extract the userinfo segment from a URL string without parsing
 /// the URL — that way we preserve the distinction between
 /// `http://joe:@host/` (empty password) and `http://joe@host/`
@@ -586,26 +606,42 @@ impl HttpClient {
     }
 
     /// Return (cloning if necessary) the client for a given proxy
-    /// URL. The empty string is the "no proxy" key.
+    /// URL. The empty string is the "no proxy" key. Keyed on the
+    /// userinfo-stripped URL so two transports that differ only in
+    /// their embedded proxy creds share a client (and its pool).
     fn client_for_proxy(&self, proxy_url: &str) -> Result<Client> {
+        let cache_key = if proxy_url.is_empty() {
+            String::new()
+        } else {
+            strip_userinfo(proxy_url)
+        };
         {
             let cache = self.clients.lock().unwrap();
-            if let Some(c) = cache.get(proxy_url) {
+            if let Some(c) = cache.get(&cache_key) {
                 return Ok(c.clone());
             }
         }
         let proxy = if proxy_url.is_empty() {
             None
         } else {
-            Some(Proxy::all(proxy_url).map_err(|e| {
-                ClientError::InvalidRequest(format!("bad proxy URL {}: {}", proxy_url, e))
+            // Strip any embedded userinfo before handing the URL to
+            // reqwest — otherwise reqwest auto-attaches a
+            // Proxy-Authorization header on every request, and
+            // breezy's tests count exactly one 407 challenge per
+            // exchange to verify the auth dance happened. We do the
+            // 407 retry ourselves (see `pick_auth_scheme_for` for
+            // AuthKind::Proxy), which extracts the same creds via
+            // `proxy_connection_parts` so the end-to-end behaviour
+            // matches urllib's "challenge-then-retry" shape.
+            Some(Proxy::all(&cache_key).map_err(|e| {
+                ClientError::InvalidRequest(format!("bad proxy URL {}: {}", cache_key, e))
             })?)
         };
         let client = build_client(&self.config, proxy)?;
         self.clients
             .lock()
             .unwrap()
-            .insert(proxy_url.to_string(), client.clone());
+            .insert(cache_key, client.clone());
         Ok(client)
     }
 
@@ -726,32 +762,15 @@ impl HttpClient {
             }
         }
         if !has_explicit_proxy_auth {
-            // Preemptive proxy auth: if the proxy URL embeds
-            // user:password and we haven't cached anything yet, go
-            // ahead and send Basic right away. Matches urllib's
-            // behaviour — saves one round-trip on every request for
-            // the common `all_proxy=http://joe:pw@host/` setup.
-            let cache_had_entry = if let Some(key) = &proxy_key {
-                if let Some(hdr) =
-                    self.attach_cached(&self.proxy_auth_cache, key, method, &uri)
-                {
-                    first_headers.push(("Proxy-Authorization".into(), hdr));
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-            if !cache_had_entry && !proxy_url.is_empty() {
-                let (_scheme, _host, _port, embedded) = proxy_connection_parts(&proxy_url);
-                if let Some((user, password)) = embedded {
-                    let hdr = build_basic_auth_header(&user, &password);
-                    // Cache so subsequent requests skip the parse.
-                    if let Some(key) = &proxy_key {
-                        self.proxy_auth_cache
-                            .put(key.clone(), CachedAuth::Basic { user, password });
-                    }
+            // Attach previously-cached proxy auth (after a successful
+            // 407 challenge cycle) but don't preemptively send creds
+            // extracted from the proxy URL — breezy's tests count
+            // exactly one 407 per request to verify the auth dance
+            // happened. Embedded proxy creds are picked up on the
+            // 407 retry path via `proxy_connection_parts` in
+            // `pick_auth_scheme_for`.
+            if let Some(key) = &proxy_key {
+                if let Some(hdr) = self.attach_cached(&self.proxy_auth_cache, key, method, &uri) {
                     first_headers.push(("Proxy-Authorization".into(), hdr));
                 }
             }
