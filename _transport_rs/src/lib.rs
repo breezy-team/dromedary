@@ -105,28 +105,26 @@ impl ConnectedTransport {
         Ok(url.unbind())
     }
 
-    /// Shared-connection handle. Breezy's `transport/remote.py`
-    /// compares `_get_connection()` results across clones to decide
-    /// whether two transports can share a smart-medium. We use the
-    /// Python-visible identity of the underlying
-    /// `_transport_rs.http.HttpTransport.inner` tuple as a proxy
-    /// for "same underlying client" — callers only compare for
-    /// equality, they don't inspect the value.
-    ///
-    /// Returns the transport itself: two sibling clones of the
-    /// same base transport share state via `Arc<HttpClient>`, and
-    /// comparing `self._get_connection() == other._get_connection()`
-    /// on two Python instances that shared a `_from_transport`
-    /// source will yield True because the Rust pyclass internals
-    /// are the same object reference. Good enough for breezy's use
-    /// case: distinguishing "same pool" from "different host".
+    /// Shared-connection handle. Breezy compares
+    /// `_get_connection()` results across clones to decide whether
+    /// two transports share an underlying connection. We can't
+    /// expose the Rust `Arc<HttpClient>` identity directly across
+    /// the FFI boundary, so we use the next best signal: the
+    /// `(scheme, host, port)` tuple. Two transports with the same
+    /// origin share the same `HttpClient` pool entry and from
+    /// breezy's perspective are "the same connection"; transports
+    /// at different paths under the same origin (e.g. after a
+    /// redirect from `/foo/` to `/foo/subdir/`) are also "the same
+    /// connection" and should compare equal here.
     fn _get_connection<'py>(slf: PyRef<'py, Self>, py: Python<'py>) -> PyResult<Py<PyAny>> {
-        // Return the base URL string — two transports that share a
-        // client will have the same base URL in the common case;
-        // for the distinct-but-same-connection case breezy's tests
-        // use clones that preserve base, so this holds.
-        let base = slf.as_super().0.base().to_string();
-        Ok(pyo3::types::PyString::new(py, &base).into())
+        let base = slf.as_super().0.base();
+        let key = format!(
+            "{}://{}:{}",
+            base.scheme(),
+            base.host_str().unwrap_or(""),
+            base.port_or_known_default().unwrap_or(0),
+        );
+        Ok(pyo3::types::PyString::new(py, &key).into())
     }
 
     /// Default `disconnect` — a no-op. Concrete transports with an
