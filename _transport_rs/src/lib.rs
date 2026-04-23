@@ -9,6 +9,7 @@ use pyo3_filelike::PyBinaryFile;
 use std::collections::HashMap;
 use std::fs::Permissions;
 use std::io::{BufRead, BufReader, Read, Seek, Write};
+use std::sync::Mutex;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -41,6 +42,63 @@ import_exception!(dromedary.urlutils, InvalidURL);
 
 #[pyclass(subclass)]
 pub(crate) struct Transport(pub(crate) Box<dyn TransportTrait>);
+
+/// Python-visible iterator wrapping the Rust-side `readv` iterator.
+///
+/// Holds a strong reference to the parent Transport pyclass
+/// (`Py<Transport>`) so the `'static`-transmuted inner iterator
+/// never outlives the transport it borrows from. Each `__next__`
+/// pulls one element from the Rust iterator under `py.detach` so
+/// HTTP calls in the iterator body can block without holding the
+/// GIL — the in-process Python test HTTP server lives in another
+/// thread and needs the GIL to serve requests.
+#[pyclass]
+pub(crate) struct ReadvIter {
+    /// Keeps the underlying Transport (and therefore the `dyn
+    /// TransportTrait` + client state the iterator closed over)
+    /// alive for as long as the iterator is live. Python holds a
+    /// strong reference via this `Py`.
+    #[allow(dead_code)]
+    parent: Py<Transport>,
+    /// The Rust iterator. `Option` so `__next__` can hand out the
+    /// final `None` cleanly and drop the iterator early if a
+    /// caller leaks the iterator pyclass. `Mutex` because PyO3's
+    /// `#[pymethods]` takes `&self`, but iterator advancement
+    /// needs mutation.
+    iter: Mutex<
+        Option<Box<dyn Iterator<Item = Result<(u64, Vec<u8>), dromedary::Error>> + Send>>,
+    >,
+    /// Path string used for error-mapping; carried alongside the
+    /// iterator for easy access on `__next__`'s Err path.
+    path: String,
+}
+
+#[pymethods]
+impl ReadvIter {
+    fn __iter__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
+    fn __next__<'py>(&self, py: Python<'py>) -> PyResult<Option<(u64, Bound<'py, PyBytes>)>> {
+        let result = py.detach(|| {
+            let mut guard = self.iter.lock().unwrap();
+            guard.as_mut().and_then(|it| it.next())
+        });
+        match result {
+            None => {
+                // Drop the iterator so cached HTTP state releases
+                // as soon as the caller stops consuming.
+                *self.iter.lock().unwrap() = None;
+                Ok(None)
+            }
+            Some(Err(e)) => {
+                *self.iter.lock().unwrap() = None;
+                Err(map_transport_err_to_py_err(e, None, Some(&self.path)))
+            }
+            Some(Ok((offset, data))) => Ok(Some((offset, PyBytes::new(py, &data)))),
+        }
+    }
+}
 
 /// Python-visible base class for Rust-backed transports that talk to
 /// a remote server. Mirrors `dromedary.ConnectedTransport` on the
@@ -891,30 +949,43 @@ impl Transport {
 
     #[pyo3(signature = (path, offsets, adjust_for_latency=None, upper_limit=None))]
     fn readv<'a>(
-        &self,
+        slf: PyRef<'a, Self>,
         py: Python<'a>,
-        path: &str,
+        path: String,
         offsets: Vec<(u64, usize)>,
         adjust_for_latency: Option<bool>,
         upper_limit: Option<u64>,
-    ) -> PyResult<Bound<'a, PyIterator>> {
-        let t = &self.0;
-        let buffered = py
-            .detach(|| {
-                t.readv(
-                    path,
-                    offsets,
-                    adjust_for_latency.unwrap_or(false),
-                    upper_limit,
-                )
-            })
-            .map(|r| {
-                r.map_err(|e| map_transport_err_to_py_err(e, None, Some(path)))
-                    .map(|(o, r)| (o, PyBytes::new(py, &r)))
-            })
-            .collect::<PyResult<Vec<(u64, Bound<PyBytes>)>>>()?;
-        let list = PyList::new(py, &buffered)?;
-        PyIterator::from_object(&list)
+    ) -> PyResult<Py<ReadvIter>> {
+        // Construct the Rust iterator up front — that step only
+        // does coalescing, no HTTP, so running it with the GIL
+        // held is fine. The returned iterator borrows the
+        // transport's `dyn TransportTrait` but our HttpTransport
+        // readv constructs a LazyReadv that owns its state (no
+        // borrow of `self`); promote to `'static` via transmute
+        // and keep the parent transport alive via a Python
+        // reference held inside `ReadvIter`. Subsequent `__next__`
+        // calls then pull elements under `py.detach` so blocking
+        // HTTP work doesn't hold the GIL.
+        let boxed: Box<dyn Iterator<Item = _> + Send + '_> = slf.0.readv(
+            &path,
+            offsets,
+            adjust_for_latency.unwrap_or(false),
+            upper_limit,
+        );
+        let iter: Box<dyn Iterator<Item = Result<(u64, Vec<u8>), dromedary::Error>> + Send> = unsafe {
+            std::mem::transmute::<
+                Box<dyn Iterator<Item = _> + Send + '_>,
+                Box<dyn Iterator<Item = _> + Send + 'static>,
+            >(boxed)
+        };
+        Py::new(
+            py,
+            ReadvIter {
+                parent: slf.into_pyobject(py)?.unbind(),
+                iter: Mutex::new(Some(iter)),
+                path,
+            },
+        )
     }
 
     fn listable(&self, py: Python) -> bool {
@@ -1481,6 +1552,7 @@ mod webdav;
 fn _transport_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<Transport>()?;
     m.add_class::<ConnectedTransport>()?;
+    m.add_class::<ReadvIter>()?;
     m.add_class::<TransportDecorator>()?;
     let localm = PyModule::new(py, "local")?;
     localm.add_class::<LocalTransport>()?;
