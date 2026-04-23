@@ -190,15 +190,7 @@ impl HttpTransport {
         };
         let resp = self
             .client
-            .request_with_origin_url(
-                method,
-                url,
-                &self.raw_base,
-                headers,
-                body,
-                &opts,
-                None,
-            )
+            .request_with_origin_url(method, url, &self.raw_base, headers, body, &opts, None)
             .map_err(client_err_to_transport_err)?;
 
         let code = resp.status;
@@ -741,8 +733,7 @@ fn client_err_to_transport_err(err: crate::http::client::ClientError) -> Error {
 /// `is_parse_status` / `is_parse_too_large` are the authoritative
 /// classifiers.
 fn is_http_parse_error(err: &reqwest::Error) -> bool {
-    let mut source: Option<&(dyn std::error::Error + 'static)> =
-        std::error::Error::source(err);
+    let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(err);
     while let Some(cause) = source {
         if let Some(hyper_err) = cause.downcast_ref::<hyper::Error>() {
             // `is_parse()` is the general "we couldn't decode this
@@ -1671,11 +1662,7 @@ struct LazyReadv {
 }
 
 impl LazyReadv {
-    fn new(
-        transport: HttpTransport,
-        relpath: String,
-        offsets: Vec<(u64, usize)>,
-    ) -> Self {
+    fn new(transport: HttpTransport, relpath: String, offsets: Vec<(u64, usize)>) -> Self {
         let offsets_usize: Vec<(usize, usize)> =
             offsets.iter().map(|(o, s)| (*o as usize, *s)).collect();
         let sorted: Vec<(usize, usize)> = {
@@ -1783,11 +1770,8 @@ impl LazyReadv {
     /// need the full degrade-and-retry loop which is too invasive
     /// to replicate here.
     fn fall_back_to_eager(&mut self, _cause: Option<Error>) {
-        let remaining: Vec<(u64, usize)> = self
-            .pending
-            .iter()
-            .map(|(o, s)| (*o as u64, *s))
-            .collect();
+        let remaining: Vec<(u64, usize)> =
+            self.pending.iter().map(|(o, s)| (*o as u64, *s)).collect();
         self.pending.clear();
         self.batches.clear();
         self.exhausted = true;

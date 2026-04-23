@@ -9,10 +9,10 @@ use pyo3_filelike::PyBinaryFile;
 use std::collections::HashMap;
 use std::fs::Permissions;
 use std::io::{BufRead, BufReader, Read, Seek, Write};
-use std::sync::Mutex;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use url::Url;
 
 import_exception!(dromedary.errors, TransportError);
@@ -65,9 +65,7 @@ pub(crate) struct ReadvIter {
     /// caller leaks the iterator pyclass. `Mutex` because PyO3's
     /// `#[pymethods]` takes `&self`, but iterator advancement
     /// needs mutation.
-    iter: Mutex<
-        Option<Box<dyn Iterator<Item = Result<(u64, Vec<u8>), dromedary::Error>> + Send>>,
-    >,
+    iter: Mutex<Option<Box<dyn Iterator<Item = Result<(u64, Vec<u8>), dromedary::Error>> + Send>>>,
     /// Path string used for error-mapping; carried alongside the
     /// iterator for easy access on `__next__`'s Err path.
     path: String,

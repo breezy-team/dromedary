@@ -61,6 +61,7 @@ pub(super) fn invoke_credential_lookup(
     port: Option<u16>,
     realm: Option<&str>,
     user: Option<&str>,
+    is_proxy: bool,
 ) -> (Option<String>, Option<String>) {
     Python::attach(|py| {
         let cb = {
@@ -72,23 +73,33 @@ pub(super) fn invoke_credential_lookup(
         };
         let kwargs = pyo3::types::PyDict::new(py);
         // The Python callback signature is
-        // `(protocol, host, port=None, path=None, realm=None, user=None)`;
+        // `(protocol, host, port=None, path=None, realm=None, user=None,
+        //   is_proxy=False)`;
         // we leave `path` as None because the Rust client doesn't track
         // it per-request (breezy's urllib version did, but the value was
         // rarely used by downstream credential stores). `user` is the
         // URL-embedded username hint — breezy's AuthenticationConfig
         // uses it to skip its own user prompt when the URL already
-        // names one.
+        // names one. `is_proxy` tells the callback that the credentials
+        // are for a proxy (407) rather than the origin (401), so it can
+        // label interactive prompts accordingly.
         let _ = kwargs.set_item("port", port);
         let _ = kwargs.set_item("path", py.None());
         let _ = kwargs.set_item("realm", realm);
         if let Some(u) = user {
             let _ = kwargs.set_item("user", u);
         }
+        if is_proxy {
+            let _ = kwargs.set_item("is_proxy", true);
+        }
         let mut result = cb.bind(py).call((protocol, host), Some(&kwargs));
-        // Older callbacks may not accept the `user` kwarg. If that's
-        // the cause of a TypeError, retry without it so we don't
-        // regress on callers that haven't been updated.
+        // Older callbacks may not accept the `user` / `is_proxy` kwargs.
+        // If that's the cause of a TypeError, drop them progressively so
+        // we don't regress on callers that haven't been updated.
+        if result.is_err() && is_proxy {
+            let _ = kwargs.del_item("is_proxy");
+            result = cb.bind(py).call((protocol, host), Some(&kwargs));
+        }
         if result.is_err() && user.is_some() {
             let _ = kwargs.del_item("user");
             result = cb.bind(py).call((protocol, host), Some(&kwargs));

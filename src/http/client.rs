@@ -270,43 +270,71 @@ fn extract_userinfo_raw(url: &str) -> Option<String> {
 }
 
 /// Break a proxy URL down into the parts the credential-lookup path
-/// needs. Returns `(scheme, host, port, embedded_creds)`. When the
-/// proxy URL carries a userinfo section (e.g.
-/// `http://joe:pw@proxy:3128/`) we lift those out so the 407 retry
-/// can send them as Proxy-Authorization without consulting the
+/// needs. Returns `(scheme, host, port, embedded_creds, user_hint)`.
+///
+/// When the proxy URL carries a complete userinfo section with
+/// password (`http://joe:pw@proxy/` or the empty-password form
+/// `http://joe:@proxy/`) we lift those out so the 407 retry can
+/// send them as Proxy-Authorization without consulting the
 /// CredentialProvider — matching urllib's behaviour where an
 /// embedded user/password on the proxy URL was authoritative.
+///
+/// When the URL carries a user but no `:` separator
+/// (`http://joe@proxy/`), that's a hint: we still need the
+/// CredentialProvider to supply the password, but we want it to
+/// skip its own user lookup/prompt and use `joe` as the default.
 fn proxy_connection_parts(
     proxy_url: &str,
-) -> (String, String, Option<u16>, Option<(String, String)>) {
+) -> (
+    String,
+    String,
+    Option<u16>,
+    Option<(String, String)>,
+    Option<String>,
+) {
     let parsed = match Url::parse(proxy_url) {
         Ok(u) => u,
-        Err(_) => return (String::new(), String::new(), None, None),
+        Err(_) => return (String::new(), String::new(), None, None, None),
     };
     let scheme = parsed.scheme().to_string();
     let host = parsed.host_str().unwrap_or("").to_string();
     let port = parsed.port();
-    let user = parsed.username();
-    let embedded = if user.is_empty() {
-        None
-    } else {
-        let user = percent_encoding::percent_decode_str(user)
-            .decode_utf8()
-            .ok()
-            .map(|s| s.into_owned())
-            .unwrap_or_default();
-        let password = parsed
-            .password()
-            .and_then(|p| {
-                percent_encoding::percent_decode_str(p)
-                    .decode_utf8()
-                    .ok()
-                    .map(|s| s.into_owned())
-            })
-            .unwrap_or_default();
-        Some((user, password))
-    };
-    (scheme, host, port, embedded)
+    // url::Url strips the empty-password form (`joe:@proxy/` parses
+    // as `password=None`, indistinguishable from `joe@proxy/`). Parse
+    // the userinfo ourselves to keep the two shapes apart, matching
+    // what the origin-side `extract_userinfo_raw` + `split_userinfo`
+    // flow does — `joe:@` is authoritative empty-password creds,
+    // `joe@` is a hint requiring a password lookup.
+    let (embedded, user_hint) = extract_userinfo_raw(proxy_url)
+        .map(|raw| {
+            match raw.split_once(':') {
+                Some((u, p)) => {
+                    let user = percent_encoding::percent_decode_str(u)
+                        .decode_utf8()
+                        .ok()
+                        .map(|s| s.into_owned());
+                    let password = percent_encoding::percent_decode_str(p)
+                        .decode_utf8()
+                        .ok()
+                        .map(|s| s.into_owned())
+                        .unwrap_or_default();
+                    match user {
+                        Some(u) => (Some((u, password)), None),
+                        None => (None, None),
+                    }
+                }
+                None => {
+                    // user-only, no ':' — treat as hint.
+                    let user = percent_encoding::percent_decode_str(&raw)
+                        .decode_utf8()
+                        .ok()
+                        .map(|s| s.into_owned());
+                    (None, user)
+                }
+            }
+        })
+        .unwrap_or((None, None));
+    (scheme, host, port, embedded, user_hint)
 }
 
 /// Key under which proxy auth is cached. Proxy credentials bind to
@@ -400,6 +428,11 @@ pub trait CredentialProvider: Send + Sync {
     /// `http://joe@host/`). Providers that support prompting use
     /// this as the default username so the user isn't asked "who
     /// are you?" when the URL already tells us.
+    ///
+    /// `is_proxy` is true when the credentials are for a proxy
+    /// (407 response) rather than the origin server (401). Providers
+    /// that prompt interactively use it to label the prompt ("Proxy
+    /// HTTP …" vs "HTTP …").
     fn lookup(
         &self,
         protocol: &str,
@@ -407,6 +440,7 @@ pub trait CredentialProvider: Send + Sync {
         port: Option<u16>,
         realm: Option<&str>,
         user_hint: Option<&str>,
+        is_proxy: bool,
     ) -> (Option<String>, Option<String>);
 }
 
@@ -422,6 +456,7 @@ impl CredentialProvider for NoCredentialProvider {
         _port: Option<u16>,
         _realm: Option<&str>,
         _user_hint: Option<&str>,
+        _is_proxy: bool,
     ) -> (Option<String>, Option<String>) {
         (None, None)
     }
@@ -1053,13 +1088,11 @@ impl HttpClient {
                 // distinction that URI parsers normalise away.
                 // Fall back to the URI's authority otherwise.
                 let user_raw = origin_userinfo.or_else(|| {
-                    uri.authority().map(http::uri::Authority::as_str).and_then(
-                        |a| a.split_once('@').map(|(userinfo, _)| userinfo),
-                    )
+                    uri.authority()
+                        .map(http::uri::Authority::as_str)
+                        .and_then(|a| a.split_once('@').map(|(userinfo, _)| userinfo))
                 });
-                let (embedded, user_hint) = user_raw
-                    .map(split_userinfo)
-                    .unwrap_or((None, None));
+                let (embedded, user_hint) = user_raw.map(split_userinfo).unwrap_or((None, None));
                 (
                     uri.scheme_str().unwrap_or("http").to_string(),
                     uri.host().unwrap_or_default().to_string(),
@@ -1068,10 +1101,7 @@ impl HttpClient {
                     user_hint,
                 )
             }
-            AuthKind::Proxy => {
-                let (s, h, p, e) = proxy_connection_parts(proxy_url);
-                (s, h, p, e, None)
-            }
+            AuthKind::Proxy => proxy_connection_parts(proxy_url),
         };
         let host_str = host.as_str();
         let protocol_str = protocol.as_str();
@@ -1095,6 +1125,7 @@ impl HttpClient {
                         port,
                         Some(&challenge.realm),
                         user_hint.as_deref(),
+                        kind == AuthKind::Proxy,
                     ),
                 };
                 let (Some(user), Some(password)) = (user, password) else {
@@ -1131,6 +1162,7 @@ impl HttpClient {
                     port,
                     realm.as_deref(),
                     user_hint.as_deref(),
+                    kind == AuthKind::Proxy,
                 ),
             };
             let (Some(user), Some(password)) = (user, password) else {
@@ -1880,6 +1912,7 @@ mod tests {
             _port: Option<u16>,
             _realm: Option<&str>,
             _user_hint: Option<&str>,
+            _is_proxy: bool,
         ) -> (Option<String>, Option<String>) {
             (Some(self.user.into()), Some(self.password.into()))
         }
@@ -1894,6 +1927,7 @@ mod tests {
             _: Option<u16>,
             _: Option<&str>,
             _: Option<&str>,
+            _: bool,
         ) -> (Option<String>, Option<String>) {
             (None, None)
         }
@@ -1989,6 +2023,7 @@ mod tests {
                 port: Option<u16>,
                 _realm: Option<&str>,
                 _user_hint: Option<&str>,
+                _is_proxy: bool,
             ) -> (Option<String>, Option<String>) {
                 *self.0.lock().unwrap() = Some(port);
                 (Some("joe".into()), Some("foo".into()))
@@ -2004,8 +2039,10 @@ mod tests {
                 port: Option<u16>,
                 realm: Option<&str>,
                 user_hint: Option<&str>,
+                is_proxy: bool,
             ) -> (Option<String>, Option<String>) {
-                self.0.lookup(protocol, host, port, realm, user_hint)
+                self.0
+                    .lookup(protocol, host, port, realm, user_hint, is_proxy)
             }
         }
         let client = fresh_client(Box::new(Shared(seen.clone())));
@@ -2121,7 +2158,13 @@ mod tests {
         let uri: Uri = "http://example.com/".parse().unwrap();
         let challenges = [r#"Basic realm="proxy""#];
         let got = client
-            .pick_auth_scheme_for(&challenges, &uri, None, AuthKind::Proxy, "http://proxy:3128")
+            .pick_auth_scheme_for(
+                &challenges,
+                &uri,
+                None,
+                AuthKind::Proxy,
+                "http://proxy:3128",
+            )
             .unwrap();
         assert_eq!(got.0, "basic");
         match got.1 {

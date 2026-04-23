@@ -63,8 +63,9 @@ impl CredentialProvider for PythonCredentialProvider {
         port: Option<u16>,
         realm: Option<&str>,
         user_hint: Option<&str>,
+        is_proxy: bool,
     ) -> (Option<String>, Option<String>) {
-        super::invoke_credential_lookup(protocol, host, port, realm, user_hint)
+        super::invoke_credential_lookup(protocol, host, port, realm, user_hint, is_proxy)
     }
 }
 
