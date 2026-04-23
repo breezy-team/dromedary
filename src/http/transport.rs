@@ -602,7 +602,24 @@ fn format_range_header(offsets: &[(usize, usize)], tail_amount: usize) -> String
 /// boundary or single-range window.
 fn wrap_response_body(url: String, mut resp: HttpResponse) -> Result<(u16, HttpRangeFile)> {
     let status = resp.status;
-    let body = resp.read(None).map_err(Error::Io)?;
+    let body = resp.read(None).map_err(|e| {
+        // Truncated response bodies (server promises Content-Length N
+        // but closes the socket before sending N bytes) surface here
+        // as an io::Error wrapping a hyper::Error whose
+        // `is_incomplete_message()` is true. That's the same signal
+        // breezy's "short readv" retry path keys off, so route it
+        // through `InvalidHttpResponse` instead of leaking as a
+        // generic `OSError` — otherwise the readv eager/retry loop
+        // treats it as a hard failure and gives up.
+        if is_io_hyper_parse_error(&e) {
+            Error::InvalidHttpResponse {
+                path: url.clone(),
+                msg: e.to_string(),
+            }
+        } else {
+            Error::Io(e)
+        }
+    })?;
     if status == 200 {
         // Plain whole-file response: skip handle_response and build
         // a RangeFile directly so we don't need to thread the body
@@ -727,28 +744,75 @@ fn client_err_to_transport_err(err: crate::http::client::ClientError) -> Error {
     }
 }
 
-/// Walk a `reqwest::Error`'s cause chain looking for a
-/// `hyper::Error` and ask it whether this was a protocol-level
-/// parse failure. No string-matching: `hyper::Error::is_parse` /
-/// `is_parse_status` / `is_parse_too_large` are the authoritative
-/// classifiers.
-fn is_http_parse_error(err: &reqwest::Error) -> bool {
-    let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(err);
-    while let Some(cause) = source {
+/// Walk an error source chain looking for a `hyper::Error` and
+/// ask it whether this was a protocol-level parse failure. No
+/// string-matching: `hyper::Error::is_parse` / `is_parse_status` /
+/// `is_incomplete_message` are the authoritative classifiers.
+///
+/// Used for both `reqwest::Error` (handshake / request-send
+/// failures) and `std::io::Error` (body-read failures where
+/// reqwest wraps the hyper error in an io::Error) — both surface
+/// the hyper error via their source chain.
+fn is_hyper_parse_chain(start: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(start);
+    while let Some(cause) = cur {
         if let Some(hyper_err) = cause.downcast_ref::<hyper::Error>() {
             // `is_parse()` is the general "we couldn't decode this
             // as HTTP" check; `is_parse_status()` covers specifically
             // bad status lines (which `is_parse` also catches —
             // included for clarity). `is_incomplete_message()` is
             // the truncated-framing case breezy's BadProtocol tests
-            // also exercise.
+            // also exercise, and the same signal truncated response
+            // bodies raise.
             return hyper_err.is_parse()
                 || hyper_err.is_parse_status()
                 || hyper_err.is_incomplete_message();
         }
-        source = cause.source();
+        cur = cause.source();
     }
     false
+}
+
+/// Classifier for `reqwest::Error` — walks the error's own source
+/// chain. Start after the error (skipping `err` itself) because
+/// `reqwest::Error::source()` is the thing carrying the real cause.
+fn is_http_parse_error(err: &reqwest::Error) -> bool {
+    match std::error::Error::source(err) {
+        Some(s) => is_hyper_parse_chain(s),
+        None => false,
+    }
+}
+
+/// Classifier for `std::io::Error` raised while reading a response
+/// body. When the server advertises `Content-Length: N` but closes
+/// the socket early, reqwest surfaces an io::Error whose cause
+/// chain ends in an inner `io::Error` of kind `UnexpectedEof`.
+/// That's the truncated-body signal — bubble it up as a parse
+/// error so the readv retry loop can degrade and retry instead of
+/// treating it as a hard failure.
+fn is_io_hyper_parse_error(err: &std::io::Error) -> bool {
+    // Top-level kind first (best if reqwest ever surfaces kind
+    // directly).
+    if err.kind() == std::io::ErrorKind::UnexpectedEof {
+        return true;
+    }
+    let Some(inner) = err.get_ref() else {
+        return false;
+    };
+    // Dig for the innermost io::Error and check its kind, too —
+    // that's where the IncompleteBody marker ends up.
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(inner);
+    while let Some(cause) = cur {
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+            if io_err.kind() == std::io::ErrorKind::UnexpectedEof {
+                return true;
+            }
+        }
+        cur = cause.source();
+    }
+    // Fall back to the hyper-typed classifier in case the truncation
+    // shape is one of the parse-layer variants.
+    is_hyper_parse_chain(inner)
 }
 
 impl Transport for HttpTransport {
