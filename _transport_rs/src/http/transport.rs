@@ -141,11 +141,22 @@ impl HttpTransport {
         source: PyRef<Self>,
         offset: Option<&str>,
     ) -> PyResult<()> {
-        let cloned = source
-            .inner
-            .clone_concrete(offset)
-            .map_err(|e| map_transport_err_to_py_err(e, None, offset))?;
-        let new_inner = Arc::new(cloned);
+        // When no offset is supplied, take the source's inner
+        // directly rather than cloning — clone_concrete's
+        // (deliberate) segment-parameter and raw_base stripping
+        // loses information that matters for ``__init__``-time
+        // TLS-config rebuilds (see
+        // ``dromedary.http.urllib.HttpTransport.__init__``).
+        let new_inner = match offset {
+            None => source.inner.clone(),
+            Some(_) => {
+                let cloned = source
+                    .inner
+                    .clone_concrete(offset)
+                    .map_err(|e| map_transport_err_to_py_err(e, None, offset))?;
+                Arc::new(cloned)
+            }
+        };
         // Replace the base Transport(Box<dyn Transport>) too so
         // calls routed through the dyn vtable see the cloned state.
         let base_box: Box<dyn dromedary::Transport> = Box::new(Clone::clone(&*new_inner));

@@ -52,32 +52,25 @@ class HttpTransport(_http_rs.HttpTransport):
     def __new__(cls, base, _from_transport=None, ca_certs=None):
         """Build the Rust transport.
 
+        We defer TLS-related knobs (``ca_certs``) to ``__init__``
+        because breezy test subclasses add the ``ca_certs`` argument
+        in their own ``__init__`` and call ``super().__init__(...,
+        ca_certs=...)`` — which only sees the argument after
+        ``__new__`` has already run. Keep ``__new__`` doing the
+        bare-minimum base-URL setup; ``__init__`` rebuilds the
+        underlying client when ``ca_certs`` finally arrives.
+
         When ``_from_transport`` is supplied we construct a fresh
         Rust instance at ``base`` and then graft the source's
         HttpClient / auth cache / range hint onto it via
         ``_rust_replace_inner_from`` — so clones share all the
         per-client state without losing the Python subclass identity.
         """
-        if ca_certs is None:
-            import dromedary.http as _mod_http
-
-            configured = _mod_http.ssl_ca_certs()
-            if configured:
-                ca_certs = configured
-
-        import ssl as _ssl
-
-        import dromedary.http as _mod_http
-
-        disable_verification = _mod_http.ssl_cert_reqs() == _ssl.CERT_NONE
-        if disable_verification:
-            ca_certs = None
-
         self = super().__new__(
             cls,
             base,
-            ca_certs=ca_certs,
-            disable_verification=disable_verification,
+            ca_certs=None,
+            disable_verification=False,
             user_agent=_default_user_agent(),
         )
         if _from_transport is not None:
@@ -88,10 +81,49 @@ class HttpTransport(_http_rs.HttpTransport):
         return self
 
     def __init__(self, base, _from_transport=None, ca_certs=None):
-        """Initialise Python-side state; Rust ``__new__`` owns transport state."""
-        # The only Python-side attribute is the _medium slot filled in
-        # by breezy when get_smart_medium() is first called.
+        """Initialise Python-side state and TLS-configured inner client.
+
+        Rust ``__new__`` populates the base-URL state with a minimal
+        default client. TLS knobs take effect here so subclasses that
+        override ``__init__`` and call ``super().__init__(..., ca_certs=...)``
+        pick up correctly — otherwise the certs would arrive after the
+        underlying client was built with the wrong ones. We rebuild the
+        whole inner state (fresh HttpClient with the right TLS config)
+        and graft it in.
+        """
         self._medium = None
+        if _from_transport is None:
+            import ssl as _ssl
+            import dromedary.http as _mod_http
+
+            if ca_certs is None:
+                configured = _mod_http.ssl_ca_certs()
+                if configured:
+                    ca_certs = configured
+            disable_verification = _mod_http.ssl_cert_reqs() == _ssl.CERT_NONE
+            if disable_verification:
+                ca_certs = None
+            # Build a fresh Rust transport with the right TLS
+            # config, then swap our inner state with it. Creating
+            # a new HttpTransport via the pyclass constructor is
+            # the simplest way to get the config plumbed all the
+            # way down to the reqwest Client — there's no single
+            # setter that re-derives everything.
+            from dromedary._transport_rs.http import (
+                HttpTransport as _RsHttpTransport,
+            )
+
+            fresh = _RsHttpTransport(
+                base,
+                ca_certs=ca_certs,
+                disable_verification=disable_verification,
+                user_agent=_default_user_agent(),
+            )
+            # ``offset=None`` lets ``_rust_replace_inner_from``
+            # share ``fresh``'s inner directly, preserving raw_base
+            # (empty-password URL shape) and segment parameters that
+            # ``clone_concrete(None)`` would otherwise strip.
+            self._rust_replace_inner_from(fresh, None)
         # Wire an activity callback into the Rust transport so
         # internal get/has/post/readv calls feed breezy's progress
         # UI too, not just the explicit ``.request()`` path. We use
