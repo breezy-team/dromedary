@@ -94,8 +94,22 @@ class HttpTransport(_http_rs.HttpTransport):
         self._medium = None
 
     def clone(self, offset=None):
-        """Return a new transport sharing this transport's HttpClient."""
-        new_base = self.base if offset is None else self.abspath(offset)
+        """Return a new transport sharing this transport's HttpClient.
+
+        Uses ``urlutils.URL.clone`` path-combine semantics rather
+        than ``abspath`` URL-join semantics — an absolute-URL
+        ``offset`` is treated as a path fragment appended to the
+        current base, not as a wholesale base replacement. Breezy's
+        ``do_catching_redirections`` test relies on this quirk: the
+        redirect callback clones at ``exception.target`` to trigger
+        a controlled loop, which only loops if the host stays put.
+        """
+        if offset is None:
+            new_base = self.base
+        else:
+            from dromedary._transport_rs.urlutils import URL
+
+            new_base = str(URL.from_string(self.base).clone(offset))
         return type(self)(new_base, _from_transport=self)
 
     def _report_activity(self, byte_count, direction):
