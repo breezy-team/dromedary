@@ -92,6 +92,24 @@ class HttpTransport(_http_rs.HttpTransport):
         # The only Python-side attribute is the _medium slot filled in
         # by breezy when get_smart_medium() is first called.
         self._medium = None
+        # Wire an activity callback into the Rust transport so
+        # internal get/has/post/readv calls feed breezy's progress
+        # UI too, not just the explicit ``.request()`` path. We use
+        # a lambda that re-looks-up ``_report_activity`` on each
+        # invocation rather than a bound method so tests that
+        # override ``_report_activity`` at class level (notably
+        # ``TestActivity``) still see the replacement.
+        import weakref
+
+        wself = weakref.ref(self)
+
+        def _forward(byte_count, direction):
+            t = wself()
+            if t is None:
+                return
+            t._report_activity(byte_count, direction)
+
+        self._set_activity_callback(_forward)
 
     def clone(self, offset=None):
         """Return a new transport sharing this transport's HttpClient.

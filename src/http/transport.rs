@@ -94,6 +94,14 @@ pub struct HttpTransport {
     client: Arc<HttpClient>,
     range_hint: Arc<Mutex<RangeHint>>,
     readv_tuning: Arc<Mutex<ReadvTuning>>,
+    /// Optional per-transport activity callback. When set, it's
+    /// passed as the `activity` arg to each internal request
+    /// (get/has/post/_get/readv) so breezy's `_report_activity`
+    /// progress-bar hook sees byte counts for these implicit
+    /// requests as well. Wrapped in `Arc<Mutex<Option<...>>>` so
+    /// clones share the slot — setting it on one transport
+    /// propagates to clones and back.
+    activity: Arc<Mutex<Option<crate::http::client::ActivityCallback>>>,
 }
 
 impl HttpTransport {
@@ -110,7 +118,25 @@ impl HttpTransport {
             client,
             range_hint: Arc::new(Mutex::new(RangeHint::Multi)),
             readv_tuning: Arc::new(Mutex::new(ReadvTuning::default())),
+            activity: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Install (or replace) the per-transport activity callback.
+    /// Called from the PyO3 layer after construction so breezy's
+    /// `_report_activity` hook reaches internal get/has/post/readv
+    /// calls, not just the explicit `.request()` API that already
+    /// threads its own callback. Pass `None` to clear.
+    pub fn set_activity(&self, cb: Option<crate::http::client::ActivityCallback>) {
+        *self.activity.lock().unwrap() = cb;
+    }
+
+    /// Snapshot of the currently-installed activity callback, if
+    /// any. Helper for the request helpers — we clone the Arc so
+    /// the lock stays short-lived even when the request itself
+    /// takes a while.
+    fn activity_snapshot(&self) -> Option<crate::http::client::ActivityCallback> {
+        self.activity.lock().unwrap().clone()
     }
 
     /// Clone this transport at a new base URL. Shares the underlying
@@ -132,6 +158,7 @@ impl HttpTransport {
             client: self.client.clone(),
             range_hint: self.range_hint.clone(),
             readv_tuning: self.readv_tuning.clone(),
+            activity: self.activity.clone(),
         }
     }
 
@@ -188,9 +215,18 @@ impl HttpTransport {
             follow_redirects,
             ..RequestOptions::default()
         };
+        let activity = self.activity_snapshot();
         let resp = self
             .client
-            .request_with_origin_url(method, url, &self.raw_base, headers, body, &opts, None)
+            .request_with_origin_url(
+                method,
+                url,
+                &self.raw_base,
+                headers,
+                body,
+                &opts,
+                activity.as_ref(),
+            )
             .map_err(client_err_to_transport_err)?;
 
         let code = resp.status;

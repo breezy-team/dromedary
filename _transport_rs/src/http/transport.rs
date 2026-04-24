@@ -157,6 +157,18 @@ impl HttpTransport {
         Ok(())
     }
 
+    /// Install (or clear) the transport-level activity callback.
+    /// Python subclasses invoke this with a bound method reference
+    /// (``self._report_activity``) so internal get / has / post /
+    /// readv calls funnel byte-count updates into breezy's progress
+    /// UI the same way the explicit ``request()`` path already does.
+    /// Pass ``None`` to clear.
+    #[pyo3(signature = (callback))]
+    fn _set_activity_callback(&self, callback: Option<Py<PyAny>>) {
+        let cb = callback.map(super::client::make_activity_callback);
+        self.inner.set_activity(cb);
+    }
+
     /// Current range hint as `"multi"`, `"single"`, or `None`. Part
     /// of the public-ish transport interface so the breezy test
     /// suite can observe the client's fallback state.

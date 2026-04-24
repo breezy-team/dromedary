@@ -354,6 +354,121 @@ fn proxy_cache_key(proxy_url: &str) -> AuthCacheKey {
     ("proxy".to_string(), host, port)
 }
 
+/// Estimate the number of bytes the request will take on the
+/// wire, matching what breezy's socket-level byte accounting in
+/// `PredefinedRequestHandler` adds up: request line + header bytes
+/// (including `\r\n` after each) + blank line + body.
+///
+/// We replay the headers reqwest/hyper will inject — our caller-
+/// supplied ones plus the fixed-by-config `accept: */*`,
+/// `user-agent: <UA>`, `accept-encoding: <enc>`, `host: <host>`,
+/// and (for bodied requests) `content-length`. That keeps
+/// byte-exact parity with the socket without re-plumbing reqwest
+/// through a custom connector.
+fn estimate_request_wire_size(
+    method: &Method,
+    url: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+    user_agent: Option<&str>,
+) -> usize {
+    // Request-line: "METHOD /path?query HTTP/1.1\r\n". Use
+    // url::Url so we handle default/missing paths the same way
+    // reqwest does.
+    let parsed = match Url::parse(url) {
+        Ok(u) => u,
+        Err(_) => return 0,
+    };
+    let path = {
+        let mut p = parsed.path().to_string();
+        if p.is_empty() {
+            p.push('/');
+        }
+        if let Some(q) = parsed.query() {
+            p.push('?');
+            p.push_str(q);
+        }
+        p
+    };
+    let mut size = method.as_str().len() + 1 + path.len() + 1 + "HTTP/1.1\r\n".len();
+
+    // reqwest's default-headers set: accept, user-agent. hyper-util
+    // adds host; reqwest's decoder feature list drives
+    // accept-encoding. Replay what we're compiled with so the
+    // count matches the wire.
+    let host = parsed.host_str().unwrap_or("");
+    let host_header = match parsed.port() {
+        Some(p) => format!("{}:{}", host, p),
+        None => host.to_string(),
+    };
+    let ua = user_agent.unwrap_or(DEFAULT_USER_AGENT_FALLBACK);
+    // The default accept-encoding is just "gzip" — the `gzip`
+    // feature is on by default; `brotli`/`zstd`/`deflate` are off
+    // in our Cargo.toml, so only gzip is advertised.
+    let defaults: [(&str, &str); 4] = [
+        ("accept", "*/*"),
+        ("user-agent", ua),
+        ("accept-encoding", "gzip"),
+        ("host", host_header.as_str()),
+    ];
+    for (k, v) in defaults.iter() {
+        size += k.len() + 2 + v.len() + 2; // "name: value\r\n"
+    }
+
+    // Caller-supplied headers. reqwest lowercases header names on
+    // the wire, so count lowercase lengths — identical to the
+    // caller's length anyway since header names are ASCII.
+    for (k, v) in headers {
+        size += k.len() + 2 + v.len() + 2;
+    }
+
+    // Content-Length is added by hyper for bodied requests.
+    if !body.is_empty() {
+        // "content-length: N\r\n"
+        let n = body.len();
+        let digits = if n == 0 {
+            1
+        } else {
+            let mut d = 0usize;
+            let mut x = n;
+            while x > 0 {
+                d += 1;
+                x /= 10;
+            }
+            d
+        };
+        size += "content-length: ".len() + digits + 2;
+    }
+
+    size += 2; // blank line separating headers from body.
+    size += body.len();
+    size
+}
+
+/// Fallback user-agent used by `estimate_request_wire_size` when
+/// the config didn't supply one. Mirrors what `build_client`
+/// installs via `default_user_agent`.
+const DEFAULT_USER_AGENT_FALLBACK: &str = "Dromedary/0.1.0";
+
+/// Estimate the status-line + header block length of the response
+/// as the server wrote it on the wire: "HTTP/1.1 NNN reason\r\n"
+/// + each header line + blank line. Mirrors the server-side count
+/// `PredefinedRequestHandler` uses for `bytes_written` (which is
+/// just `len(canned_response)`).
+fn estimate_response_header_size(
+    _status: u16,
+    reason: &str,
+    headers: &[(String, String)],
+) -> usize {
+    // "HTTP/1.1 NNN Reason\r\n"
+    let mut size = "HTTP/1.1 ".len() + 3 + 1 + reason.len() + 2;
+    for (k, v) in headers {
+        size += k.len() + 2 + v.len() + 2;
+    }
+    size += 2; // blank line
+    size
+}
+
 /// Build an `Authorization:` header value from the cached state.
 /// Mutates digest state in place so `nonce_count` bumps correctly.
 fn cached_auth_header(cached: &CachedAuth, method: &Method, uri: &Uri) -> Option<String> {
@@ -1245,14 +1360,25 @@ impl HttpClient {
             *req.body_mut() = Some(reqwest::blocking::Body::from(body.to_vec()));
         }
 
-        // Report the upload size before the actual send. Like the
-        // ureq version, we report the application-level byte count
-        // rather than per-socket counters (reqwest doesn't expose
-        // those either) — matches what breezy's progress bar showed
-        // under the urllib-handler transport.
+        // Report the upload size before the actual send. We report
+        // the whole on-the-wire request size (request line + headers
+        // + blank line + body), matching what breezy's old
+        // socket-level accounting produced. reqwest doesn't expose
+        // the bytes it actually writes, so recompute them ourselves
+        // by replaying the same headers reqwest is about to send:
+        // the caller-supplied ones in `headers`, plus the defaults
+        // we know reqwest and hyper inject (accept, user-agent,
+        // accept-encoding, host, content-length for bodies).
         if let Some(cb) = activity {
-            if !body.is_empty() {
-                cb(body.len(), ActivityDirection::Write);
+            let wire_bytes = estimate_request_wire_size(
+                method,
+                url,
+                headers,
+                body,
+                self.config.user_agent.as_deref(),
+            );
+            if wire_bytes > 0 {
+                cb(wire_bytes, ActivityDirection::Write);
             }
         }
 
@@ -1487,6 +1613,19 @@ impl HttpResponse {
                 headers.push((name.as_str().to_string(), v.to_string()));
             }
         }
+
+        // Report the status-line + header block as read activity so
+        // breezy's socket-level byte accounting (used by the
+        // TestActivity tests) balances. `CountingReader` reports the
+        // body bytes as they're consumed; together that covers the
+        // whole canned_response bytes the test server writes.
+        if let Some(cb) = activity.as_ref() {
+            let header_bytes = estimate_response_header_size(status, &reason, &headers);
+            if header_bytes > 0 {
+                cb(header_bytes, ActivityDirection::Read);
+            }
+        }
+
         Ok(Self {
             status,
             reason,
