@@ -336,6 +336,21 @@ impl HttpTransport {
         }
     }
 
+    /// Shortcut the degradation ladder: jump straight to
+    /// `RangeHint::None` (full-file downloads). Used when a server
+    /// explicitly rejects a Range header rather than misbehaves on
+    /// the response — probing one range at a time gains nothing
+    /// there, and the full-file path finishes in a single GET.
+    /// Returns false if we're already at None.
+    pub(crate) fn jump_range_hint_to_none(&self) -> bool {
+        let mut hint = self.range_hint.lock().unwrap();
+        if *hint == RangeHint::None {
+            return false;
+        }
+        *hint = RangeHint::None;
+        true
+    }
+
     /// Current range hint as a short string: `"multi"`, `"single"`,
     /// or `None`. Matches the values the Python HttpTransport used
     /// so tests that reach into `_range_hint` continue to work.
@@ -1153,9 +1168,21 @@ impl HttpTransport {
                     remaining: new_remaining,
                     cause,
                 }) => {
-                    // Server misbehaved; try again with a degraded
-                    // range hint.
-                    if !self.degrade_range_hint() {
+                    // Server misbehaved; degrade the range hint.
+                    // Distinguish "server explicitly rejected the
+                    // Range request" (400/416 → InvalidHttpRange)
+                    // from "server's response was corrupt" (truncated
+                    // multipart, bad boundaries, etc. →
+                    // InvalidHttpResponse / ShortReadv). An explicit
+                    // rejection means *any* number of ranges is
+                    // risky — drop straight to full-file rather than
+                    // probe Single one-GET-per-range. The truncation
+                    // case steps Multi→Single→None one rung at a time
+                    // so servers that cope with fewer ranges don't
+                    // force a whole-file download.
+                    let jumped = matches!(cause, Some(Error::InvalidHttpRange { .. }))
+                        && self.jump_range_hint_to_none();
+                    if !jumped && !self.degrade_range_hint() {
                         out.push(Err(cause.or(last_retry_err).unwrap_or_else(|| {
                             Error::InvalidHttpResponse {
                                 path: relpath.to_string(),
@@ -1833,12 +1860,27 @@ impl LazyReadv {
     /// behaviour for the retry-worthy error categories — those
     /// need the full degrade-and-retry loop which is too invasive
     /// to replicate here.
-    fn fall_back_to_eager(&mut self, _cause: Option<Error>) {
+    ///
+    /// Before handing off, pre-degrade the range hint based on the
+    /// failure we just saw so the eager path doesn't replay the
+    /// same doomed request. InvalidHttpRange (server rejected the
+    /// Range header) jumps straight to full-file; other retry-worthy
+    /// errors step down one rung.
+    fn fall_back_to_eager(&mut self, cause: Option<Error>) {
         let remaining: Vec<(u64, usize)> =
             self.pending.iter().map(|(o, s)| (*o as u64, *s)).collect();
         self.pending.clear();
         self.batches.clear();
         self.exhausted = true;
+        match &cause {
+            Some(Error::InvalidHttpRange { .. }) => {
+                self.transport.jump_range_hint_to_none();
+            }
+            Some(Error::InvalidHttpResponse { .. }) | Some(Error::ShortReadvError(_, _, _, _)) => {
+                self.transport.degrade_range_hint();
+            }
+            _ => {}
+        }
         let results = self.transport.readv_eager(&self.relpath, remaining);
         for r in results {
             self.yielded.push_back(r);
