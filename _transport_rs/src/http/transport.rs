@@ -377,6 +377,20 @@ pub(crate) fn http_transport_initializer(
     inner: Arc<RsHttpTransport>,
 ) -> PyClassInitializer<HttpTransport> {
     let base_box: Box<dyn dromedary::Transport> = Box::new(Clone::clone(&*inner));
+    http_transport_initializer_with_base(inner, base_box)
+}
+
+/// Like `http_transport_initializer` but lets the caller supply a
+/// specific `dyn Transport` to install at the base `Transport`
+/// pyclass layer. Used by the DAV subclass so default-method
+/// dispatch (e.g. `Transport::move` in Python, which goes to the
+/// Rust `dyn Transport::move` in turn) reaches the DAV impls (stat
+/// via PROPFIND, native MOVE) rather than the HTTP parent that
+/// has no stat support.
+pub(crate) fn http_transport_initializer_with_base(
+    inner: Arc<RsHttpTransport>,
+    base_box: Box<dyn dromedary::Transport>,
+) -> PyClassInitializer<HttpTransport> {
     PyClassInitializer::from(Transport(base_box))
         .add_subclass(ConnectedTransport)
         .add_subclass(HttpTransport { inner })

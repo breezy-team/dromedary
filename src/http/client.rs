@@ -422,8 +422,11 @@ fn estimate_request_wire_size(
         size += k.len() + 2 + v.len() + 2;
     }
 
-    // Content-Length is added by hyper for bodied requests.
-    if !body.is_empty() {
+    // Content-Length is added by hyper for any bodied request, and
+    // we force a (possibly-empty) body for PUT/POST/PATCH so those
+    // methods always carry the header.
+    let expects_body = matches!(method, &Method::PUT | &Method::POST | &Method::PATCH);
+    if !body.is_empty() || expects_body {
         // "content-length: N\r\n"
         let n = body.len();
         let digits = if n == 0 {
@@ -1372,7 +1375,16 @@ impl HttpClient {
                 }
             }
         }
-        if !body.is_empty() {
+        // Set a body (even an empty one) for methods that
+        // conventionally carry one. That forces reqwest to emit a
+        // `Content-Length: 0` header for zero-byte PUT/POST/PATCH
+        // uploads, which some servers (including breezy's own
+        // `dav_server` test harness) require to distinguish "empty
+        // body" from "body not received yet". Bodyless methods
+        // (GET/HEAD/OPTIONS/DELETE) stay bodyless — sending
+        // Content-Length there would be surprising.
+        let expects_body = matches!(method, &Method::PUT | &Method::POST | &Method::PATCH);
+        if !body.is_empty() || expects_body {
             *req.body_mut() = Some(reqwest::blocking::Body::from(body.to_vec()));
         }
 

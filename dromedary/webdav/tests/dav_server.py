@@ -88,9 +88,14 @@ class TestingDAVRequestHandler(http_server.TestingHTTPRequestHandler):
                 body.append(data)
             body = "".join(body)
 
+        elif content_length is not None:
+            body = self._read(int(content_length))
         else:
-            if content_length is not None:
-                body = self._read(int(content_length))
+            # Neither chunked nor Content-Length: treat as a
+            # zero-byte body. RFC 7230 §3.3.3 allows omitting
+            # Content-Length on an empty request body, and reqwest
+            # does exactly that for PUT/POST with no bytes.
+            body = b""
 
         return body
 
@@ -263,10 +268,16 @@ class TestingDAVRequestHandler(http_server.TestingHTTPRequestHandler):
         try:
             # DAV  makes no  distinction between  files  and dirs
             # when required to nuke them,  but we have to. And we
-            # also watch out for symlinks.
+            # also watch out for symlinks. Per RFC 4918 §9.6, DELETE
+            # on a collection removes the collection *with* all its
+            # members — so use shutil.rmtree for directories rather
+            # than os.rmdir, which would fail on any non-empty
+            # subtree.
             real_path = os.path.realpath(path)
             if os.path.isdir(real_path):
-                os.rmdir(path)
+                import shutil
+
+                shutil.rmtree(path)
             else:
                 os.remove(path)
         except FileNotFoundError:

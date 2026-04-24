@@ -140,6 +140,30 @@ class HttpDavTransport(_webdav_rs.HttpDavTransport):
         """Append `f.read()` to `relpath`. Returns the old length."""
         return self.append_bytes(relpath, f.read())
 
+    def open_write_stream(self, relpath, mode=None):  # noqa: ARG002
+        """Open a writable stream at ``relpath``.
+
+        WebDAV has no native append/stream verbs, so we back the
+        stream with append-based writes: the Transport protocol's
+        ``AppendBasedFileStream`` sends one PUT per ``write()``,
+        each concatenating the new bytes onto the server-side file.
+        Inefficient for large files but correct; bzr only uses
+        open_write_stream for small status/lock files.
+
+        We start by PUT'ing an empty body so the file exists when
+        ``open_write_stream`` returns (the Transport contract
+        requires it — breezy's ``test_opening_a_file_stream_creates_
+        file`` exercises exactly that shape). ``FileStream.close``
+        looks the stream up in the module-level ``_file_streams``
+        registry, so we insert it there too.
+        """
+        from dromedary import AppendBasedFileStream, _file_streams
+
+        self.put_bytes(relpath, b"")
+        handle = AppendBasedFileStream(self, relpath)
+        _file_streams[self.abspath(relpath)] = handle
+        return handle
+
 
 def get_test_permutations():
     """Return the permutations to be used in testing."""

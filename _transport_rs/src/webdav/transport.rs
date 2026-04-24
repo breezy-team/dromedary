@@ -26,7 +26,9 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
 use crate::http::client::{PythonCredentialProvider, PythonNegotiateProvider};
-use crate::http::transport::{http_transport_initializer, HttpTransport as PyHttpTransport};
+use crate::http::transport::{
+    http_transport_initializer_with_base, HttpTransport as PyHttpTransport,
+};
 use crate::map_transport_err_to_py_err;
 
 /// Python-bound Rust WebDAV transport.
@@ -223,9 +225,20 @@ impl HttpDavTransport {
 
     /// Append `bytes` to the file at `relpath`, returning the file
     /// size before the append. Picks between HEAD+ranged-PUT and
-    /// GET+modify+PUT based on the inherited range-hint state.
-    fn append_bytes(&self, py: Python, relpath: &str, bytes: &[u8]) -> PyResult<u64> {
+    /// GET+modify+PUT based on the inherited range-hint state. The
+    /// ``mode`` argument is accepted for Transport-API parity — the
+    /// DAV backend has no way to set file modes server-side, so it's
+    /// ignored.
+    #[pyo3(signature = (relpath, bytes, mode=None))]
+    fn append_bytes(
+        &self,
+        py: Python,
+        relpath: &str,
+        bytes: &[u8],
+        mode: Option<Py<PyAny>>,
+    ) -> PyResult<u64> {
         use dromedary::Transport as _;
+        let _ = mode;
         py.detach(|| self.inner.append_bytes(relpath, bytes, None))
             .map_err(|e| map_transport_err_to_py_err(e, None, Some(relpath)))
     }
@@ -278,19 +291,20 @@ impl HttpDavTransport {
 /// Build the four-layer `Transport → ConnectedTransport →
 /// HttpTransport → HttpDavTransport` initializer.
 ///
-/// Design note on what the `dyn Transport` at the base points to:
-/// we construct the HttpTransport parent normally (its inner points
-/// at the HTTP transport embedded inside the DAV transport), which
-/// means the `Transport` pyclass's own `dyn Transport` box also
-/// points at the HTTP transport. Python-visible behaviour that
-/// differs between HTTP and DAV (is_readonly, listable, write
-/// verbs) is exposed via DAV-specific pymethods on this subclass,
-/// so the Python caller sees DAV semantics; the base pyclass's
-/// inherited methods like `get` / `has` / `readv` work either way
-/// because DAV delegates them to the HTTP layer anyway.
+/// The `dyn Transport` installed at the base points at the *DAV*
+/// transport, not the HTTP one it wraps. That matters because the
+/// `Transport` pyclass's inherited Python helpers (notably `move`,
+/// `copy_tree`, `copy_to`) dispatch to `self.0.r#move` etc. —
+/// `self.0` being the base `Box<dyn Transport>`. If that dyn
+/// pointed at the HTTP layer, those helpers would call the HTTP
+/// `stat` (which returns `TransportNotPossible`) and fail. Pointing
+/// at the DAV layer routes them through PROPFIND-backed stat and
+/// the native WebDAV MOVE verb.
 fn dav_transport_initializer(
     inner: Arc<RsHttpDavTransport>,
 ) -> PyClassInitializer<HttpDavTransport> {
     let http_inner = Arc::new(inner.http().clone());
-    http_transport_initializer(http_inner).add_subclass(HttpDavTransport { inner })
+    let dav_box: Box<dyn dromedary::Transport> = Box::new((*inner).clone());
+    http_transport_initializer_with_base(http_inner, dav_box)
+        .add_subclass(HttpDavTransport { inner })
 }

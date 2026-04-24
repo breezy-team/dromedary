@@ -184,6 +184,16 @@ impl HttpDavTransport {
             }
             Err(e) => return Err(e),
         };
+        // `head()` currently returns Ok for both 200 and 404 (the
+        // transport-level wrapper only rejects *other* statuses).
+        // A 404 here means the file doesn't exist yet — treat it
+        // like the NoSuchFile branch above rather than parsing the
+        // 404 body's Content-Length, which would mis-report the
+        // error page size as the file's pre-append length.
+        if resp.status == 404 {
+            self.put_bytes(relpath, bytes, None)?;
+            return Ok(0);
+        }
         let current_size = resp
             .header("content-length")
             .and_then(|v| v.parse::<u64>().ok())
@@ -246,6 +256,72 @@ fn strip_dav_scheme_suffix(url: &str) -> String {
 impl std::fmt::Debug for HttpDavTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "HttpDavTransport({})", self.inner.base())
+    }
+}
+
+/// Write stream returned by `HttpDavTransport::open_write_stream`.
+///
+/// Buffers all `write` calls in memory and PUTs the accumulated
+/// body when the stream is flushed or dropped. WebDAV has no
+/// native streaming-write verb, so one buffered PUT is the best
+/// approximation: bzr only uses open_write_stream for small files
+/// (lock markers, knit indices), where the buffer cost is
+/// negligible.
+struct DavWriteStream {
+    transport: HttpDavTransport,
+    relpath: String,
+    buffer: Vec<u8>,
+    permissions: Option<Permissions>,
+    flushed: bool,
+}
+
+impl DavWriteStream {
+    /// Send the accumulated buffer as a PUT. Safe to call multiple
+    /// times — subsequent calls are no-ops unless `buffer` has
+    /// grown since the last flush.
+    fn flush_buffer(&mut self) -> std::io::Result<()> {
+        if self.flushed && self.buffer.is_empty() {
+            return Ok(());
+        }
+        self.transport
+            .put_bytes(&self.relpath, &self.buffer, self.permissions.clone())
+            .map_err(|e| std::io::Error::other(format!("{:?}", e)))?;
+        self.flushed = true;
+        Ok(())
+    }
+}
+
+impl std::io::Write for DavWriteStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.buffer.extend_from_slice(buf);
+        self.flushed = false;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.flush_buffer()
+    }
+}
+
+impl crate::WriteStream for DavWriteStream {
+    fn sync_data(&self) -> std::io::Result<()> {
+        // HTTP has no fsync. The server's durability model is
+        // whatever the DAV implementation provides. Treat as a
+        // no-op rather than raising, matching the Python
+        // `AppendBasedFileStream` fdatasync behaviour (which just
+        // raises `TransportNotPossible` but that's silently
+        // swallowed by `FileStream.close(want_fdatasync=True)`).
+        Ok(())
+    }
+}
+
+impl Drop for DavWriteStream {
+    fn drop(&mut self) {
+        // Flush on drop so users who forget to call close() still
+        // get their bytes to the server. Errors are swallowed —
+        // Drop can't surface them, and the stream contract says
+        // close() is the authoritative end-of-write signal.
+        let _ = self.flush_buffer();
     }
 }
 
@@ -589,13 +665,23 @@ impl Transport for HttpDavTransport {
 
     fn open_write_stream(
         &self,
-        _relpath: &UrlFragment,
-        _permissions: Option<Permissions>,
+        relpath: &UrlFragment,
+        permissions: Option<Permissions>,
     ) -> Result<Box<dyn crate::WriteStream + Send + Sync>> {
-        // Python emulates this with AppendBasedFileStream; bzr uses
-        // it for the knit index. We'd need an analogous streaming
-        // wrapper in Rust — out of scope for this stage.
-        Err(unsupported("open_write_stream()"))
+        // WebDAV has no native streaming-write verb. Create the
+        // file up front with an empty body so `open_write_stream`
+        // honours the Transport contract that the file exists
+        // before the handle is returned. Then return a memory-
+        // buffered stream that PUTs the whole accumulated body
+        // when it's flushed or dropped.
+        self.put_bytes(relpath, &[], permissions.clone())?;
+        Ok(Box::new(DavWriteStream {
+            transport: Clone::clone(self),
+            relpath: relpath.to_string(),
+            buffer: Vec::new(),
+            permissions,
+            flushed: false,
+        }))
     }
 
     fn local_abspath(&self, _relpath: &UrlFragment) -> Result<std::path::PathBuf> {
