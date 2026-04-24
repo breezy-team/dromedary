@@ -970,17 +970,32 @@ impl Transport {
             adjust_for_latency.unwrap_or(false),
             upper_limit,
         );
-        let iter: Box<dyn Iterator<Item = Result<(u64, Vec<u8>), dromedary::Error>> + Send> = unsafe {
+        let mut iter: Box<dyn Iterator<Item = Result<(u64, Vec<u8>), dromedary::Error>> + Send> = unsafe {
             std::mem::transmute::<
                 Box<dyn Iterator<Item = _> + Send + '_>,
                 Box<dyn Iterator<Item = _> + Send + 'static>,
             >(boxed)
         };
+        // Peek the first element synchronously so errors that the
+        // transport raises up-front (NoSuchFile for a missing
+        // file, PermissionDenied, &c) surface from the `readv()`
+        // *call* itself, not from the first `__next__` on the
+        // returned iterator. Python's Transport.readv contract
+        // historically raised there — breezy's pack-repo autopack
+        // (see `test_autopack_reloads_and_stops`) catches those
+        // around `make_readv_reader` construction to translate
+        // deleted-pack races into RetryWithNewPacks.
+        let first = py.detach(|| iter.next());
+        if let Some(Err(e)) = first {
+            return Err(map_transport_err_to_py_err(e, None, Some(&path)));
+        }
+        let prefixed: Box<dyn Iterator<Item = Result<(u64, Vec<u8>), dromedary::Error>> + Send> =
+            Box::new(first.into_iter().chain(iter));
         Py::new(
             py,
             ReadvIter {
                 parent: slf.into_pyobject(py)?.unbind(),
-                iter: Mutex::new(Some(iter)),
+                iter: Mutex::new(Some(prefixed)),
                 path,
             },
         )
