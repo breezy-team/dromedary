@@ -78,7 +78,7 @@ impl HttpTransport {
             user_agent,
             read_timeout: timeout,
         };
-        let client = HttpClient::with_providers(
+        let mut client = HttpClient::with_providers(
             cfg,
             Box::new(PythonCredentialProvider),
             Box::new(PythonNegotiateProvider) as Box<dyn NegotiateProvider>,
@@ -90,6 +90,13 @@ impl HttpTransport {
                 Some(base),
             )
         })?;
+        // Route auth-header traces back through the Python callback
+        // set via `set_auth_header_trace`. Breezy registers that
+        // callback at import time so debug-flag-controlled
+        // "> Authorization: <masked>" lines reach `trace.mutter`.
+        client.set_auth_trace(Some(std::sync::Arc::new(|header: &str| {
+            super::invoke_auth_header_trace(header);
+        })));
         let rust = RsHttpTransport::new(base, Arc::new(client))
             .map_err(|e| map_transport_err_to_py_err(e, None, Some(base)))?;
         let inner = Arc::new(rust);

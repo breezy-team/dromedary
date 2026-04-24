@@ -122,12 +122,15 @@ impl HttpClient {
             user_agent,
             read_timeout: timeout,
         };
-        let inner = RsHttpClient::with_providers(
+        let mut inner = RsHttpClient::with_providers(
             cfg,
             Box::new(PythonCredentialProvider),
             Box::new(PythonNegotiateProvider),
         )
         .map_err(client_err_to_py)?;
+        inner.set_auth_trace(Some(std::sync::Arc::new(|header: &str| {
+            super::invoke_auth_header_trace(header);
+        })));
         Ok(Self {
             inner,
             defaults: Mutex::new(RequestOptions::default()),

@@ -72,7 +72,7 @@ impl HttpDavTransport {
             user_agent,
             read_timeout: timeout,
         };
-        let client = HttpClient::with_providers(
+        let mut client = HttpClient::with_providers(
             cfg,
             Box::new(PythonCredentialProvider),
             Box::new(PythonNegotiateProvider) as Box<dyn NegotiateProvider>,
@@ -84,6 +84,9 @@ impl HttpDavTransport {
                 Some(base),
             )
         })?;
+        client.set_auth_trace(Some(std::sync::Arc::new(|header: &str| {
+            crate::http::invoke_auth_header_trace(header);
+        })));
         let rust = RsHttpDavTransport::new(base, Arc::new(client))
             .map_err(|e| map_transport_err_to_py_err(e, None, Some(base)))?;
         Ok(dav_transport_initializer(Arc::new(rust)))

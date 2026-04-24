@@ -596,7 +596,17 @@ pub struct HttpClient {
     /// no-op provider; the PyO3 layer swaps in a callback that
     /// delegates to Python's `kerberos` module.
     negotiate: Box<dyn NegotiateProvider>,
+    /// Optional tracing hook invoked just before a request carrying
+    /// an Authorization or Proxy-Authorization header goes on the
+    /// wire. Breezy uses this to emit a "> Authorization: <masked>"
+    /// debug line when the `http` debug flag is enabled. `None`
+    /// means "no tracing" — the default.
+    auth_trace: Option<AuthTraceCallback>,
 }
+
+/// Callback type for the auth-header trace hook. See
+/// [`HttpClient::set_auth_trace`] / the `auth_trace` field above.
+pub type AuthTraceCallback = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
 impl HttpClient {
     /// Build a new client honouring the given config.
@@ -637,7 +647,16 @@ impl HttpClient {
             proxy_auth_cache: AuthCache::new(),
             credentials,
             negotiate,
+            auth_trace: None,
         })
+    }
+
+    /// Install (or replace) the auth-header trace hook. Pass `None`
+    /// to disable tracing. Thread-safe to call before sharing the
+    /// client via `Arc`; callers that want to install it later must
+    /// wrap the whole client behind their own mutability.
+    pub fn set_auth_trace(&mut self, cb: Option<AuthTraceCallback>) {
+        self.auth_trace = cb;
     }
 
     /// Return (cloning if necessary) the client for a given proxy
@@ -1202,6 +1221,24 @@ impl HttpClient {
                     ClientError::InvalidRequest(format!("bad header value for {}: {}", k, e))
                 })?;
                 hdrs.append(name, value);
+            }
+        }
+
+        // Fire the auth-header trace hook for any Authorization /
+        // Proxy-Authorization header we're about to send. Breezy
+        // subscribes to emit a "> <HeaderName>: <masked>" debug line
+        // (see `test_no_credential_leaks_in_log`). Iterate the raw
+        // `headers` slice, not the reqwest HeaderMap, so we see the
+        // names exactly as the caller set them — the HeaderMap
+        // normalises to lowercase and the test matches the cased
+        // name ("Authorization").
+        if let Some(cb) = &self.auth_trace {
+            for (k, _) in headers {
+                if k.eq_ignore_ascii_case("authorization")
+                    || k.eq_ignore_ascii_case("proxy-authorization")
+                {
+                    cb(k);
+                }
             }
         }
         if !body.is_empty() {
