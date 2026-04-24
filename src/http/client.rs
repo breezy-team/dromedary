@@ -1731,11 +1731,27 @@ impl HttpResponse {
 
     /// Drain the remaining body into the buffer. No-op if already
     /// buffered.
+    ///
+    /// On a truncated body (server promised N bytes but closed the
+    /// socket early, surfacing as `UnexpectedEof`) we keep whatever
+    /// was already read rather than discarding it — downstream
+    /// multipart parsing can still recover the complete sub-ranges
+    /// from the partial bytes (see
+    /// `TestTruncatedMultipleRangeServer.test_readv_with_short_reads`).
+    /// The error is still propagated so the caller can react; the
+    /// retained buffer is only visible via a subsequent `body()`
+    /// call that re-drains.
     fn buffer_all(&mut self) -> std::io::Result<()> {
         if let BodyState::Streaming(reader) = &mut self.body {
             let mut buf = Vec::new();
-            std::io::Read::read_to_end(reader, &mut buf)?;
+            let err = match std::io::Read::read_to_end(reader, &mut buf) {
+                Ok(_) => None,
+                Err(e) => Some(e),
+            };
             self.body = BodyState::Buffered(std::io::Cursor::new(buf));
+            if let Some(e) = err {
+                return Err(e);
+            }
         }
         Ok(())
     }

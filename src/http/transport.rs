@@ -653,24 +653,28 @@ fn format_range_header(offsets: &[(usize, usize)], tail_amount: usize) -> String
 /// boundary or single-range window.
 fn wrap_response_body(url: String, mut resp: HttpResponse) -> Result<(u16, HttpRangeFile)> {
     let status = resp.status;
-    let body = resp.read(None).map_err(|e| {
-        // Truncated response bodies (server promises Content-Length N
-        // but closes the socket before sending N bytes) surface here
-        // as an io::Error wrapping a hyper::Error whose
-        // `is_incomplete_message()` is true. That's the same signal
-        // breezy's "short readv" retry path keys off, so route it
-        // through `InvalidHttpResponse` instead of leaking as a
-        // generic `OSError` — otherwise the readv eager/retry loop
-        // treats it as a hard failure and gives up.
-        if is_io_hyper_parse_error(&e) {
-            Error::InvalidHttpResponse {
-                path: url.clone(),
-                msg: e.to_string(),
+    // Truncated response bodies (server promised Content-Length N
+    // but closed the socket before sending N bytes) surface as an
+    // io::Error wrapping a hyper::Error whose `is_incomplete_
+    // message()` is true. That's the same signal breezy's "short
+    // readv" retry path keys off. Preserve the partial bytes we
+    // *did* read so the downstream multipart parser can extract
+    // the ranges that arrived in full before the cut — the readv
+    // eager/retry loop then only has to fetch the tail, not redo
+    // everything. Non-truncation errors still bubble up.
+    let body = match resp.read(None) {
+        Ok(b) => b,
+        Err(e) => {
+            if !is_io_hyper_parse_error(&e) {
+                return Err(Error::Io(e));
             }
-        } else {
-            Error::Io(e)
+            // `buffer_all` keeps the partial read in the
+            // response's buffer even on UnexpectedEof, so a
+            // second call reads it out without re-hitting the
+            // socket.
+            resp.read(None).unwrap_or_default()
         }
-    })?;
+    };
     if status == 200 {
         // Plain whole-file response: skip handle_response and build
         // a RangeFile directly so we don't need to thread the body
@@ -1786,6 +1790,13 @@ struct LazyReadv {
     /// subsequent yields come from `yielded` and we stop issuing
     /// new GETs.
     exhausted: bool,
+    /// A retry-worthy failure from an earlier batch that we
+    /// haven't acted on yet — deferred so callers can consume
+    /// the ranges we *did* manage to parse from the partial
+    /// response before we start issuing fresh GETs. The error is
+    /// discharged the next time `fetch_next_batch` runs and
+    /// `yielded` has drained.
+    deferred_fallback: Option<Error>,
 }
 
 impl LazyReadv {
@@ -1821,6 +1832,7 @@ impl LazyReadv {
                     yielded,
                     batches: std::collections::VecDeque::new(),
                     exhausted: true,
+                    deferred_fallback: None,
                 };
             }
         };
@@ -1832,6 +1844,7 @@ impl LazyReadv {
             yielded: std::collections::VecDeque::new(),
             batches,
             exhausted: false,
+            deferred_fallback: None,
         }
     }
 
@@ -1839,6 +1852,17 @@ impl LazyReadv {
     /// `yielded` in the order the caller originally asked for
     /// them (reordering within the batch using pending's head).
     fn fetch_next_batch(&mut self) -> bool {
+        // Discharge any pending fallback before issuing a fresh GET:
+        // an earlier batch left partial results and a deferred
+        // error, and now the caller's asking for more offsets than
+        // that partial could satisfy. Running the fallback here
+        // (rather than inline with the failed read) means we yield
+        // the partial ranges first, then only replay the eager
+        // path for the offsets that actually went unsatisfied.
+        if let Some(err) = self.deferred_fallback.take() {
+            self.run_eager_fallback(Some(err));
+            return true;
+        }
         let Some(batch) = self.batches.pop_front() else {
             return false;
         };
@@ -1860,34 +1884,57 @@ impl LazyReadv {
         };
         // Pull each sub-range's bytes from the response and route
         // them to either `yielded` (for the next caller request)
-        // or a per-batch data_map for out-of-order reassembly.
+        // or a per-batch data_map for out-of-order reassembly. We
+        // drain `pending` incrementally — if reading later in the
+        // batch fails (e.g. a truncated multipart body), earlier
+        // ranges we already decoded are still yielded before the
+        // fallback kicks in, matching
+        // `test_readv_with_short_reads`'s expectation that partial
+        // progress survives a cut-short response.
         let mut data_map: std::collections::HashMap<(usize, usize), Vec<u8>> =
             std::collections::HashMap::new();
+        let flush_available =
+            |data_map: &mut std::collections::HashMap<(usize, usize), Vec<u8>>,
+             pending: &mut std::collections::VecDeque<(usize, usize)>,
+             yielded: &mut std::collections::VecDeque<Result<(u64, Vec<u8>)>>| {
+                while let Some(&(off, size)) = pending.front() {
+                    if let Some(data) = data_map.remove(&(off, size)) {
+                        pending.pop_front();
+                        yielded.push_back(Ok((off as u64, data)));
+                    } else {
+                        break;
+                    }
+                }
+            };
         for (coal_start, _coal_length, ranges) in &batch {
             for (sub_offset, sub_size) in ranges {
                 let abs_start = coal_start + sub_offset;
                 match rf.read_at(abs_start as u64, *sub_size) {
                     Ok(d) => {
                         data_map.insert((abs_start, *sub_size), d);
+                        flush_available(&mut data_map, &mut self.pending, &mut self.yielded);
                     }
                     Err(e) => {
-                        self.fall_back_to_eager(Some(e));
+                        flush_available(&mut data_map, &mut self.pending, &mut self.yielded);
+                        // If we yielded anything this batch, defer
+                        // the fallback — the caller asked for one
+                        // range at a time via next(), so don't
+                        // burn a fresh GET until they actually
+                        // reach a range we couldn't satisfy. If we
+                        // have nothing to show, fall back now so
+                        // the caller sees results rather than an
+                        // infinite empty-batch loop.
+                        if self.yielded.is_empty() {
+                            self.fall_back_to_eager(Some(e));
+                        } else {
+                            self.deferred_fallback = Some(e);
+                        }
                         return true;
                     }
                 }
             }
         }
-        // Now drain `pending` in order, yielding anything this
-        // batch resolved. Stop at the first offset we don't have —
-        // that one belongs to a later batch.
-        while let Some(&(off, size)) = self.pending.front() {
-            if let Some(data) = data_map.remove(&(off, size)) {
-                self.pending.pop_front();
-                self.yielded.push_back(Ok((off as u64, data)));
-            } else {
-                break;
-            }
-        }
+        flush_available(&mut data_map, &mut self.pending, &mut self.yielded);
         true
     }
 
@@ -1896,13 +1943,17 @@ impl LazyReadv {
     /// behaviour for the retry-worthy error categories — those
     /// need the full degrade-and-retry loop which is too invasive
     /// to replicate here.
-    ///
-    /// Before handing off, pre-degrade the range hint based on the
-    /// failure we just saw so the eager path doesn't replay the
-    /// same doomed request. InvalidHttpRange (server rejected the
-    /// Range header) jumps straight to full-file; other retry-worthy
-    /// errors step down one rung.
     fn fall_back_to_eager(&mut self, cause: Option<Error>) {
+        self.run_eager_fallback(cause);
+    }
+
+    /// Shared implementation used by both `fall_back_to_eager`
+    /// (invoked synchronously when we have no partial results) and
+    /// the `deferred_fallback` discharge in `fetch_next_batch`.
+    /// Degrades the range hint based on the failure shape before
+    /// handing off so the eager path doesn't replay the same
+    /// doomed request.
+    fn run_eager_fallback(&mut self, cause: Option<Error>) {
         let remaining: Vec<(u64, usize)> =
             self.pending.iter().map(|(o, s)| (*o as u64, *s)).collect();
         self.pending.clear();
