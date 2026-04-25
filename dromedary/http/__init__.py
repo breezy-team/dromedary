@@ -16,18 +16,27 @@
 
 """Base implementation of Transport over http.
 
-There are separate implementation modules for each http client implementation.
+This module is a thin facade over ``_transport_rs.http``. The User-
+Agent prefix, the credential-lookup callback, CA bundle resolution
+(including native-store materialisation on Windows/macOS), and the
+default certificate-verification requirement all live in Rust; the
+helpers here just delegate.
+
+Breezy overrides ``ssl_ca_certs`` and ``ssl_cert_reqs`` by
+reassigning the module attributes, so those stay as plain callables
+at the module level rather than functions that always consult the
+Rust state.
 """
 
 DEBUG = 0
-
-import sys
 
 from dromedary.version import version_string as dromedary_version
 
 from .._transport_rs import http as _http_rs
 
-_user_agent_prefix = f"Dromedary/{dromedary_version}"
+# Seed the Rust-held User-Agent prefix with our own default; breezy's
+# transport layer calls set_user_agent() later to replace it.
+_http_rs.set_user_agent(f"Dromedary/{dromedary_version}")
 
 
 def set_user_agent(prefix):
@@ -36,22 +45,12 @@ def set_user_agent(prefix):
     Args:
         prefix: The User-Agent string to use, e.g. "Breezy/3.4.0".
     """
-    global _user_agent_prefix
-    _user_agent_prefix = prefix
+    _http_rs.set_user_agent(prefix)
 
 
-def _default_credential_lookup(protocol, host, port=None, path=None, realm=None):
-    """Default credential lookup returning no credentials.
-
-    Override via set_credential_lookup() to integrate with a credential store.
-
-    Returns:
-        tuple: (user, password) or (None, None) if no credentials found.
-    """
-    return None, None
-
-
-_credential_lookup = _default_credential_lookup
+def default_user_agent():
+    """Get the default User-Agent string for HTTP requests."""
+    return _http_rs.default_user_agent()
 
 
 def set_credential_lookup(func):
@@ -59,46 +58,47 @@ def set_credential_lookup(func):
 
     Args:
         func: A callable(protocol, host, port=None, path=None, realm=None)
-            returning (user, password) or (None, None).
+            returning (user, password) or (None, None). Pass ``None``
+            to clear any previously-registered callback.
     """
-    global _credential_lookup
-    _credential_lookup = func
+    _http_rs.set_credential_lookup(func)
+
+
+def get_credential_lookup():
+    """Return the currently-registered credential-lookup callable, or None."""
+    return _http_rs.get_credential_lookup()
 
 
 def get_credentials(protocol, host, port=None, path=None, realm=None):
     """Look up stored credentials for an HTTP connection."""
-    return _credential_lookup(protocol, host, port=port, path=path, realm=realm)
+    return _http_rs.get_credentials(protocol, host, port=port, path=path, realm=realm)
 
 
-def default_user_agent():
-    """Get the default User-Agent string for HTTP requests."""
-    return _user_agent_prefix
-
-
-# Known CA bundle locations. Exported for compatibility; the authoritative
-# list lives in the Rust `dromedary::http` module.
+# Known CA bundle locations. Exported for compatibility; the
+# authoritative list lives in the Rust ``dromedary::http`` module.
 _ssl_ca_certs_known_locations = list(_http_rs.SSL_CA_CERTS_KNOWN_LOCATIONS)
 
 
 def default_ca_certs():
-    """Get the default path to CA certificates for SSL verification."""
+    """Get the default path to CA certificates for SSL verification.
+
+    On Windows and macOS this returns the path to a PEM tempfile
+    containing the platform's native root store (written once per
+    process). On Linux it returns the first pre-installed bundle
+    found in ``_ssl_ca_certs_known_locations``.
+    """
     return _http_rs.default_ca_certs()
 
 
 def default_cert_reqs():
-    """Get the default certificate verification requirement for the platform.
+    """Get the default certificate verification requirement.
 
-    On Windows and macOS, returns ssl.CERT_NONE due to lack of native access
-    to root certificates. On other platforms, returns ssl.CERT_REQUIRED.
+    Returns an integer matching ``ssl.CERT_NONE`` (0) or
+    ``ssl.CERT_REQUIRED`` (2). On Windows and macOS, returns
+    ``CERT_NONE`` historically — see
+    ``_transport_rs.http.default_cert_reqs`` for the rationale.
     """
-    import ssl
-
-    if sys.platform in ("win32", "darwin"):
-        # FIXME: Once we get a native access to root certificates there, this
-        # won't needed anymore. See http://pad.lv/920455 -- vila 2012-02-15
-        return ssl.CERT_NONE
-    else:
-        return ssl.CERT_REQUIRED
+    return _http_rs.default_cert_reqs()
 
 
 ssl_ca_certs = default_ca_certs

@@ -15,6 +15,7 @@ url = { workspace = true }
 log = { workspace = true }
 russh = { version = "0.54", optional = true }
 tokio = { version = "1", features = ["rt", "io-util", "net", "sync", "macros"], optional = true }
+lazy_static = "1"
 
 [features]
 default = ["russh"]

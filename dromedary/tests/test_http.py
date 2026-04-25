@@ -120,7 +120,7 @@ class TestUserAgent(unittest.TestCase):
 
 class TestCredentialLookup(unittest.TestCase):
     def setUp(self):
-        self._original = http._credential_lookup
+        self._original = http.get_credential_lookup()
         self.addCleanup(http.set_credential_lookup, self._original)
 
     def test_default_returns_no_credentials(self):
