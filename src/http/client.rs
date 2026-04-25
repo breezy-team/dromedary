@@ -306,35 +306,47 @@ fn proxy_connection_parts(
     // flow does — `joe:@` is authoritative empty-password creds,
     // `joe@` is a hint requiring a password lookup.
     let (embedded, user_hint) = extract_userinfo_raw(proxy_url)
-        .map(|raw| {
-            match raw.split_once(':') {
-                Some((u, p)) => {
-                    let user = percent_encoding::percent_decode_str(u)
-                        .decode_utf8()
-                        .ok()
-                        .map(|s| s.into_owned());
-                    let password = percent_encoding::percent_decode_str(p)
-                        .decode_utf8()
-                        .ok()
-                        .map(|s| s.into_owned())
-                        .unwrap_or_default();
-                    match user {
-                        Some(u) => (Some((u, password)), None),
-                        None => (None, None),
-                    }
-                }
-                None => {
-                    // user-only, no ':' — treat as hint.
-                    let user = percent_encoding::percent_decode_str(&raw)
-                        .decode_utf8()
-                        .ok()
-                        .map(|s| s.into_owned());
-                    (None, user)
-                }
-            }
-        })
+        .map(|raw| split_userinfo(&raw))
         .unwrap_or((None, None));
     (scheme, host, port, embedded, user_hint)
+}
+
+/// Split a raw userinfo segment into either authoritative credentials
+/// (`user:pass`) or a user hint (`user`-only).
+///
+/// Returns `(Some((user, password)), None)` when both halves are
+/// present (`joe:@host` is authoritative empty-password creds);
+/// `(None, Some(user))` when only the user is present (a hint to the
+/// CredentialProvider); `(None, None)` if the user half can't be
+/// decoded. The empty-vs-missing-password distinction is preserved
+/// because `Url::parse` normalises `joe:@host` and `joe@host` to the
+/// same shape — callers who care extract the raw userinfo first via
+/// `extract_userinfo_raw`.
+fn split_userinfo(userinfo: &str) -> (Option<(String, String)>, Option<String>) {
+    match userinfo.split_once(':') {
+        Some((u, p)) => {
+            let user = percent_encoding::percent_decode_str(u)
+                .decode_utf8()
+                .ok()
+                .map(|s| s.into_owned());
+            let password = percent_encoding::percent_decode_str(p)
+                .decode_utf8()
+                .ok()
+                .map(|s| s.into_owned())
+                .unwrap_or_default();
+            match user {
+                Some(u) => (Some((u, password)), None),
+                None => (None, None),
+            }
+        }
+        None => {
+            let user = percent_encoding::percent_decode_str(userinfo)
+                .decode_utf8()
+                .ok()
+                .map(|s| s.into_owned());
+            (None, user)
+        }
+    }
 }
 
 /// Key under which proxy auth is cached. Proxy credentials bind to
@@ -428,18 +440,7 @@ fn estimate_request_wire_size(
     let expects_body = matches!(method, &Method::PUT | &Method::POST | &Method::PATCH);
     if !body.is_empty() || expects_body {
         // "content-length: N\r\n"
-        let n = body.len();
-        let digits = if n == 0 {
-            1
-        } else {
-            let mut d = 0usize;
-            let mut x = n;
-            while x > 0 {
-                d += 1;
-                x /= 10;
-            }
-            d
-        };
+        let digits = body.len().checked_ilog10().unwrap_or(0) as usize + 1;
         size += "content-length: ".len() + digits + 2;
     }
 
@@ -1200,40 +1201,11 @@ impl HttpClient {
         // classic `http://joe:pw@host/` or
         // `all_proxy=http://joe:pw@proxy/` shapes), we prefer those
         // over the CredentialProvider so callers don't have to wire
-        // a separate store up for every test scenario.
-        // Extract userinfo into either full credentials (both user and
-        // password present → authoritative) or a user hint (user only
-        // → pass to CredentialProvider so it can look up / prompt for
-        // the password). `test_empty_pass` distinguishes empty password
-        // (`joe:@host`, authoritative) from missing password
-        // (`joe@host`, hint).
-        fn split_userinfo(userinfo: &str) -> (Option<(String, String)>, Option<String>) {
-            match userinfo.split_once(':') {
-                Some((u, p)) => {
-                    let user = percent_encoding::percent_decode_str(u)
-                        .decode_utf8()
-                        .ok()
-                        .map(|s| s.into_owned());
-                    let password = percent_encoding::percent_decode_str(p)
-                        .decode_utf8()
-                        .ok()
-                        .map(|s| s.into_owned())
-                        .unwrap_or_default();
-                    match user {
-                        Some(u) => (Some((u, password)), None),
-                        None => (None, None),
-                    }
-                }
-                None => {
-                    // User-only, no ':'. Treat as a hint, not creds.
-                    let user = percent_encoding::percent_decode_str(userinfo)
-                        .decode_utf8()
-                        .ok()
-                        .map(|s| s.into_owned());
-                    (None, user)
-                }
-            }
-        }
+        // a separate store up for every test scenario. `split_userinfo`
+        // (module scope) does the user/password extraction; the
+        // empty-vs-absent-password distinction (`joe:@` authoritative
+        // vs `joe@` hint) is the reason we route through the raw
+        // userinfo string rather than `Url::parse`.
         let (protocol, host, port, embedded, user_hint) = match kind {
             AuthKind::Origin => {
                 // Prefer the raw userinfo string supplied by the
@@ -1413,24 +1385,25 @@ impl HttpClient {
         let response = match client.execute(req) {
             Ok(r) => r,
             Err(e) => {
-                // Synthesize a minimal response when the server
-                // received the full request body but closed the
-                // connection before sending a complete response.
-                // Breezy's `test_post_body_is_received` test
-                // exercises this pathological shape — it only
-                // cares that the POST body made it to the server,
-                // not what came back. Python's http.client was
-                // lenient enough to return an empty 200 on a bare
-                // "HTTP/1.1 200 OK\r\n" status line; reqwest/hyper
-                // aren't, so detect the typed signal rather than
-                // string-matching the error Display.
+                // Synthesize a minimal response only for POST requests
+                // whose body the server received but where it closed
+                // the connection before sending a complete response.
+                // Breezy's `test_post_body_is_received` test exercises
+                // this pathological shape — it only cares that the
+                // POST body made it to the server, not what came back.
+                // Python's http.client was lenient enough to return an
+                // empty 200 on a bare "HTTP/1.1 200 OK\r\n" status
+                // line; reqwest/hyper aren't, so detect the typed
+                // signal rather than string-matching the error
+                // Display.
                 //
-                // Only tolerate this for requests that had a body
-                // to ship. For GET/HEAD there's nothing to verify
-                // delivery of, and the tests in TestWallServer /
-                // TestBadStatusServer rely on the error being
-                // surfaced so they can assert retries/fallbacks.
-                if !body.is_empty() && is_incomplete_message(&e) {
+                // Restricted to POST (not "any bodied request") so
+                // PUT / PROPFIND / MKCOL / MOVE / etc. failures don't
+                // get masked as success — WebDAV's `bare_put` checks
+                // resp.status against {200,201,204} and would silently
+                // accept a fabricated 200 even if the server never
+                // wrote the body.
+                if method == Method::POST && !body.is_empty() && is_incomplete_message(&e) {
                     return Ok(HttpResponse {
                         status: 200,
                         reason: "OK".to_string(),

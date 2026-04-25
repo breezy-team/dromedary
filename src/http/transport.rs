@@ -1878,7 +1878,7 @@ impl LazyReadv {
                 // the remaining offsets (the current batch's plus
                 // anything we hadn't started yet, reconstructed
                 // from `pending`).
-                self.fall_back_to_eager(Some(e));
+                self.run_eager_fallback(Some(e));
                 return true;
             }
         };
@@ -1925,7 +1925,7 @@ impl LazyReadv {
                         // the caller sees results rather than an
                         // infinite empty-batch loop.
                         if self.yielded.is_empty() {
-                            self.fall_back_to_eager(Some(e));
+                            self.run_eager_fallback(Some(e));
                         } else {
                             self.deferred_fallback = Some(e);
                         }
@@ -1938,21 +1938,15 @@ impl LazyReadv {
         true
     }
 
-    /// Fall back to the eager readv path for any remaining
-    /// offsets plus the current failure. Matches the previous
-    /// behaviour for the retry-worthy error categories — those
-    /// need the full degrade-and-retry loop which is too invasive
-    /// to replicate here.
-    fn fall_back_to_eager(&mut self, cause: Option<Error>) {
-        self.run_eager_fallback(cause);
-    }
-
-    /// Shared implementation used by both `fall_back_to_eager`
-    /// (invoked synchronously when we have no partial results) and
-    /// the `deferred_fallback` discharge in `fetch_next_batch`.
-    /// Degrades the range hint based on the failure shape before
-    /// handing off so the eager path doesn't replay the same
-    /// doomed request.
+    /// Fall back to the eager readv path for any remaining offsets
+    /// plus the current failure. Matches the previous behaviour for
+    /// the retry-worthy error categories — those need the full
+    /// degrade-and-retry loop which is too invasive to replicate
+    /// here. Invoked both synchronously when we have no partial
+    /// results, and as the `deferred_fallback` discharge in
+    /// `fetch_next_batch`. Degrades the range hint based on the
+    /// failure shape before handing off so the eager path doesn't
+    /// replay the same doomed request.
     fn run_eager_fallback(&mut self, cause: Option<Error>) {
         let remaining: Vec<(u64, usize)> =
             self.pending.iter().map(|(o, s)| (*o as u64, *s)).collect();

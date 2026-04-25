@@ -94,6 +94,7 @@ class HttpTransport(_http_rs.HttpTransport):
         self._medium = None
         if _from_transport is None:
             import ssl as _ssl
+
             import dromedary.http as _mod_http
 
             if ca_certs is None:
@@ -275,6 +276,13 @@ class HttpTransport(_http_rs.HttpTransport):
             for coal in offsets:
                 for sub_off, sub_len in coal.ranges:
                     pairs.append((coal.start + sub_off, sub_len))
+        from dromedary.errors import (
+            InvalidHttpRange as _InvalidHttpRange,
+        )
+        from dromedary.errors import (
+            ShortReadvError as _ShortReadvError,
+        )
+
         # Reject zero-length ranges as syntactically invalid — the
         # server-side form `bytes=start-end` with start > end is
         # rejected by any conforming HTTP server, and breezy's
@@ -282,10 +290,6 @@ class HttpTransport(_http_rs.HttpTransport):
         # raising InvalidHttpRange locally rather than either
         # silently succeeding or letting the server surface the
         # failure with its own error shape.
-        from dromedary.errors import (
-            InvalidHttpRange as _InvalidHttpRange,
-        )
-
         if any(length <= 0 for _, length in pairs):
             abspath = self._remote_path(relpath)
             raise _InvalidHttpRange(
@@ -305,11 +309,6 @@ class HttpTransport(_http_rs.HttpTransport):
         # highest (offset + length) any caller will seek+read.
         highest = max(start + length for start, length in pairs)
         out = BytesIO(b"\0" * highest)
-        from dromedary.errors import (
-            InvalidHttpRange as _InvalidHttpRange,
-            ShortReadvError as _ShortReadvError,
-        )
-
         try:
             for offset, chunk in self.readv(relpath, pairs):
                 out.seek(offset)

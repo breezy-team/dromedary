@@ -123,14 +123,24 @@ impl HttpDavTransport {
         source: PyRef<HttpDavTransport>,
         offset: Option<&str>,
     ) -> PyResult<()> {
-        let cloned = source
-            .inner
-            .clone_concrete(offset)
-            .map_err(|e| map_transport_err_to_py_err(e, None, offset))?;
-        let new_inner = Arc::new(cloned);
+        // When no offset is supplied, share the source's inner Arc
+        // directly — clone_concrete's raw_base/segment-parameter
+        // stripping (matching ConnectedTransport.clone semantics)
+        // is wrong for the ``__init__``-time TLS-config rebuild
+        // path that calls this helper with offset=None.
+        let new_inner = match offset {
+            None => source.inner.clone(),
+            Some(_) => {
+                let cloned = source
+                    .inner
+                    .clone_concrete(offset)
+                    .map_err(|e| map_transport_err_to_py_err(e, None, offset))?;
+                Arc::new(cloned)
+            }
+        };
         // Refresh every layer's dyn-Transport pointer so calls
         // through each inheritance level see the cloned state.
-        let dav_box: Box<dyn dromedary::Transport> = Box::new((*new_inner).clone());
+        let dav_box: Box<dyn dromedary::Transport> = Box::new(Clone::clone(&*new_inner));
         let http_layer = slf.as_super();
         // Update the HttpTransport parent's own HTTP-transport
         // pointer so inherited methods (`request`, `_post`, ...) see
@@ -304,7 +314,7 @@ fn dav_transport_initializer(
     inner: Arc<RsHttpDavTransport>,
 ) -> PyClassInitializer<HttpDavTransport> {
     let http_inner = Arc::new(inner.http().clone());
-    let dav_box: Box<dyn dromedary::Transport> = Box::new((*inner).clone());
+    let dav_box: Box<dyn dromedary::Transport> = Box::new(Clone::clone(&*inner));
     http_transport_initializer_with_base(http_inner, dav_box)
         .add_subclass(HttpDavTransport { inner })
 }
