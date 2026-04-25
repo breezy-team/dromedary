@@ -71,9 +71,7 @@ def get_credential_lookup():
 
 def get_credentials(protocol, host, port=None, path=None, realm=None):
     """Look up stored credentials for an HTTP connection."""
-    return _http_rs.get_credentials(
-        protocol, host, port=port, path=path, realm=realm
-    )
+    return _http_rs.get_credentials(protocol, host, port=port, path=path, realm=realm)
 
 
 # Known CA bundle locations. Exported for compatibility; the

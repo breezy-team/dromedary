@@ -36,6 +36,7 @@ from urllib.parse import urlencode, urljoin, urlparse
 
 import dromedary as _mod_dromedary
 from dromedary import ConnectedTransport, urlutils
+from dromedary._transport_rs import http as _http_rs
 from dromedary.errors import (
     BadHttpRequest,
     ConnectionError,
@@ -51,7 +52,6 @@ from dromedary.errors import (
     UnexpectedHttpStatus,
     UnusableRedirect,
 )
-from dromedary._transport_rs import http as _http_rs
 from dromedary.http import default_user_agent
 
 logger = logging.getLogger("dromedary.http.urllib")
