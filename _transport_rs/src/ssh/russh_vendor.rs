@@ -563,20 +563,47 @@ async fn try_password_or_interactive(
 }
 
 /// Enumerate keys from the SSH agent and try each in turn. Silent no-op
-/// when `$SSH_AUTH_SOCK` is unset or the agent is unreachable — matches
-/// paramiko's behavior (agent failures never block other auth methods).
+/// when the agent is unreachable — matches paramiko's behavior (agent
+/// failures never block other auth methods). On Unix this uses
+/// `$SSH_AUTH_SOCK`; on Windows it talks to Pageant.
+#[cfg(unix)]
 async fn try_agent_auth(
     session: &mut russh::client::Handle<VerifyingHandler>,
     user: &str,
 ) -> Result<bool, AuthError> {
-    let mut agent = match russh::keys::agent::client::AgentClient::connect_env().await {
+    let agent = match russh::keys::agent::client::AgentClient::connect_env().await {
         Ok(a) => a,
         Err(e) => {
             log::debug!("SSH agent unavailable: {e}");
             return Ok(false);
         }
     };
+    try_agent_auth_with(session, user, agent).await
+}
 
+#[cfg(windows)]
+async fn try_agent_auth(
+    session: &mut russh::client::Handle<VerifyingHandler>,
+    user: &str,
+) -> Result<bool, AuthError> {
+    let agent = match russh::keys::agent::client::AgentClient::connect_pageant().await {
+        Ok(a) => a,
+        Err(e) => {
+            log::debug!("SSH agent (Pageant) unavailable: {e}");
+            return Ok(false);
+        }
+    };
+    try_agent_auth_with(session, user, agent).await
+}
+
+async fn try_agent_auth_with<S>(
+    session: &mut russh::client::Handle<VerifyingHandler>,
+    user: &str,
+    mut agent: russh::keys::agent::client::AgentClient<S>,
+) -> Result<bool, AuthError>
+where
+    S: russh::keys::agent::client::AgentStream + Unpin + Send + 'static,
+{
     let identities = match agent.request_identities().await {
         Ok(ids) => ids,
         Err(e) => {
