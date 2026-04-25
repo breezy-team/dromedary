@@ -412,6 +412,7 @@ class DAVServer(http_server.HttpServer):
     """
 
     def __init__(self):
+        """Initialize the DAV server."""
         # We    have   special    requests    to   handle    that
         # HttpServer_urllib doesn't know about
         super().__init__(TestingDAVRequestHandler)
@@ -437,6 +438,7 @@ class QuirkyDAVServer(http_server.HttpServer):
     """
 
     def __init__(self):
+        """Initialize the quirky DAV server."""
         # We    have   special    requests    to   handle    that
         # HttpServer_urllib doesn't know about
         super().__init__(QuirkyTestingDAVRequestHandler)

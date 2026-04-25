@@ -35,6 +35,8 @@ from dromedary import (
     AppendBasedFileStream,
     Transport,
     _file_streams,
+)
+from dromedary import (
     errors as transport_errors,
 )
 from dromedary.errors import FileExists, NoSuchFile
@@ -1175,6 +1177,7 @@ class HttpDavTransport(urllib.HttpTransport):
         self.put_file(relpath, full_data)
 
         return before
+
 
 def get_test_permutations():
     """Return the permutations to be used in testing.

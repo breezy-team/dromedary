@@ -20,7 +20,8 @@ import stat
 from http.client import parse_headers
 from io import StringIO
 
-from dromedary import errors as transport_errors, tests
+from dromedary import errors as transport_errors
+from dromedary import tests
 from dromedary.tests import http_server
 from dromedary.webdav import webdav
 
