@@ -42,7 +42,8 @@ from io import BytesIO
 
 parse_headers = http_client.parse_headers
 
-from dromedary import errors as transport_errors, tests
+from dromedary import errors as transport_errors
+from dromedary import tests
 from dromedary.http import response
 
 
