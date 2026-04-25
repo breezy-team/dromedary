@@ -421,9 +421,18 @@ class TestDAVErrors(tests.TestCase):
 
     def test_delete_replies_202(self):
         """A bogus return code for delete raises an error."""
+        # Note: this response must be well-formed (blank line after
+        # headers, Content-Length, Connection: close) — the Rust HTTP
+        # client is strict about framing, unlike the old urllib.py
+        # which silently tolerated truncated responses. The test
+        # still exercises the code path we care about: a 202 reply
+        # to DELETE (which WebDAV treats as unexpected).
         self.server.canned_response = b"""HTTP/1.1 202 OK\r
 Date: Tue, 10 Aug 2013 14:38:56 GMT\r
 Server: Apache/42 (Wonderland)\r
+Content-Length: 0\r
+Connection: close\r
+\r
 """
         t = self.get_transport()
         self.assertRaises(transport_errors.InvalidHttpResponse, t.delete, "whatever")

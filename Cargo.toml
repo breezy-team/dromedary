@@ -45,6 +45,9 @@ hex = "0.4"
 rand = "0.8"
 rustls-native-certs = "0.8"
 base64 = "0.22"
+ureq = { version = "3", default-features = false, features = ["rustls", "gzip", "json"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+http = "1"
 gio = { version = "0.22", optional = true }
 glib = { version = "0.22", optional = true }
 

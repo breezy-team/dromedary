@@ -1,5 +1,6 @@
 //! Python bindings for the HTTP helper functions in `dromedary::http`.
 
+mod client;
 mod response;
 
 use std::sync::Mutex;
@@ -23,6 +24,84 @@ lazy_static! {
     /// callback has been set and `get_credentials` should return
     /// `(None, None)`.
     static ref CREDENTIAL_LOOKUP: Mutex<Option<Py<PyAny>>> = Mutex::new(None);
+    /// Registered Negotiate (Kerberos) initial-token callback.
+    /// Called as `cb(host) -> Optional[str]`; the returned string
+    /// goes after `Negotiate ` in the Authorization header.
+    static ref NEGOTIATE_PROVIDER: Mutex<Option<Py<PyAny>>> = Mutex::new(None);
+}
+
+/// Invoke the registered Negotiate callback. Returns `None` if no
+/// callback is set, the callback returned a non-string, or it
+/// raised. Matches the behaviour of the old Python
+/// `_auth_match_kerberos` which quietly returned `None` on any
+/// GSSAPI error.
+pub(super) fn invoke_negotiate_provider(host: &str) -> Option<String> {
+    Python::attach(|py| {
+        let cb = {
+            let guard = NEGOTIATE_PROVIDER.lock().unwrap();
+            guard.as_ref().map(|p| p.clone_ref(py))
+        };
+        let cb = cb?;
+        let result = cb.bind(py).call1((host,)).ok()?;
+        if result.is_none() {
+            return None;
+        }
+        result.extract::<String>().ok()
+    })
+}
+
+/// Invoke the registered credential-lookup callback with the given
+/// arguments. Returns `(None, None)` if no callback is set, or if
+/// the callback raises — we don't surface those errors because the
+/// auth layer treats them as "no credentials available".
+pub(super) fn invoke_credential_lookup(
+    protocol: &str,
+    host: &str,
+    port: Option<u16>,
+    realm: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    Python::attach(|py| {
+        let cb = {
+            let guard = CREDENTIAL_LOOKUP.lock().unwrap();
+            guard.as_ref().map(|p| p.clone_ref(py))
+        };
+        let Some(cb) = cb else {
+            return (None, None);
+        };
+        let kwargs = pyo3::types::PyDict::new(py);
+        // The Python callback signature is
+        // `(protocol, host, port=None, path=None, realm=None)`; we
+        // leave `path` as None because the Rust client doesn't
+        // track it per-request (breezy's urllib version did, but
+        // the value was rarely used by downstream credential stores).
+        let _ = kwargs.set_item("port", port);
+        let _ = kwargs.set_item("path", py.None());
+        let _ = kwargs.set_item("realm", realm);
+        let result = cb.bind(py).call((protocol, host), Some(&kwargs));
+        match result {
+            Ok(obj) => {
+                let tup = match obj.cast::<PyTuple>() {
+                    Ok(t) => t,
+                    Err(_) => return (None, None),
+                };
+                if tup.len() != 2 {
+                    return (None, None);
+                }
+                let user = tup
+                    .get_item(0)
+                    .ok()
+                    .and_then(|v| v.extract::<Option<String>>().ok())
+                    .flatten();
+                let password = tup
+                    .get_item(1)
+                    .ok()
+                    .and_then(|v| v.extract::<Option<String>>().ok())
+                    .flatten();
+                (user, password)
+            }
+            Err(_) => (None, None),
+        }
+    })
 }
 
 #[pyfunction]
@@ -171,6 +250,34 @@ fn get_credential_lookup(py: Python) -> Py<PyAny> {
         .unwrap_or_else(|| py.None())
 }
 
+/// Register a Negotiate (Kerberos) initial-token callback. The
+/// callable is invoked as `func(host)` and should return the
+/// base64-encoded token to send after `Negotiate ` in the
+/// Authorization header, or `None` if no token is available (no
+/// ticket / library missing / wrong realm).
+///
+/// Passing `None` clears any previously-registered callback.
+#[pyfunction]
+fn set_negotiate_provider(py: Python, func: Py<PyAny>) {
+    let mut slot = NEGOTIATE_PROVIDER.lock().unwrap();
+    *slot = if func.bind(py).is_none() {
+        None
+    } else {
+        Some(func)
+    };
+}
+
+/// Return the currently-registered Negotiate callback, or `None`.
+#[pyfunction]
+fn get_negotiate_provider(py: Python) -> Py<PyAny> {
+    NEGOTIATE_PROVIDER
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|p| p.clone_ref(py))
+        .unwrap_or_else(|| py.None())
+}
+
 /// Look up credentials via the registered callback. Returns
 /// `(None, None)` if no callback is set (the historical default).
 #[pyfunction]
@@ -221,8 +328,11 @@ pub(crate) fn register(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(set_credential_lookup, m)?)?;
     m.add_function(wrap_pyfunction!(get_credential_lookup, m)?)?;
     m.add_function(wrap_pyfunction!(get_credentials, m)?)?;
+    m.add_function(wrap_pyfunction!(set_negotiate_provider, m)?)?;
+    m.add_function(wrap_pyfunction!(get_negotiate_provider, m)?)?;
     m.add_function(wrap_pyfunction!(evaluate_proxy_bypass, m)?)?;
 
+    client::register(m)?;
     response::register(m)?;
 
     let locations = PyList::new(py, dromedary::http::SSL_CA_CERTS_KNOWN_LOCATIONS)?;

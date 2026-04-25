@@ -20,6 +20,7 @@ pub(crate) type BoxedChannel = Box<dyn SshChannel>;
 create_exception!(dromedary._transport_rs, SFTPError, PyException);
 import_exception!(dromedary.errors, NoSuchFile);
 import_exception!(dromedary.errors, PermissionDenied);
+import_exception!(dromedary.errors, SocketConnectionError);
 
 #[pyclass]
 struct SFTPAttributes(sftp::Attributes);
@@ -306,23 +307,37 @@ impl SFTPDir {
 impl SFTPClient {
     #[new]
     fn new(py: Python, fd: isize) -> PyResult<Self> {
-        let session = py.detach(|| {
-            #[cfg(unix)]
-            let channel: BoxedChannel = {
-                use std::os::fd::FromRawFd;
-                // SAFETY: `fd` was produced by a vendor that transferred
-                // ownership via `detach_fd`; wrapping it in `File` makes
-                // us the sole owner, closed on `Drop`.
-                Box::new(unsafe { std::fs::File::from_raw_fd(fd as i32) })
-            };
-            #[cfg(windows)]
-            let channel: BoxedChannel = {
-                use std::os::windows::io::{FromRawHandle, RawHandle};
-                // SAFETY: same detach-and-transfer contract as unix above.
-                Box::new(unsafe { std::fs::File::from_raw_handle(fd as RawHandle) })
-            };
-            sftp::SftpClient::new(channel)
-        })?;
+        let session = py
+            .detach(|| {
+                #[cfg(unix)]
+                let channel: BoxedChannel = {
+                    use std::os::fd::FromRawFd;
+                    // SAFETY: `fd` was produced by a vendor that transferred
+                    // ownership via `detach_fd`; wrapping it in `File` makes
+                    // us the sole owner, closed on `Drop`.
+                    Box::new(unsafe { std::fs::File::from_raw_fd(fd as i32) })
+                };
+                #[cfg(windows)]
+                let channel: BoxedChannel = {
+                    use std::os::windows::io::{FromRawHandle, RawHandle};
+                    // SAFETY: same detach-and-transfer contract as unix above.
+                    Box::new(unsafe { std::fs::File::from_raw_handle(fd as RawHandle) })
+                };
+                sftp::SftpClient::new(channel)
+            })
+            .map_err(|e| {
+                // An IO error during the opening SFTP handshake means the
+                // transport (spawned ssh subprocess or plain TCP socket)
+                // died before we could speak SFTP to it. Report it as a
+                // transport-level connection failure rather than letting a
+                // raw BrokenPipeError / EOF surface at the caller.
+                SocketConnectionError::new_err((
+                    "".to_string(),
+                    "".to_string(),
+                    "Failed to open SFTP session",
+                    e.to_string(),
+                ))
+            })?;
         Ok(Self {
             sftp: Arc::new(session),
             cwd: None,

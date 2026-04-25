@@ -44,28 +44,7 @@ parse_headers = http_client.parse_headers
 
 from dromedary import errors as transport_errors
 from dromedary import tests
-from dromedary.http import response, urllib
-
-
-class ReadSocket:
-    """A socket-like object that can be given a predefined content."""
-
-    def __init__(self, data):
-        self.readfile = BytesIO(data)
-
-    def makefile(self, mode="r", bufsize=None):
-        return self.readfile
-
-
-class FakeHTTPConnection(urllib.HTTPConnection):
-    def __init__(self, sock):
-        urllib.HTTPConnection.__init__(self, "localhost")
-        # Set the socket to bypass the connection
-        self.sock = sock
-
-    def send(self, str):
-        """Ignores the writes on the socket."""
-        pass
+from dromedary.http import response
 
 
 class TestResponseFileIter(tests.TestCase):
@@ -80,31 +59,6 @@ class TestResponseFileIter(tests.TestCase):
     def test_readlines(self):
         f = response.ResponseFile("many", BytesIO(b"0\n1\nboo!\n"))
         self.assertEqual([b"0\n", b"1\n", b"boo!\n"], f.readlines())
-
-
-class TestHTTPConnection(tests.TestCase):
-    def test_cleanup_pipe(self):
-        sock = ReadSocket(
-            b"""HTTP/1.1 200 OK\r
-Content-Type: text/plain; charset=UTF-8\r
-Content-Length: 18
-\r
-0123456789
-garbage"""
-        )
-        conn = FakeHTTPConnection(sock)
-        # Simulate the request sending so that the connection will be able to
-        # read the response.
-        conn.putrequest("GET", "http://localhost/fictious")
-        conn.endheaders()
-        # Now, get the response
-        resp = conn.getresponse()
-        # Read part of the response
-        self.assertEqual(b"0123456789\n", resp.read(11))
-        # Override the thresold to force the warning emission
-        conn._range_warning_thresold = 6  # There are 7 bytes pending
-        conn.cleanup_pipe()
-        self.assertContainsRe(self.get_log(), "Got a 200 response when asking")
 
 
 class TestRangeFileMixin:

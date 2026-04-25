@@ -4,7 +4,14 @@
 //! to be wired in: locating the CA certificate bundle and the User-Agent
 //! default. The Python wrapper in `dromedary.http` delegates to these.
 
+pub mod auth;
+pub mod client;
 pub mod response;
+pub use auth::{
+    build_basic_auth_header, build_digest_auth_header, parse_digest_challenge, DigestAuthState,
+    DigestChallenge,
+};
+pub use client::{ClientError, HttpClient, HttpClientConfig, HttpResponse};
 pub use response::{handle_response, InFile, RangeFile, ResponseError, ResponseFile, ResponseKind};
 
 use std::path::{Path, PathBuf};
@@ -302,6 +309,74 @@ pub enum ProxyBypass {
     /// host. Python returned `None`, and the caller fell through to
     /// the platform-specific proxy-bypass check.
     Undecided,
+}
+
+/// Snapshot the proxy-related environment variables into a map of
+/// `scheme.lower() -> proxy_url`. Mirrors the Python
+/// `urllib.request.getproxies_environment` implementation
+/// byte-for-byte so breezy users who rely on its quirks (CGI
+/// `HTTP_PROXY` guard, lowercase-wins, empty-lowercase-deletes) keep
+/// getting the same answers.
+///
+/// Intentionally reads the live environment on every call; callers
+/// that want caching should cache the returned map. Reading fresh
+/// matches stdlib's behaviour and keeps the implementation
+/// thread-safe without a module-level mutex.
+pub fn getproxies_environment() -> std::collections::HashMap<String, String> {
+    let mut proxies: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    // First pass: any case is accepted, `<SCHEME>_PROXY → proxies[scheme.lower()]`.
+    // Collect into a Vec so the second pass doesn't pay the env-read cost twice.
+    let mut environment: Vec<(String, String, String)> = Vec::new();
+    for (name, value) in std::env::vars() {
+        if name.len() > 5
+            && name.as_bytes()[name.len() - 6] == b'_'
+            && name[name.len() - 5..].eq_ignore_ascii_case("proxy")
+        {
+            let proxy_name = name[..name.len() - 6].to_ascii_lowercase();
+            if !value.is_empty() {
+                proxies.insert(proxy_name.clone(), value.clone());
+            }
+            environment.push((name, value, proxy_name));
+        }
+    }
+    // CVE-2016-1000110: when running as a CGI script, drop `HTTP_PROXY`
+    // to avoid honouring a client-supplied `Proxy:` header.
+    if std::env::var_os("REQUEST_METHOD").is_some() {
+        proxies.remove("http");
+    }
+    // Second pass: lowercase-only names override (including "set empty to delete").
+    for (name, value, proxy_name) in environment {
+        if name.ends_with("_proxy") {
+            if !value.is_empty() {
+                proxies.insert(proxy_name, value);
+            } else {
+                proxies.remove(&proxy_name);
+            }
+        }
+    }
+    proxies
+}
+
+/// Look up a proxy URL in the map returned by [`getproxies_environment`],
+/// with a `default_to` fallback (typically `"all"` to honour
+/// `ALL_PROXY` / `all_proxy`).
+///
+/// Mirrors breezy's `ProxyHandler.get_proxy_env_var`. `name` is
+/// lower-cased before lookup; `default_to=None` disables the
+/// fallback.
+pub fn get_proxy_env_var(
+    proxies: &std::collections::HashMap<String, String>,
+    name: &str,
+    default_to: Option<&str>,
+) -> Option<String> {
+    let name = name.to_ascii_lowercase();
+    if let Some(v) = proxies.get(&name) {
+        return Some(v.clone());
+    }
+    if let Some(fallback) = default_to {
+        return proxies.get(fallback).cloned();
+    }
+    None
 }
 
 /// Check a host against a comma-separated `no_proxy` list and
@@ -670,6 +745,118 @@ mod tests {
         assert!(matches!(v, 0 | 2));
     }
 
+    // Proxy env-var tests must not race on the shared process
+    // environment. We reuse `ENV_LOCK` defined above for the
+    // `CURL_CA_BUNDLE` tests. Exposed to sibling test modules
+    // (e.g. `client::tests`) that also mutate env vars.
+    pub(crate) fn with_env_vars<R>(
+        clear: &[&str],
+        set: &[(&str, &str)],
+        f: impl FnOnce() -> R,
+    ) -> R {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // Snapshot the bits we're about to touch so we can restore them.
+        let snapshot: Vec<(String, Option<String>)> = clear
+            .iter()
+            .chain(set.iter().map(|(k, _)| k))
+            .map(|k| (k.to_string(), std::env::var(k).ok()))
+            .collect();
+        // SAFETY: serialised against other tests in this module via ENV_LOCK.
+        unsafe {
+            for k in clear {
+                std::env::remove_var(k);
+            }
+            for (k, v) in set {
+                std::env::set_var(k, v);
+            }
+        }
+        let r = f();
+        unsafe {
+            for (k, v) in snapshot {
+                match v {
+                    Some(v) => std::env::set_var(&k, v),
+                    None => std::env::remove_var(&k),
+                }
+            }
+        }
+        r
+    }
+
+    #[test]
+    fn getproxies_environment_reads_any_case() {
+        with_env_vars(
+            &["http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY"],
+            &[("HTTP_PROXY", "http://upper.example/")],
+            || {
+                let p = getproxies_environment();
+                assert_eq!(
+                    p.get("http").map(String::as_str),
+                    Some("http://upper.example/")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn getproxies_environment_lowercase_wins() {
+        with_env_vars(
+            &["http_proxy", "HTTP_PROXY"],
+            &[
+                ("HTTP_PROXY", "http://upper.example/"),
+                ("http_proxy", "http://lower.example/"),
+            ],
+            || {
+                let p = getproxies_environment();
+                assert_eq!(
+                    p.get("http").map(String::as_str),
+                    Some("http://lower.example/")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn getproxies_environment_empty_lowercase_deletes() {
+        with_env_vars(
+            &["http_proxy", "HTTP_PROXY"],
+            &[("HTTP_PROXY", "http://upper.example/"), ("http_proxy", "")],
+            || {
+                let p = getproxies_environment();
+                // Python explicitly removes the entry when the
+                // lowercase variant is set to empty. Preserve that.
+                assert_eq!(p.get("http"), None);
+            },
+        );
+    }
+
+    #[test]
+    fn getproxies_environment_cgi_guard() {
+        with_env_vars(
+            &["http_proxy", "HTTP_PROXY", "REQUEST_METHOD"],
+            &[
+                ("HTTP_PROXY", "http://attacker.example/"),
+                ("REQUEST_METHOD", "GET"),
+            ],
+            || {
+                let p = getproxies_environment();
+                // CVE-2016-1000110: CGI scripts must ignore HTTP_PROXY.
+                assert_eq!(p.get("http"), None);
+            },
+        );
+    }
+
+    #[test]
+    fn get_proxy_env_var_falls_back_to_all() {
+        let mut proxies = std::collections::HashMap::new();
+        proxies.insert("all".to_string(), "http://all.example/".to_string());
+        assert_eq!(
+            get_proxy_env_var(&proxies, "http", Some("all")).as_deref(),
+            Some("http://all.example/"),
+        );
+        // No fallback configured: returns None even when `all` is set.
+        assert_eq!(get_proxy_env_var(&proxies, "http", None), None);
+    }
+
     #[test]
     fn evaluate_proxy_bypass_use_proxy_when_unset() {
         // Python returns `False` when no_proxy is None — meaning
@@ -720,6 +907,17 @@ mod tests {
     fn evaluate_proxy_bypass_star_glob() {
         assert_eq!(
             evaluate_proxy_bypass("host1.internal", Some("*.internal")),
+            ProxyBypass::Bypass
+        );
+    }
+
+    #[test]
+    fn evaluate_proxy_bypass_leading_star_glob() {
+        // `*example.com` with prefix-only matching still works
+        // because `*` eats the leading label(s). Matches breezy's
+        // TestHttpProxyWhiteBox.test_evaluate_proxy_bypass_true.
+        assert_eq!(
+            evaluate_proxy_bypass("bzr.example.com", Some("*example.com")),
             ProxyBypass::Bypass
         );
     }
@@ -781,6 +979,27 @@ mod tests {
     }
 
     #[test]
+    fn evaluate_proxy_bypass_empty_list_entries() {
+        // A `no_proxy` value that's entirely empty or commas-only
+        // or contains empty inner entries should be equivalent to
+        // "no bypass list entries matched": callers fall through to
+        // the default proxy behaviour. Mirrors breezy's
+        // TestHttpProxyWhiteBox.test_evaluate_proxy_bypass_empty_entries.
+        assert_eq!(
+            evaluate_proxy_bypass("example.com", Some("")),
+            ProxyBypass::Undecided
+        );
+        assert_eq!(
+            evaluate_proxy_bypass("example.com", Some(",")),
+            ProxyBypass::Undecided
+        );
+        assert_eq!(
+            evaluate_proxy_bypass("example.com", Some("foo,,bar")),
+            ProxyBypass::Undecided
+        );
+    }
+
+    #[test]
     fn user_agent_setter_roundtrips() {
         // The User-Agent prefix is process-global state, so other
         // tests may have mutated it. Save and restore around this
@@ -834,6 +1053,16 @@ mod tests {
     fn parse_auth_header_no_remainder() {
         let (scheme, rest) = parse_auth_header("Negotiate");
         assert_eq!(scheme, "negotiate");
+        assert_eq!(rest, None);
+    }
+
+    #[test]
+    fn parse_auth_header_empty() {
+        // Empty header: scheme is "" (lowercased of ""), no remainder.
+        // Matches the Python `AbstractAuthHandler._parse_auth_header`
+        // behaviour exercised by breezy's TestAuthHeader.test_empty_header.
+        let (scheme, rest) = parse_auth_header("");
+        assert_eq!(scheme, "");
         assert_eq!(rest, None);
     }
 
