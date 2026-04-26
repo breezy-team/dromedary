@@ -30,10 +30,100 @@ import_exception!(dromedary.errors, PathError);
 import_exception!(dromedary.errors, DirectoryNotEmpty);
 import_exception!(dromedary.errors, NotADirectory);
 import_exception!(dromedary.errors, ResourceBusy);
+import_exception!(dromedary.errors, InvalidHttpResponse);
+import_exception!(dromedary.errors, UnexpectedHttpStatus);
+import_exception!(dromedary.errors, InvalidHttpRange);
+import_exception!(dromedary.errors, BadHttpRequest);
+import_exception!(dromedary.errors, RedirectRequested);
+import_exception!(dromedary.errors, UnusableRedirect);
+import_exception!(dromedary.errors, ConnectionError);
 import_exception!(dromedary.urlutils, InvalidURL);
 
 #[pyclass(subclass)]
 pub(crate) struct Transport(pub(crate) Box<dyn TransportTrait>);
+
+/// Python-visible base class for Rust-backed transports that talk to
+/// a remote server. Mirrors `dromedary.ConnectedTransport` on the
+/// Python side, providing the `_user` / `_password` / `_host` /
+/// `_port` / `_path` / `_scheme` getters and `disconnect()` /
+/// `_reuse_for()` that `get_transport_from_url(possible_transports=…)`
+/// relies on for connection pooling.
+#[pyclass(extends=Transport, subclass)]
+pub(crate) struct ConnectedTransport;
+
+#[pymethods]
+impl ConnectedTransport {
+    #[getter]
+    fn _scheme(slf: PyRef<'_, Self>) -> String {
+        let base = slf.as_super().0.base();
+        dromedary::connected_url_scheme(&base)
+    }
+
+    #[getter]
+    fn _host(slf: PyRef<'_, Self>) -> Option<String> {
+        let base = slf.as_super().0.base();
+        dromedary::connected_url_host(&base)
+    }
+
+    #[getter]
+    fn _port(slf: PyRef<'_, Self>) -> Option<u16> {
+        let base = slf.as_super().0.base();
+        dromedary::connected_url_port(&base)
+    }
+
+    #[getter]
+    fn _user(slf: PyRef<'_, Self>) -> Option<String> {
+        let base = slf.as_super().0.base();
+        dromedary::connected_url_user(&base)
+    }
+
+    #[getter]
+    fn _password(slf: PyRef<'_, Self>) -> Option<String> {
+        let base = slf.as_super().0.base();
+        dromedary::connected_url_password(&base)
+    }
+
+    #[getter]
+    fn _path(slf: PyRef<'_, Self>) -> String {
+        let base = slf.as_super().0.base();
+        dromedary::connected_url_path(&base)
+    }
+
+    /// Default `disconnect` — a no-op. Concrete transports with an
+    /// explicit connection handle override this in Python (or extend
+    /// the pyclass and override the pymethod).
+    fn disconnect(&self) {}
+
+    /// Return a transport for `other_base` sharing this transport's
+    /// connection state, or `None` if the URLs point at different
+    /// origins.
+    ///
+    /// The comparison logic lives in pure Rust (`classify_reuse_for`)
+    /// so pure-Rust callers use the same rules. This layer just
+    /// dispatches on the result: same-origin-same-path returns
+    /// `self`, same-origin-different-path calls back into Python to
+    /// let subclass `__init__` flow through with its extra kwargs
+    /// (e.g. HTTPS_transport's `ca_certs`).
+    fn _reuse_for<'py>(
+        slf: PyRef<'py, Self>,
+        py: Python<'py>,
+        other_base: &str,
+    ) -> PyResult<Py<PyAny>> {
+        let base = slf.as_super().0.base();
+        match dromedary::classify_reuse_for(&base, other_base) {
+            dromedary::ReuseMatch::None => Ok(py.None()),
+            dromedary::ReuseMatch::Same => Ok(slf.into_pyobject(py)?.into_any().unbind()),
+            dromedary::ReuseMatch::Sibling => {
+                let bound = slf.into_pyobject(py)?;
+                let cls = bound.get_type();
+                let kwargs = pyo3::types::PyDict::new(py);
+                kwargs.set_item("_from_transport", bound.clone())?;
+                let sibling = cls.call((other_base,), Some(&kwargs))?;
+                Ok(sibling.unbind())
+            }
+        }
+    }
+}
 
 /// Shared base class for all Rust-backed Transport decorators.
 ///
@@ -123,6 +213,25 @@ pub(crate) fn map_transport_err_to_py_err(
             ShortReadvError::new_err((path, offset, expected, got))
         }
         Error::ResourceBusy(name) => ResourceBusy::new_err((pick_path(name),)),
+        Error::InvalidHttpResponse { path, msg } => InvalidHttpResponse::new_err((path, msg)),
+        Error::UnexpectedHttpStatus { path, code, extra } => {
+            UnexpectedHttpStatus::new_err((path, code, extra))
+        }
+        Error::InvalidHttpRange { path, range, msg } => {
+            InvalidHttpRange::new_err((path, range, msg))
+        }
+        Error::BadHttpRequest { path, reason } => BadHttpRequest::new_err((path, reason)),
+        Error::RedirectRequested {
+            source,
+            target,
+            is_permanent,
+        } => RedirectRequested::new_err((source, target, is_permanent)),
+        Error::UnusableRedirect {
+            source,
+            target,
+            reason,
+        } => UnusableRedirect::new_err((source, target, reason)),
+        Error::ConnectionError(msg) => ConnectionError::new_err((msg,)),
     }
 }
 
@@ -1297,6 +1406,7 @@ mod urlutils;
 #[pymodule]
 fn _transport_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<Transport>()?;
+    m.add_class::<ConnectedTransport>()?;
     m.add_class::<TransportDecorator>()?;
     let localm = PyModule::new(py, "local")?;
     localm.add_class::<LocalTransport>()?;

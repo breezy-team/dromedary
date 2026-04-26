@@ -2,6 +2,7 @@
 
 mod client;
 mod response;
+mod transport;
 
 use std::sync::Mutex;
 
@@ -334,6 +335,7 @@ pub(crate) fn register(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
 
     client::register(m)?;
     response::register(m)?;
+    transport::register(m)?;
 
     let locations = PyList::new(py, dromedary::http::SSL_CA_CERTS_KNOWN_LOCATIONS)?;
     m.add("SSL_CA_CERTS_KNOWN_LOCATIONS", locations)?;

@@ -472,6 +472,16 @@ fn char_is_safe(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '~'
 }
 
+/// Unquote percent-escapes of RFC 3986 unreserved characters
+/// (`A-Z a-z 0-9 - . _ ~`). Other percent-escapes are preserved.
+/// Callers use this to canonicalise URL paths that have been
+/// needlessly over-escaped (`%7E` → `~`).
+pub fn unquote_unreserved(path: &str) -> String {
+    URL_HEX_ESCAPES_RE
+        .replace_all(path, unescape_safe_chars)
+        .into_owned()
+}
+
 fn unescape_safe_chars(captures: &regex::Captures) -> String {
     let hex_digits = &captures[0][1..];
     let char_code = u8::from_str_radix(hex_digits, 16).unwrap();
