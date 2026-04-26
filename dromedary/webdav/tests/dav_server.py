@@ -134,9 +134,12 @@ class TestingDAVRequestHandler(http_server.TestingHTTPRequestHandler):
             else:
                 return self.list_directory(path)
         ctype = self.guess_type(path)
-        mode = "r" if ctype.startswith("text/") else "rb"
+        # Always open in binary. The inherited SimpleHTTPRequestHandler
+        # picked text mode for `text/*` but then writes the file object
+        # to a binary socket via `shutil.copyfileobj` — the str-to-bytes
+        # mismatch raises TypeError on the first write.
         try:
-            f = open(path, mode)
+            f = open(path, "rb")
         except OSError:
             self.send_error(404, "File not found")
             return None

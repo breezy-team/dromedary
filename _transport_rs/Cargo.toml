@@ -18,9 +18,12 @@ tokio = { version = "1", features = ["rt", "io-util", "net", "sync", "macros"], 
 lazy_static = "1"
 
 [features]
-default = ["russh"]
+default = ["russh", "webdav"]
 gio = ["dromedary/gio"]
 russh = ["dep:russh", "dep:tokio"]
+# WebDAV bindings. Forwards to dromedary/webdav which pulls in
+# quick-xml for parsing multi-status PROPFIND responses.
+webdav = ["dromedary/webdav"]
 # TODO: add `libssh2` and `ssh2-rs` features when those backends are implemented.
 
 [target.'cfg(unix)'.dependencies]

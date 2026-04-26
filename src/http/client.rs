@@ -1,54 +1,45 @@
 //! Rust HTTP client used by the `HttpTransport` port.
 //!
-//! Wraps a [`ureq::Agent`] with dromedary-specific defaults: proxy
-//! config read from `<scheme>_proxy` / `no_proxy` env vars via our
-//! own resolver (keeps breezy's historical behaviour), root
-//! certificates loaded from a user-supplied bundle or the
-//! platform's native store, and the User-Agent managed by the
-//! module-level setter.
+//! Wraps a [`reqwest::blocking::Client`] with dromedary-specific
+//! defaults: proxy config read from `<scheme>_proxy` / `no_proxy`
+//! env vars via our own resolver (keeps breezy's historical
+//! behaviour), root certificates loaded from a user-supplied bundle
+//! or the platform's native store, and the User-Agent managed by
+//! the module-level setter.
+//!
+//! # Choice of HTTP library
+//!
+//! We started out on `ureq`. That lasted until the WebDAV port —
+//! `ureq-proto` (pulled in transitively) hard-codes a whitelist of
+//! HTTP methods in `ext.rs::verify_version` and rejects anything
+//! outside GET/HEAD/POST/PUT/DELETE/CONNECT/OPTIONS/TRACE/PATCH as
+//! `MethodVersionMismatch`. WebDAV's MKCOL / MOVE / COPY / PROPFIND
+//! / PROPPATCH are perfectly valid HTTP/1.1 methods per RFC 7230 but
+//! ureq-proto won't let them through. Swapping to `reqwest` (which
+//! sits on hyper and happily forwards any method) fixed that in one
+//! deliberate step — the swap is contained in this module and
+//! didn't touch any caller.
 //!
 //! # Known limitations
 //!
-//! ## Proxy protocol: CONNECT only
+//! ## Proxy client caching
 //!
-//! ureq's HTTP proxy support uses CONNECT tunneling for both
-//! `http://` and `https://` origin URLs. That's fine for HTTPS
-//! (everyone uses CONNECT) but differs from the pre-Rust
-//! urllib-based transport, which used absolute-form request-targets
-//! (`GET http://origin/path HTTP/1.1`) for plain HTTP through a
-//! proxy. Some proxy servers (notably squid in its default config)
-//! accept absolute-form GETs for plain HTTP but reject CONNECT to
-//! port 80, so users of that configuration will see a
-//! `501 Not Implemented` when combined with `http_proxy`.
-//!
-//! Workaround options today:
-//!
-//! - Use `https://` URLs (CONNECT works everywhere).
-//! - Configure the proxy server to allow CONNECT to plain HTTP
-//!   ports.
-//! - Set `no_proxy` to bypass the proxy for affected origins.
-//!
-//! TODO: swap in a custom `ureq::unversioned::transport::Connector`
-//! that emits absolute-form HTTP requests for plain-HTTP proxies.
-//! The Connector trait is at
-//! `ureq::unversioned::transport::Connector` — a chain that opens
-//! TCP to the *proxy* address and then writes the request with an
-//! absolute-form request-target (`GET http://origin/path HTTP/1.1`)
-//! rather than going through the CONNECT tunneling path. See
-//! [`HttpClient::choose_proxy`] for where the bad combination is
-//! detected today; the warning emitted there should go away once
-//! the connector is wired up.
-
-use std::path::Path;
-use std::time::Duration;
+//! reqwest bakes the proxy into the `Client` at construction
+//! (unlike ureq which let us override per-request). We work around
+//! that by caching a small set of pre-built clients keyed by the
+//! effective proxy URL; the common cases (no proxy, one proxy) hit
+//! at most two distinct clients. Tests that flip env vars mid-run
+//! rebuild a client on demand — there's no connection-pool warmup
+//! worth protecting at that scale.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Mutex;
+use std::time::Duration;
 
-use ureq::config::Config;
-use ureq::http::{Method, Request, Response, Uri};
-use ureq::tls::{Certificate, PemItem, RootCerts, TlsConfig};
-use ureq::{Agent, Body, Proxy};
+use http::{Method, Uri};
+use reqwest::blocking::{Client, ClientBuilder, Request as ReqwestRequest, Response};
+use reqwest::{Certificate, Proxy};
 use url::Url;
 
 use crate::http::auth::{
@@ -66,8 +57,8 @@ use crate::http::{
 /// `dromedary.errors` classes so existing callers don't notice.
 #[derive(Debug)]
 pub enum ClientError {
-    /// The underlying ureq call failed (TLS, transport, timeout, …).
-    Transport(ureq::Error),
+    /// The underlying reqwest call failed (TLS, transport, timeout, …).
+    Transport(reqwest::Error),
     /// A URL or HTTP method was supplied that we couldn't parse.
     InvalidRequest(String),
     /// Error reading or writing the response body.
@@ -86,8 +77,8 @@ impl std::fmt::Display for ClientError {
 
 impl std::error::Error for ClientError {}
 
-impl From<ureq::Error> for ClientError {
-    fn from(e: ureq::Error) -> Self {
+impl From<reqwest::Error> for ClientError {
+    fn from(e: reqwest::Error) -> Self {
         Self::Transport(e)
     }
 }
@@ -243,16 +234,19 @@ fn auth_cache_key(uri: &Uri) -> AuthCacheKey {
 }
 
 /// Key under which proxy auth is cached. Proxy credentials bind to
-/// the proxy URL, not the origin, so we key on the proxy's own
-/// host + port.
-fn proxy_cache_key(proxy: &Proxy) -> AuthCacheKey {
-    // ureq's Proxy exposes host/port as &str/u16. Lowercase the host
-    // for case-insensitive matching.
-    let host = proxy.host().to_ascii_lowercase();
-    let port = proxy.port();
-    // The "scheme" for proxy-cache-key is always "proxy" — we don't
-    // need to distinguish HTTP-tunnelled proxy from SOCKS here
-    // because the proxy protocol is fixed per Proxy instance.
+/// the proxy URL, not the origin, so we key on the proxy's own URL.
+/// reqwest's `Proxy` type doesn't expose the URL back for inspection,
+/// so we track the raw string we built the proxy from alongside it.
+fn proxy_cache_key(proxy_url: &str) -> AuthCacheKey {
+    let parsed = Url::parse(proxy_url).ok();
+    let host = parsed
+        .as_ref()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+        .unwrap_or_default();
+    let port = parsed
+        .as_ref()
+        .and_then(|u| u.port_or_known_default())
+        .unwrap_or(80);
     ("proxy".to_string(), host, port)
 }
 
@@ -450,19 +444,24 @@ pub struct HttpClientConfig {
     pub read_timeout: Option<Duration>,
 }
 
-/// HTTP client wrapper around [`ureq::Agent`].
+/// HTTP client wrapper around [`reqwest::blocking::Client`].
 ///
 /// Proxies are resolved per-request from the current environment,
 /// matching the Python urllib behaviour where `ProxyHandler` reads
-/// env vars at construction and every redirect cycle. We don't
-/// cache the env-var snapshot because the Python tests assume
-/// setting `HTTP_PROXY` mid-test takes effect immediately.
+/// env vars at construction and every redirect cycle. reqwest bakes
+/// proxy config into the Client so we maintain a small cache of
+/// pre-built clients keyed by the effective proxy URL; requests
+/// pick the matching client at dispatch time. Env-var changes take
+/// effect immediately — a new proxy URL forces a new client build.
 pub struct HttpClient {
-    /// The configured agent. Proxies are applied per-request via
-    /// `configure_request`, not baked into the agent, so env-var
-    /// changes take effect immediately without rebuilding the
-    /// agent's connection pool.
-    agent: Agent,
+    /// Holds the inputs needed to rebuild a client for a specific
+    /// proxy URL. Without this we'd have to re-parse the TLS bundle
+    /// and re-resolve the user agent on every proxy switch; cheap
+    /// but wasteful.
+    config: HttpClientConfig,
+    /// Cache of built clients keyed by proxy URL (`""` means "no
+    /// proxy"). Populated lazily as callers hit new proxies.
+    clients: Mutex<HashMap<String, Client>>,
     /// Per-origin cache of successful auth state. Populated after
     /// the server accepts our credentials; subsequent requests to
     /// the same host preemptively attach the cached header.
@@ -506,15 +505,44 @@ impl HttpClient {
         credentials: Box<dyn CredentialProvider>,
         negotiate: Box<dyn NegotiateProvider>,
     ) -> Result<Self> {
-        let base_config = build_config(&config)?;
-        let agent = Agent::new_with_config(base_config);
+        // Eagerly build the no-proxy client so construction fails
+        // loudly on a bad config (missing CA bundle, etc.) rather
+        // than at first request.
+        let mut clients = HashMap::new();
+        let initial = build_client(&config, None)?;
+        clients.insert(String::new(), initial);
         Ok(Self {
-            agent,
+            config,
+            clients: Mutex::new(clients),
             auth_cache: AuthCache::new(),
             proxy_auth_cache: AuthCache::new(),
             credentials,
             negotiate,
         })
+    }
+
+    /// Return (cloning if necessary) the client for a given proxy
+    /// URL. The empty string is the "no proxy" key.
+    fn client_for_proxy(&self, proxy_url: &str) -> Result<Client> {
+        {
+            let cache = self.clients.lock().unwrap();
+            if let Some(c) = cache.get(proxy_url) {
+                return Ok(c.clone());
+            }
+        }
+        let proxy = if proxy_url.is_empty() {
+            None
+        } else {
+            Some(Proxy::all(proxy_url).map_err(|e| {
+                ClientError::InvalidRequest(format!("bad proxy URL {}: {}", proxy_url, e))
+            })?)
+        };
+        let client = build_client(&self.config, proxy)?;
+        self.clients
+            .lock()
+            .unwrap()
+            .insert(proxy_url.to_string(), client.clone());
+        Ok(client)
     }
 
     /// Perform an HTTP request with default options (no redirect
@@ -583,9 +611,13 @@ impl HttpClient {
 
         // Resolve the proxy ahead of time so both the preemptive
         // header attach and the 407 retry can use the same key.
-        let proxy = self.choose_proxy(&uri)?;
+        let proxy_url = self.choose_proxy(&uri)?;
         let origin_key = auth_cache_key(&uri);
-        let proxy_key = proxy.as_ref().map(proxy_cache_key);
+        let proxy_key = if proxy_url.is_empty() {
+            None
+        } else {
+            Some(proxy_cache_key(&proxy_url))
+        };
 
         // Preemptively attach cached auth headers. Callers' explicit
         // headers take precedence — don't clobber.
@@ -610,7 +642,8 @@ impl HttpClient {
             }
         }
 
-        let mut response = self.send_once(method, url, &first_headers, body, activity)?;
+        let mut response =
+            self.send_once(method, url, &first_headers, body, activity, &proxy_url)?;
         if response.status != 401 && response.status != 407 {
             return Ok(response);
         }
@@ -643,6 +676,7 @@ impl HttpClient {
                 headers,
                 body,
                 activity,
+                &proxy_url,
                 &mut response,
                 &self.proxy_auth_cache,
                 &proxy_key,
@@ -668,6 +702,7 @@ impl HttpClient {
             headers,
             body,
             activity,
+            &proxy_url,
             &mut response,
             &self.auth_cache,
             &origin_key,
@@ -707,6 +742,7 @@ impl HttpClient {
         headers: &[(String, String)],
         body: &[u8],
         activity: Option<&ActivityCallback>,
+        proxy_url: &str,
         first_response: &mut HttpResponse,
         cache: &AuthCache,
         cache_key: &AuthCacheKey,
@@ -730,8 +766,8 @@ impl HttpClient {
             });
         };
 
-        // Return the first response's connection to ureq's pool
-        // before the retry. BodyReader doesn't drain on Drop.
+        // Return the first response's connection to the pool before
+        // the retry by draining any unread body.
         first_response.discard_body().ok();
 
         // Build the retry header. For Digest we persist the bumped
@@ -750,7 +786,7 @@ impl HttpClient {
         };
         retry_headers.push((header_name.into(), hdr));
 
-        let retry = self.send_once(method, url, &retry_headers, body, activity)?;
+        let retry = self.send_once(method, url, &retry_headers, body, activity, proxy_url)?;
         if retry.status < 400 {
             match &new_auth {
                 CachedAuth::Basic { .. } => {
@@ -891,47 +927,54 @@ impl HttpClient {
         headers: &[(String, String)],
         body: &[u8],
         activity: Option<&ActivityCallback>,
+        proxy_url: &str,
     ) -> Result<HttpResponse> {
-        let uri: Uri = url
-            .parse()
+        let client = self.client_for_proxy(proxy_url)?;
+
+        // Build the reqwest Request by hand. reqwest's Request is
+        // constructed from a `Method` and a `url::Url`, not from a
+        // plain string, so we go through url::Url first.
+        let parsed = Url::parse(url)
             .map_err(|_| ClientError::InvalidRequest(format!("bad URL: {}", url)))?;
-
-        let mut builder = Request::builder().method(method.clone()).uri(&uri);
-        for (k, v) in headers {
-            builder = builder.header(k, v);
+        let mut req = ReqwestRequest::new(method.clone(), parsed);
+        {
+            let hdrs = req.headers_mut();
+            for (k, v) in headers {
+                let name = reqwest::header::HeaderName::from_bytes(k.as_bytes()).map_err(|e| {
+                    ClientError::InvalidRequest(format!("bad header name {}: {}", k, e))
+                })?;
+                let value = reqwest::header::HeaderValue::from_str(v).map_err(|e| {
+                    ClientError::InvalidRequest(format!("bad header value for {}: {}", k, e))
+                })?;
+                hdrs.append(name, value);
+            }
         }
-        let req: Request<Vec<u8>> = builder
-            .body(body.to_vec())
-            .map_err(|e| ClientError::InvalidRequest(e.to_string()))?;
+        if !body.is_empty() {
+            *req.body_mut() = Some(reqwest::blocking::Body::from(body.to_vec()));
+        }
 
-        let req = match self.choose_proxy(&uri)? {
-            Some(proxy) => self.agent.configure_request(req).proxy(Some(proxy)).build(),
-            None => req,
-        };
-        // Report the upload size before the actual send. We don't
-        // have per-socket counters (ureq doesn't expose them) so we
-        // report the application-level byte count; matches what
-        // breezy's progress bar displayed with the urllib-handler
-        // version (which also reported len(data) at write time).
+        // Report the upload size before the actual send. Like the
+        // ureq version, we report the application-level byte count
+        // rather than per-socket counters (reqwest doesn't expose
+        // those either) — matches what breezy's progress bar showed
+        // under the urllib-handler transport.
         if let Some(cb) = activity {
             if !body.is_empty() {
                 cb(body.len(), ActivityDirection::Write);
             }
         }
-        let response = self.agent.run(req)?;
-        // Hand the callback to the response so reads from the
-        // streaming body keep reporting bytes to the UI. Cloning
-        // the Arc is cheap and keeps the callback alive for as long
-        // as the response does.
+
+        let response = client.execute(req)?;
         let activity_owned = activity.cloned();
-        HttpResponse::from_ureq(response, url.to_string(), activity_owned)
+        HttpResponse::from_reqwest(response, url.to_string(), activity_owned)
     }
 
     /// Decide whether the request to `uri` should go through a
     /// proxy. Consults `<scheme>_proxy` / `all_proxy` / `no_proxy`
     /// env vars via our [`getproxies_environment`] port of the
-    /// stdlib helper.
-    fn choose_proxy(&self, uri: &Uri) -> Result<Option<Proxy>> {
+    /// stdlib helper. Returns the proxy URL or an empty string to
+    /// signal "no proxy".
+    fn choose_proxy(&self, uri: &Uri) -> Result<String> {
         let scheme = uri.scheme_str().unwrap_or("http");
         let host = uri.host().unwrap_or_default();
         // Uri::port_u16 sidesteps the lifetime issue `uri.port()`
@@ -953,54 +996,28 @@ impl HttpClient {
         // currently depends on it. If that becomes necessary we can
         // add a `platform_bypass()` shim later.
         match evaluate_proxy_bypass(&host_with_port, no_proxy.as_deref()) {
-            ProxyBypass::Bypass => return Ok(None),
+            ProxyBypass::Bypass => return Ok(String::new()),
             ProxyBypass::UseProxy | ProxyBypass::Undecided => {}
         }
 
         let Some(proxy_url) = get_proxy_env_var(&env, scheme, Some("all")) else {
-            return Ok(None);
+            return Ok(String::new());
         };
-        // ureq tunnels via CONNECT for both http:// and https://
-        // origins. Some proxies (squid default) accept absolute-
-        // form GETs for plain HTTP but reject CONNECT to port 80.
-        // See the module-level docs + TODO. Warn once per process
-        // so users hitting the regression can diagnose it quickly.
-        if scheme == "http" {
-            warn_about_plain_http_proxy_once();
-        }
-        Proxy::new(&proxy_url)
-            .map(Some)
-            .map_err(|e| ClientError::InvalidRequest(format!("bad proxy URL {}: {}", proxy_url, e)))
+        Ok(proxy_url)
     }
 }
 
-/// Log-once guard for the plain-HTTP-through-proxy warning. Using a
-/// static `Once` keeps the client quiet for the common HTTPS case
-/// and emits a single diagnostic for the known-problematic
-/// combination. See the module-level `TODO` for the real fix.
-fn warn_about_plain_http_proxy_once() {
-    use std::sync::Once;
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        log::warn!(
-            "plain HTTP proxied request: ureq will tunnel via CONNECT \
-             rather than emit absolute-form GET. Proxies expecting \
-             absolute-form (e.g. squid default) may reject with \
-             501. Use https:// or set no_proxy to bypass. See \
-             dromedary::http::client module docs for details.",
-        );
-    });
-}
-
-/// Build the initial `ureq::Config` honouring our TLS/User-Agent/
-/// timeout settings. Proxy is left unset here — we inject it
-/// per-request in [`HttpClient::request`] so env-var changes take
-/// effect without rebuilding the client.
-fn build_config(config: &HttpClientConfig) -> Result<Config> {
-    let mut builder = Agent::config_builder();
-
-    let tls = build_tls_config(config)?;
-    builder = builder.tls_config(tls);
+/// Build a `reqwest::blocking::Client` honouring the given config
+/// and optional proxy. Called once per distinct proxy URL seen
+/// (including once for the "no proxy" case).
+fn build_client(config: &HttpClientConfig, proxy: Option<Proxy>) -> Result<Client> {
+    let mut builder = ClientBuilder::new()
+        // We follow redirects ourselves (Stage 7) so reqwest's
+        // built-in redirect policy is disabled.
+        .redirect(reqwest::redirect::Policy::none())
+        // Gzip is already in the default feature set we selected;
+        // make sure it actually gets applied.
+        .gzip(true);
 
     let ua = config
         .user_agent
@@ -1009,77 +1026,69 @@ fn build_config(config: &HttpClientConfig) -> Result<Config> {
     builder = builder.user_agent(ua);
 
     if let Some(t) = config.read_timeout {
-        builder = builder.timeout_global(Some(t));
+        builder = builder.timeout(t);
     }
-
-    // Let non-2xx surface as ordinary responses so we can inspect the
-    // status code for retry / auth-challenge / redirect logic.
-    builder = builder.http_status_as_error(false);
-
-    // We follow redirects ourselves (Stage 7) so ureq's built-in
-    // redirect loop is disabled.
-    builder = builder.max_redirects(0);
-
-    Ok(builder.build())
-}
-
-fn build_tls_config(config: &HttpClientConfig) -> Result<TlsConfig> {
-    let mut builder = TlsConfig::builder();
 
     if config.disable_verification {
-        builder = builder.disable_verification(true);
-        return Ok(builder.build());
+        builder = builder
+            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_hostnames(true);
+    } else if let Some(path) = &config.ca_certs_path {
+        for cert in root_certs_from_pem_file(path)? {
+            builder = builder.add_root_certificate(cert);
+        }
+        // Don't also trust the platform native store when the caller
+        // passed an explicit bundle — `reqwest` defaults that on with
+        // `rustls-tls-native-roots`, but the Python test suite sets
+        // a fake CA and expects only that bundle to match (tests
+        // against https with a self-signed cert fail otherwise).
+        builder = builder.tls_built_in_native_certs(false);
+    }
+    // If no CA bundle was supplied and verification wasn't
+    // disabled, fall through and let reqwest's
+    // `rustls-tls-native-roots` feature do the right thing (load
+    // the OS trust store).
+
+    if let Some(proxy) = proxy {
+        builder = builder.proxy(proxy);
+    } else {
+        // reqwest defaults to picking up env-var proxies on its
+        // own; disable that so the only source of truth is our
+        // choose_proxy() resolver (which already checks env vars
+        // but with our historical precedence rules).
+        builder = builder.no_proxy();
     }
 
-    let root_certs = match &config.ca_certs_path {
-        Some(path) => root_certs_from_pem_file(path)?,
-        None => root_certs_from_native_store(),
-    };
-    builder = builder.root_certs(root_certs);
-    Ok(builder.build())
+    builder.build().map_err(ClientError::Transport)
 }
 
-fn root_certs_from_pem_file(path: &Path) -> Result<RootCerts> {
+/// Parse a PEM file into `reqwest::Certificate`s. Each cert in the
+/// bundle becomes one trust anchor.
+fn root_certs_from_pem_file(path: &Path) -> Result<Vec<Certificate>> {
     let bytes = std::fs::read(path)?;
-    let certs: Vec<Certificate<'static>> = ureq::tls::parse_pem(&bytes)
-        .filter_map(|p| p.ok())
-        .filter_map(|p| match p {
-            PemItem::Certificate(c) => Some(c),
-            _ => None,
-        })
-        .collect();
-    Ok(certs.into())
-}
-
-fn root_certs_from_native_store() -> RootCerts {
-    // `rustls-native-certs` returns DER-encoded roots. The ureq
-    // Certificate API is zero-copy against the DER bytes but we
-    // need `'static`; cloning the bytes into each cert gives us
-    // that.
-    let native = rustls_native_certs::load_native_certs();
-    let certs: Vec<Certificate<'static>> = native
-        .certs
-        .into_iter()
-        .map(|c| {
-            // `to_owned` copies the DER bytes into a `Certificate<'static>`.
-            Certificate::from_der(c.as_ref()).to_owned()
-        })
-        .collect();
-    if certs.is_empty() {
-        // No native certs available — fall through to ureq's built-in
-        // WebPKI bundle so we aren't left with zero roots.
-        return RootCerts::WebPki;
+    // reqwest can parse a bundle via `Certificate::from_pem_bundle`
+    // (returns all certs in one call). Fall back to `from_pem` if
+    // the bundle contains only one cert and the bundle parser isn't
+    // available in the pinned reqwest version.
+    match Certificate::from_pem_bundle(&bytes) {
+        Ok(certs) => Ok(certs),
+        Err(_) => {
+            // Single-cert fallback.
+            let cert = Certificate::from_pem(&bytes).map_err(|e| {
+                ClientError::InvalidRequest(format!("failed to parse CA bundle: {}", e))
+            })?;
+            Ok(vec![cert])
+        }
     }
-    certs.into()
 }
 
 /// Response returned by [`HttpClient::request`]. Headers are
 /// eagerly parsed; the body is streamed on demand.
 ///
 /// Callers that only care about status / headers pay nothing for
-/// the body — it stays as a live `ureq::BodyReader` and is
-/// consumed only when something calls [`read`](Self::read) /
-/// [`read_to_end`](Self::read_to_end) / [`body`](Self::body).
+/// the body — it stays as a live reqwest response and is consumed
+/// only when something calls [`read`](Self::read) /
+/// [`body`](Self::body).
 pub struct HttpResponse {
     /// HTTP status code (e.g. 200, 404, 302).
     pub status: u16,
@@ -1106,12 +1115,10 @@ pub struct HttpResponse {
 /// transitions to `Buffered` so subsequent reads are cheap and
 /// idempotent.
 enum BodyState {
-    /// Body hasn't been fully consumed yet. We wrap ureq's
-    /// `BodyReader` with `CountingReader` so every byte transferred
-    /// out of the stream ticks the activity callback — that way
-    /// progress bars advance smoothly as the response downloads
-    /// rather than jumping once at the end.
-    Streaming(CountingReader<ureq::BodyReader<'static>>),
+    /// Body hasn't been fully consumed yet. reqwest's Response
+    /// implements `std::io::Read`, so we wrap it in
+    /// `CountingReader` for byte-level activity reporting.
+    Streaming(CountingReader<Response>),
     /// Body was fully drained into a buffer. Cursor tracks how
     /// much of it has been handed out through `read()`.
     Buffered(std::io::Cursor<Vec<u8>>),
@@ -1157,8 +1164,8 @@ impl std::fmt::Debug for HttpResponse {
 }
 
 impl HttpResponse {
-    fn from_ureq(
-        resp: Response<Body>,
+    fn from_reqwest(
+        resp: Response,
         final_url: String,
         activity: Option<ActivityCallback>,
     ) -> Result<Self> {
@@ -1166,9 +1173,8 @@ impl HttpResponse {
         // HTTP/2 has no reason phrase — fall back to the canonical
         // text for the status code so callers always get something.
         let reason = resp.status().canonical_reason().unwrap_or("").to_string();
-        let (parts, body) = resp.into_parts();
-        let mut headers: Vec<(String, String)> = Vec::with_capacity(parts.headers.len());
-        for (name, value) in &parts.headers {
+        let mut headers: Vec<(String, String)> = Vec::with_capacity(resp.headers().len());
+        for (name, value) in resp.headers() {
             if let Ok(v) = value.to_str() {
                 headers.push((name.as_str().to_string(), v.to_string()));
             }
@@ -1179,7 +1185,7 @@ impl HttpResponse {
             headers,
             final_url,
             redirected_to: None,
-            body: BodyState::Streaming(CountingReader::new(body.into_reader(), activity)),
+            body: BodyState::Streaming(CountingReader::new(resp, activity)),
         })
     }
 
@@ -1207,7 +1213,7 @@ impl HttpResponse {
         let mut out = vec![0u8; n];
         let got = match &mut self.body {
             BodyState::Streaming(reader) => {
-                // BodyReader::read can return short reads; loop until
+                // Response::read can return short reads; loop until
                 // we have `n` bytes or hit EOF, matching the usual
                 // Python .read(n) contract that fills the buffer on
                 // a socket.
@@ -1251,9 +1257,9 @@ impl HttpResponse {
 
     /// Drain and discard the body, leaving the response marked as
     /// consumed. Used on the 401 path when we're about to retry —
-    /// we need the underlying socket returned to ureq's pool but
-    /// don't care about the body content. Subsequent `read` /
-    /// `body` calls return empty.
+    /// we need the underlying socket returned to the pool but don't
+    /// care about the body content. Subsequent `read` / `body`
+    /// calls return empty.
     pub fn discard_body(&mut self) -> std::io::Result<()> {
         if let BodyState::Streaming(reader) = &mut self.body {
             std::io::copy(reader, &mut std::io::sink())?;
@@ -1281,7 +1287,6 @@ impl HttpResponse {
             .collect()
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1341,12 +1346,12 @@ mod tests {
                 // Host listed in no_proxy → no proxy applied.
                 let uri: Uri = "http://internal.example/".parse().unwrap();
                 let p = client.choose_proxy(&uri).unwrap();
-                assert!(p.is_none(), "no_proxy match should skip the proxy");
+                assert!(p.is_empty(), "no_proxy match should skip the proxy");
 
                 // Host not listed → proxy applies.
                 let uri: Uri = "http://public.example/".parse().unwrap();
                 let p = client.choose_proxy(&uri).unwrap();
-                assert!(p.is_some(), "non-matching host should honour the proxy");
+                assert!(!p.is_empty(), "non-matching host should honour the proxy");
             },
         );
     }
@@ -1370,12 +1375,12 @@ mod tests {
             || {
                 let uri: Uri = "https://public.example/".parse().unwrap();
                 let p = client.choose_proxy(&uri).unwrap();
-                assert!(p.is_some(), "HTTPS request should pick up https_proxy");
+                assert!(!p.is_empty(), "HTTPS request should pick up https_proxy");
 
                 let uri: Uri = "http://public.example/".parse().unwrap();
                 let p = client.choose_proxy(&uri).unwrap();
                 assert!(
-                    p.is_none(),
+                    p.is_empty(),
                     "HTTP request shouldn't pick up https_proxy when http_proxy is unset"
                 );
             },
@@ -1847,18 +1852,17 @@ mod tests {
         // Same host reached directly vs via a proxy should use
         // different cache buckets so credentials don't leak.
         let origin: Uri = "http://example.com/".parse().unwrap();
-        let proxy = Proxy::new("http://proxy.example:8080").unwrap();
         let ok = auth_cache_key(&origin);
-        let pk = proxy_cache_key(&proxy);
+        let pk = proxy_cache_key("http://proxy.example:8080");
         assert_ne!(ok, pk);
     }
 
     #[test]
     fn proxy_cache_key_is_case_insensitive_on_host() {
         // Proxy host lookup shouldn't be affected by case variation.
-        let a = Proxy::new("http://PROXY.Example:3128").unwrap();
-        let b = Proxy::new("http://proxy.example:3128").unwrap();
-        assert_eq!(proxy_cache_key(&a), proxy_cache_key(&b));
+        let a = proxy_cache_key("http://PROXY.Example:3128");
+        let b = proxy_cache_key("http://proxy.example:3128");
+        assert_eq!(a, b);
     }
 
     #[test]

@@ -1,8 +1,8 @@
 //! Python bindings for the HTTP helper functions in `dromedary::http`.
 
-mod client;
+pub(crate) mod client;
 mod response;
-mod transport;
+pub(crate) mod transport;
 
 use std::sync::Mutex;
 

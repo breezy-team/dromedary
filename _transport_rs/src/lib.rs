@@ -1402,6 +1402,8 @@ mod sftp;
 mod ssh;
 mod unlistable;
 mod urlutils;
+#[cfg(feature = "webdav")]
+mod webdav;
 
 #[pymodule]
 fn _transport_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
@@ -1466,6 +1468,14 @@ fn _transport_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     http::register(py, &httpm)?;
     m.add_submodule(&httpm)?;
 
+    #[cfg(feature = "webdav")]
+    let webdavm = {
+        let webdavm = PyModule::new(py, "webdav")?;
+        webdav::register(&webdavm)?;
+        m.add_submodule(&webdavm)?;
+        webdavm
+    };
+
     let logm = PyModule::new(py, "log")?;
     log::register(py, &logm)?;
     m.add_submodule(&logm)?;
@@ -1496,6 +1506,8 @@ fn _transport_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     modules.set_item(format!("{}.pathfilter", module_name), &pathfilterm)?;
     modules.set_item(format!("{}.memory", module_name), &memorym)?;
     modules.set_item(format!("{}.http", module_name), &httpm)?;
+    #[cfg(feature = "webdav")]
+    modules.set_item(format!("{}.webdav", module_name), &webdavm)?;
     modules.set_item(format!("{}.log", module_name), &logm)?;
     #[cfg(feature = "gio")]
     modules.set_item(format!("{}.gio", module_name), &giom)?;

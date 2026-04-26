@@ -59,8 +59,7 @@ impl HttpTransport {
     /// `http` or `https` scheme (optionally with a `+impl` suffix
     /// like `http+urllib://`, which we ignore beyond logging).
     pub fn new(base: &str, client: Arc<HttpClient>) -> Result<Self> {
-        let (unqualified_scheme, normalised_base, segment_parameters) =
-            normalise_http_url(base)?;
+        let (unqualified_scheme, normalised_base, segment_parameters) = normalise_http_url(base)?;
         Ok(Self {
             base: normalised_base,
             unqualified_scheme,
@@ -1220,11 +1219,7 @@ mod tests {
     fn segment_parameters_dont_appear_on_the_wire() {
         // `remote_url` is the URL we hand the server — segment params
         // are a dromedary-internal convention and must stay local.
-        let t = HttpTransport::new(
-            "http://example.com/path/,key=val",
-            fresh_client(),
-        )
-        .unwrap();
+        let t = HttpTransport::new("http://example.com/path/,key=val", fresh_client()).unwrap();
         let remote = t.remote_url("file").unwrap();
         assert!(!remote.as_str().contains(','));
         assert!(!remote.as_str().contains("key=val"));
@@ -1264,11 +1259,7 @@ mod tests {
         // Matches Python ConnectedTransport semantics: clone drops
         // segment parameters because they belong to the specific
         // base URL, not to the connection.
-        let t = HttpTransport::new(
-            "http://example.com/a/,key=val",
-            fresh_client(),
-        )
-        .unwrap();
+        let t = HttpTransport::new("http://example.com/a/,key=val", fresh_client()).unwrap();
         let cloned = t.clone_concrete(None).unwrap();
         assert!(cloned.get_segment_parameters().unwrap().is_empty());
     }
@@ -1305,19 +1296,12 @@ mod tests {
         // used (80 for http, 443 for https) — callers that want the
         // default port fall back themselves.
         let t = HttpTransport::new("http://example.com/", fresh_client()).unwrap();
-        assert_eq!(
-            <HttpTransport as crate::ConnectedTransport>::port(&t),
-            None
-        );
+        assert_eq!(<HttpTransport as crate::ConnectedTransport>::port(&t), None);
     }
 
     #[test]
     fn connected_user_and_password_are_percent_decoded() {
-        let t = HttpTransport::new(
-            "http://jo%40home:p%40ss@example.com/",
-            fresh_client(),
-        )
-        .unwrap();
+        let t = HttpTransport::new("http://jo%40home:p%40ss@example.com/", fresh_client()).unwrap();
         assert_eq!(
             <HttpTransport as crate::ConnectedTransport>::user(&t),
             Some("jo@home".to_string())
@@ -1331,10 +1315,7 @@ mod tests {
     #[test]
     fn connected_user_and_password_absent_when_not_in_url() {
         let t = HttpTransport::new("http://example.com/", fresh_client()).unwrap();
-        assert_eq!(
-            <HttpTransport as crate::ConnectedTransport>::user(&t),
-            None
-        );
+        assert_eq!(<HttpTransport as crate::ConnectedTransport>::user(&t), None);
         assert_eq!(
             <HttpTransport as crate::ConnectedTransport>::password(&t),
             None

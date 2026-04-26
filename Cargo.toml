@@ -45,9 +45,14 @@ hex = "0.4"
 rand = "0.8"
 rustls-native-certs = "0.8"
 base64 = "0.22"
-ureq = { version = "3", default-features = false, features = ["rustls", "gzip", "json"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# reqwest replaces ureq: ureq-proto (transitive) hardcodes a method
+# whitelist that rejects WebDAV verbs (MKCOL, MOVE, COPY, PROPFIND).
+# reqwest is hyper-based and accepts arbitrary methods. `blocking`
+# keeps our sync API shape; `rustls-tls-native-roots` wires rustls
+# with the platform's native trust store.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "gzip", "blocking"] }
 http = "1"
+quick-xml = { version = "0.37", optional = true }
 gio = { version = "0.22", optional = true }
 glib = { version = "0.22", optional = true }
 
@@ -55,6 +60,10 @@ glib = { version = "0.22", optional = true }
 default = ["pyo3"]
 pyo3 = ["dep:pyo3", "dep:pyo3-filelike"]
 gio = ["dep:gio", "dep:glib"]
+# WebDAV transport on top of HTTP. Pulls in quick-xml for parsing
+# multi-status PROPFIND responses; opt-in because callers that only
+# need HTTP shouldn't pay the XML-parser cost.
+webdav = ["dep:quick-xml"]
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["fs", "uio"] }
