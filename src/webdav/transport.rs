@@ -111,9 +111,7 @@ impl HttpDavTransport {
         if let Some(range) = range_header {
             headers.push(("Content-Range".to_string(), range));
         }
-        let resp = self
-            .inner
-            .request("PUT", abspath, &headers, bytes, false)?;
+        let resp = self.inner.request("PUT", abspath, &headers, bytes, false)?;
         match resp.status {
             200 | 201 | 204 => Ok(()),
             // Intermediate directories missing.
@@ -135,9 +133,7 @@ impl HttpDavTransport {
                 if overwrite { "T" } else { "F" }.to_string(),
             ),
         ];
-        let resp = self
-            .inner
-            .request("MOVE", abs_from, &headers, &[], false)?;
+        let resp = self.inner.request("MOVE", abs_from, &headers, &[], false)?;
         match resp.status {
             201 => Ok(()),
             // 204 means `to` already existed — allowed only when
@@ -306,7 +302,11 @@ impl Transport for HttpDavTransport {
         } else {
             0o100644
         };
-        let size = if dav.is_dir { 0 } else { dav.size.max(0) as usize };
+        let size = if dav.is_dir {
+            0
+        } else {
+            dav.size.max(0) as usize
+        };
         Ok(Stat {
             size,
             #[cfg(unix)]
@@ -499,7 +499,9 @@ impl Transport for HttpDavTransport {
         let abs_from = self.inner.remote_url(rel_from)?.to_string();
         let abs_to = self.inner.remote_url(rel_to)?.to_string();
         let headers = [("Destination".to_string(), abs_to.clone())];
-        let resp = self.inner.request("COPY", &abs_from, &headers, &[], false)?;
+        let resp = self
+            .inner
+            .request("COPY", &abs_from, &headers, &[], false)?;
         match resp.status {
             // Apache returns 204 on overwrite; the dromedary test
             // server returns 201. Both are acceptable per RFC 4918.

@@ -379,7 +379,6 @@ enum AuthKind {
     Proxy,
 }
 
-
 /// Cached per-origin authentication state. Once the server accepts
 /// our credentials we preemptively attach the same auth header to
 /// subsequent requests to the same host+port, matching urllib's
@@ -643,7 +642,8 @@ impl HttpClient {
             }
         }
 
-        let mut response = self.send_once(method, url, &first_headers, body, activity, &proxy_url)?;
+        let mut response =
+            self.send_once(method, url, &first_headers, body, activity, &proxy_url)?;
         if response.status != 401 && response.status != 407 {
             return Ok(response);
         }
@@ -944,10 +944,7 @@ impl HttpClient {
                     ClientError::InvalidRequest(format!("bad header name {}: {}", k, e))
                 })?;
                 let value = reqwest::header::HeaderValue::from_str(v).map_err(|e| {
-                    ClientError::InvalidRequest(format!(
-                        "bad header value for {}: {}",
-                        k, e
-                    ))
+                    ClientError::InvalidRequest(format!("bad header value for {}: {}", k, e))
                 })?;
                 hdrs.append(name, value);
             }
@@ -2009,7 +2006,6 @@ mod tests {
         // After discard, reads return empty.
         assert_eq!(r.read(None).unwrap(), Vec::<u8>::new());
     }
-
 
     #[test]
     fn cached_auth_header_digest_bumps_nonce_count_via_clone() {

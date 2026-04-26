@@ -142,11 +142,7 @@ impl HttpDavTransport {
     /// bytes object. Used by the Python subclass's `get()` override
     /// (the DAV transport uses the inherited `request()` machinery
     /// and wants the body materialised in one shot).
-    fn _get_bytes<'py>(
-        &self,
-        py: Python<'py>,
-        relpath: &str,
-    ) -> PyResult<Bound<'py, PyBytes>> {
+    fn _get_bytes<'py>(&self, py: Python<'py>, relpath: &str) -> PyResult<Bound<'py, PyBytes>> {
         let buf = py
             .detach(|| -> Result<Vec<u8>, dromedary::Error> {
                 use dromedary::Transport as _;
@@ -216,13 +212,8 @@ impl HttpDavTransport {
     ) -> PyResult<()> {
         use dromedary::Transport as _;
         py.detach(|| {
-            self.inner.put_bytes_non_atomic(
-                relpath,
-                bytes,
-                None,
-                Some(create_parent_dir),
-                None,
-            )
+            self.inner
+                .put_bytes_non_atomic(relpath, bytes, None, Some(create_parent_dir), None)
         })
         .map_err(|e| map_transport_err_to_py_err(e, None, Some(relpath)))
     }
@@ -253,9 +244,7 @@ impl HttpDavTransport {
         // Return a SimpleNamespace so callers use dotted access
         // (bzr reads `st.st_mode`, not `st['st_mode']`).
         let types = py.import("types")?;
-        let ns = types
-            .getattr("SimpleNamespace")?
-            .call((), Some(&dict))?;
+        let ns = types.getattr("SimpleNamespace")?.call((), Some(&dict))?;
         Ok(ns)
     }
 

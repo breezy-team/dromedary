@@ -59,6 +59,7 @@ class HttpDavTransport(_webdav_rs.HttpDavTransport):
                 ca_certs = configured
 
         import ssl as _ssl
+
         import dromedary.http as _mod_http
 
         disable_verification = _mod_http.ssl_cert_reqs() == _ssl.CERT_NONE
@@ -79,7 +80,8 @@ class HttpDavTransport(_webdav_rs.HttpDavTransport):
             self._rust_replace_inner_from(_from_transport, offset)
         return self
 
-    def __init__(self, base, _from_transport=None, ca_certs=None):  # noqa: ARG002
+    def __init__(self, base, _from_transport=None, ca_certs=None):
+        """Initialize the Python-side state."""
         # Rust __new__ populates the transport state. The only
         # Python-side slot is `_medium`, which breezy's HttpDav
         # subclass fills in on first `get_smart_medium()` call.
@@ -117,7 +119,7 @@ class HttpDavTransport(_webdav_rs.HttpDavTransport):
         """Return ``relpath``'s contents as bytes."""
         return self._get_bytes(relpath)
 
-    def put_file(self, relpath, f, mode=None):  # noqa: ARG002
+    def put_file(self, relpath, f, mode=None):
         """Store the contents of `f` at `relpath`. Returns the length."""
         data = f.read()
         self.put_bytes(relpath, data)
@@ -127,14 +129,14 @@ class HttpDavTransport(_webdav_rs.HttpDavTransport):
         self,
         relpath,
         f,
-        mode=None,  # noqa: ARG002
+        mode=None,
         create_parent_dir=False,
-        dir_mode=None,  # noqa: ARG002
+        dir_mode=None,
     ):
         """Non-atomic version of put_file (skips the temp-file dance)."""
         self.put_bytes_non_atomic(relpath, f.read(), create_parent_dir)
 
-    def append_file(self, relpath, f, mode=None):  # noqa: ARG002
+    def append_file(self, relpath, f, mode=None):
         """Append `f.read()` to `relpath`. Returns the old length."""
         return self.append_bytes(relpath, f.read())
 
