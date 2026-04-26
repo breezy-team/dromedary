@@ -88,9 +88,9 @@ class HttpTransport(_http_rs.HttpTransport):
         return self
 
     def __init__(self, base, _from_transport=None, ca_certs=None):
-        # Rust __new__ populates all the transport state. The only
-        # Python-side attribute is the _medium slot filled in by
-        # breezy when get_smart_medium() is first called.
+        """Initialise Python-side state; Rust ``__new__`` owns transport state."""
+        # The only Python-side attribute is the _medium slot filled in
+        # by breezy when get_smart_medium() is first called.
         self._medium = None
 
     def clone(self, offset=None):
@@ -266,9 +266,9 @@ def get_test_permutations():
     from dromedary.tests import http_server
 
     permutations = [(HttpTransport, http_server.HttpServer)]
-    try:
-        import ssl
+    import importlib.util
 
+    if importlib.util.find_spec("ssl") is not None:
         from dromedary.tests import https_server, ssl_certs
 
         _ca_path = ssl_certs.build_path("ca.crt")
@@ -290,6 +290,4 @@ def get_test_permutations():
                 )
 
         permutations.append((HTTPS_transport, https_server.HTTPSServer))
-    except ModuleNotFoundError:
-        pass
     return permutations
