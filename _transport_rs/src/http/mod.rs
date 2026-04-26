@@ -29,6 +29,29 @@ lazy_static! {
     /// Called as `cb(host) -> Optional[str]`; the returned string
     /// goes after `Negotiate ` in the Authorization header.
     static ref NEGOTIATE_PROVIDER: Mutex<Option<Py<PyAny>>> = Mutex::new(None);
+    /// Registered auth-header-sent callback. The Rust client calls
+    /// this just before sending a request carrying an Authorization
+    /// or Proxy-Authorization header; breezy uses it to emit a
+    /// `trace.mutter("> %s: <masked>", header_name)` line when the
+    /// `http` debug flag is on, so users can confirm auth happened
+    /// without leaking the credential value into logs.
+    static ref AUTH_HEADER_TRACE: Mutex<Option<Py<PyAny>>> = Mutex::new(None);
+}
+
+/// Invoke the registered auth-header-trace callback. No-op if no
+/// callback is set. Errors from the callback are swallowed — this
+/// is a tracing hook, not a control-flow one, so a broken logger
+/// mustn't break HTTP auth.
+pub(crate) fn invoke_auth_header_trace(header_name: &str) {
+    Python::attach(|py| {
+        let cb = {
+            let guard = AUTH_HEADER_TRACE.lock().unwrap();
+            guard.as_ref().map(|p| p.clone_ref(py))
+        };
+        if let Some(cb) = cb {
+            let _ = cb.bind(py).call1((header_name,));
+        }
+    });
 }
 
 /// Invoke the registered Negotiate callback. Returns `None` if no
@@ -60,6 +83,8 @@ pub(super) fn invoke_credential_lookup(
     host: &str,
     port: Option<u16>,
     realm: Option<&str>,
+    user: Option<&str>,
+    is_proxy: bool,
 ) -> (Option<String>, Option<String>) {
     Python::attach(|py| {
         let cb = {
@@ -71,14 +96,37 @@ pub(super) fn invoke_credential_lookup(
         };
         let kwargs = pyo3::types::PyDict::new(py);
         // The Python callback signature is
-        // `(protocol, host, port=None, path=None, realm=None)`; we
-        // leave `path` as None because the Rust client doesn't
-        // track it per-request (breezy's urllib version did, but
-        // the value was rarely used by downstream credential stores).
+        // `(protocol, host, port=None, path=None, realm=None, user=None,
+        //   is_proxy=False)`;
+        // we leave `path` as None because the Rust client doesn't track
+        // it per-request (breezy's urllib version did, but the value was
+        // rarely used by downstream credential stores). `user` is the
+        // URL-embedded username hint — breezy's AuthenticationConfig
+        // uses it to skip its own user prompt when the URL already
+        // names one. `is_proxy` tells the callback that the credentials
+        // are for a proxy (407) rather than the origin (401), so it can
+        // label interactive prompts accordingly.
         let _ = kwargs.set_item("port", port);
         let _ = kwargs.set_item("path", py.None());
         let _ = kwargs.set_item("realm", realm);
-        let result = cb.bind(py).call((protocol, host), Some(&kwargs));
+        if let Some(u) = user {
+            let _ = kwargs.set_item("user", u);
+        }
+        if is_proxy {
+            let _ = kwargs.set_item("is_proxy", true);
+        }
+        let mut result = cb.bind(py).call((protocol, host), Some(&kwargs));
+        // Older callbacks may not accept the `user` / `is_proxy` kwargs.
+        // If that's the cause of a TypeError, drop them progressively so
+        // we don't regress on callers that haven't been updated.
+        if result.is_err() && is_proxy {
+            let _ = kwargs.del_item("is_proxy");
+            result = cb.bind(py).call((protocol, host), Some(&kwargs));
+        }
+        if result.is_err() && user.is_some() {
+            let _ = kwargs.del_item("user");
+            result = cb.bind(py).call((protocol, host), Some(&kwargs));
+        }
         match result {
             Ok(obj) => {
                 let tup = match obj.cast::<PyTuple>() {
@@ -268,6 +316,23 @@ fn set_negotiate_provider(py: Python, func: Py<PyAny>) {
     };
 }
 
+/// Register a callback invoked when the HTTP client is about to
+/// send an Authorization or Proxy-Authorization header. The
+/// callable is invoked as `func(header_name)` — breezy uses this
+/// for debug tracing so users can confirm auth credentials were
+/// sent without exposing the values themselves in logs.
+///
+/// Passing `None` clears any previously-registered callback.
+#[pyfunction]
+fn set_auth_header_trace(py: Python, func: Py<PyAny>) {
+    let mut slot = AUTH_HEADER_TRACE.lock().unwrap();
+    *slot = if func.bind(py).is_none() {
+        None
+    } else {
+        Some(func)
+    };
+}
+
 /// Return the currently-registered Negotiate callback, or `None`.
 #[pyfunction]
 fn get_negotiate_provider(py: Python) -> Py<PyAny> {
@@ -331,6 +396,7 @@ pub(crate) fn register(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_credentials, m)?)?;
     m.add_function(wrap_pyfunction!(set_negotiate_provider, m)?)?;
     m.add_function(wrap_pyfunction!(get_negotiate_provider, m)?)?;
+    m.add_function(wrap_pyfunction!(set_auth_header_trace, m)?)?;
     m.add_function(wrap_pyfunction!(evaluate_proxy_bypass, m)?)?;
 
     client::register(m)?;

@@ -45,13 +45,63 @@ enum RangeHint {
 /// `unqualified_scheme` is the HTTP scheme without any `+impl`
 /// qualifier so we can hand back clean URLs from `external_url`
 /// and `_remote_path`.
+/// Per-transport readv tunables. Defaults match the historical
+/// urllib HttpTransport values; tests poke individual fields to
+/// force specific batching behaviour. Stored behind an `Arc<Mutex>`
+/// so clones share the same tuning state.
+#[derive(Debug, Clone)]
+pub struct ReadvTuning {
+    /// Max number of separate offsets to coalesce into one
+    /// `_CoalescedOffset` group. `0` means "no limit". Mirrors the
+    /// Python `_max_readv_combine` attribute.
+    pub max_readv_combine: usize,
+    /// "Fudge factor" — bytes to read between offsets before
+    /// preferring a seek. Default 128. Mirrors
+    /// `_bytes_to_read_before_seek`.
+    pub bytes_to_read_before_seek: usize,
+    /// Max byte size of a single coalesced range. `0` = no limit.
+    /// Mirrors `_get_max_size`.
+    pub get_max_size: usize,
+    /// Max number of byte ranges packed into one HTTP Range header.
+    /// Mirrors `_max_get_ranges`.
+    pub max_get_ranges: usize,
+}
+
+impl Default for ReadvTuning {
+    fn default() -> Self {
+        Self {
+            max_readv_combine: 0,
+            bytes_to_read_before_seek: 128,
+            get_max_size: 0,
+            // Apache's default range cap is ~400; pick well under that.
+            max_get_ranges: 200,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct HttpTransport {
     base: Url,
+    /// The base string as supplied to `new`, used as the authoritative
+    /// source of any URL-embedded userinfo that `url::Url` would
+    /// otherwise normalise away (`http://joe:@host/` → `http://joe@host/`
+    /// loses the empty password `test_empty_pass` distinguishes from
+    /// "password absent"). Contains the full original URL including
+    /// any `+impl` scheme suffix, password, and path.
+    raw_base: String,
     unqualified_scheme: String,
     segment_parameters: std::collections::BTreeMap<String, String>,
     client: Arc<HttpClient>,
     range_hint: Arc<Mutex<RangeHint>>,
+    readv_tuning: Arc<Mutex<ReadvTuning>>,
+    /// Optional per-transport activity callback. When set, it's
+    /// passed as the `activity` arg to each internal request
+    /// (get/has/post/_get/readv) so breezy's `_report_activity`
+    /// progress-bar hook sees byte counts for these implicit
+    /// requests as well. Wrapped in `Arc<Mutex<Option<...>>>` so
+    /// clones share the slot — setting it on one transport
+    /// propagates to clones and back.
+    activity: Arc<Mutex<Option<crate::http::client::ActivityCallback>>>,
 }
 
 impl HttpTransport {
@@ -62,11 +112,31 @@ impl HttpTransport {
         let (unqualified_scheme, normalised_base, segment_parameters) = normalise_http_url(base)?;
         Ok(Self {
             base: normalised_base,
+            raw_base: base.to_string(),
             unqualified_scheme,
             segment_parameters,
             client,
             range_hint: Arc::new(Mutex::new(RangeHint::Multi)),
+            readv_tuning: Arc::new(Mutex::new(ReadvTuning::default())),
+            activity: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Install (or replace) the per-transport activity callback.
+    /// Called from the PyO3 layer after construction so breezy's
+    /// `_report_activity` hook reaches internal get/has/post/readv
+    /// calls, not just the explicit `.request()` API that already
+    /// threads its own callback. Pass `None` to clear.
+    pub fn set_activity(&self, cb: Option<crate::http::client::ActivityCallback>) {
+        *self.activity.lock().unwrap() = cb;
+    }
+
+    /// Snapshot of the currently-installed activity callback, if
+    /// any. Helper for the request helpers — we clone the Arc so
+    /// the lock stays short-lived even when the request itself
+    /// takes a while.
+    fn activity_snapshot(&self) -> Option<crate::http::client::ActivityCallback> {
+        self.activity.lock().unwrap().clone()
     }
 
     /// Clone this transport at a new base URL. Shares the underlying
@@ -76,11 +146,19 @@ impl HttpTransport {
     /// which did the same via `_raw_base`).
     fn clone_at(&self, new_base: Url) -> Self {
         Self {
+            // The clone's raw_base is the new canonical URL. We lose
+            // the original's literal text (including any empty
+            // password markers), but clones are typically produced
+            // by offsetting from the parent, and credentials in the
+            // URL only matter on the initial construction.
+            raw_base: new_base.to_string(),
             base: new_base,
             unqualified_scheme: self.unqualified_scheme.clone(),
             segment_parameters: std::collections::BTreeMap::new(),
             client: self.client.clone(),
             range_hint: self.range_hint.clone(),
+            readv_tuning: self.readv_tuning.clone(),
+            activity: self.activity.clone(),
         }
     }
 
@@ -137,9 +215,18 @@ impl HttpTransport {
             follow_redirects,
             ..RequestOptions::default()
         };
+        let activity = self.activity_snapshot();
         let resp = self
             .client
-            .request_with(method, url, headers, body, &opts, None)
+            .request_with_origin_url(
+                method,
+                url,
+                &self.raw_base,
+                headers,
+                body,
+                &opts,
+                activity.as_ref(),
+            )
             .map_err(client_err_to_transport_err)?;
 
         let code = resp.status;
@@ -285,6 +372,21 @@ impl HttpTransport {
         }
     }
 
+    /// Shortcut the degradation ladder: jump straight to
+    /// `RangeHint::None` (full-file downloads). Used when a server
+    /// explicitly rejects a Range header rather than misbehaves on
+    /// the response — probing one range at a time gains nothing
+    /// there, and the full-file path finishes in a single GET.
+    /// Returns false if we're already at None.
+    pub(crate) fn jump_range_hint_to_none(&self) -> bool {
+        let mut hint = self.range_hint.lock().unwrap();
+        if *hint == RangeHint::None {
+            return false;
+        }
+        *hint = RangeHint::None;
+        true
+    }
+
     /// Current range hint as a short string: `"multi"`, `"single"`,
     /// or `None`. Matches the values the Python HttpTransport used
     /// so tests that reach into `_range_hint` continue to work.
@@ -294,6 +396,21 @@ impl HttpTransport {
             RangeHint::Single => Some("single"),
             RangeHint::None => None,
         }
+    }
+
+    /// Apply a [`ReadvTuning`] update — shared across all clones
+    /// because the tuning sits behind an `Arc<Mutex>`. Used by the
+    /// PyO3 wrapper's `_max_readv_combine` / `_max_get_ranges` /
+    /// `_get_max_size` / `_bytes_to_read_before_seek` setters so
+    /// breezy's test-harness tunables reach the readv coalescer.
+    pub fn set_readv_tuning(&self, tuning: ReadvTuning) {
+        *self.readv_tuning.lock().unwrap() = tuning;
+    }
+
+    /// Read the current [`ReadvTuning`] snapshot. Cloned to avoid
+    /// holding the lock across the readv call.
+    pub fn readv_tuning(&self) -> ReadvTuning {
+        self.readv_tuning.lock().unwrap().clone()
     }
 
     /// Accessor for the shared `HttpClient`. Exposed so the PyO3
@@ -481,6 +598,43 @@ fn normalise_http_url(
 
 /// Format a list of (start, length) offsets + optional tail amount
 /// as an HTTP Range header value.
+/// Collapse `//` and `/./` path segments per RFC 3986 §5.2.4.
+///
+/// `url::Url::join` applies this to the base URL but leaves the
+/// output path alone when relative joins introduce stray `./` or
+/// double slashes. breezy's tests assert that abspath emits the
+/// canonical form — `abspath(".bzr/1//2/./3")` on
+/// `http://host/bzr/bzr.dev/` should yield `/bzr/bzr.dev/.bzr/1/2/3`.
+fn collapse_path_segments(path: &str) -> String {
+    let has_leading_slash = path.starts_with('/');
+    let has_trailing_slash = path.len() > 1 && path.ends_with('/');
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" => {}  // empty segment from `//` or leading `/`
+            "." => {} // drop current-directory markers
+            ".." => {
+                // Pop the previous segment if we have one; otherwise
+                // leave the `..` in place (url::Url already handled
+                // overflow against the base).
+                if parts.pop().is_none() {
+                    parts.push("..");
+                }
+            }
+            s => parts.push(s),
+        }
+    }
+    let mut out = String::with_capacity(path.len());
+    if has_leading_slash {
+        out.push('/');
+    }
+    out.push_str(&parts.join("/"));
+    if has_trailing_slash && !out.ends_with('/') {
+        out.push('/');
+    }
+    out
+}
+
 fn format_range_header(offsets: &[(usize, usize)], tail_amount: usize) -> String {
     let mut parts: Vec<String> = offsets
         .iter()
@@ -499,7 +653,28 @@ fn format_range_header(offsets: &[(usize, usize)], tail_amount: usize) -> String
 /// boundary or single-range window.
 fn wrap_response_body(url: String, mut resp: HttpResponse) -> Result<(u16, HttpRangeFile)> {
     let status = resp.status;
-    let body = resp.read(None).map_err(Error::Io)?;
+    // Truncated response bodies (server promised Content-Length N
+    // but closed the socket before sending N bytes) surface as an
+    // io::Error wrapping a hyper::Error whose `is_incomplete_
+    // message()` is true. That's the same signal breezy's "short
+    // readv" retry path keys off. Preserve the partial bytes we
+    // *did* read so the downstream multipart parser can extract
+    // the ranges that arrived in full before the cut — the readv
+    // eager/retry loop then only has to fetch the tail, not redo
+    // everything. Non-truncation errors still bubble up.
+    let body = match resp.read(None) {
+        Ok(b) => b,
+        Err(e) => {
+            if !is_io_hyper_parse_error(&e) {
+                return Err(Error::Io(e));
+            }
+            // `buffer_all` keeps the partial read in the
+            // response's buffer even on UnexpectedEof, so a
+            // second call reads it out without re-hitting the
+            // socket.
+            resp.read(None).unwrap_or_default()
+        }
+    };
     if status == 200 {
         // Plain whole-file response: skip handle_response and build
         // a RangeFile directly so we don't need to thread the body
@@ -584,16 +759,115 @@ fn response_err_to_transport_err(err: ResponseError) -> Error {
 fn client_err_to_transport_err(err: crate::http::client::ClientError) -> Error {
     use crate::http::client::ClientError;
     match err {
-        ClientError::InvalidRequest(msg) => Error::InvalidHttpResponse {
-            path: String::new(),
-            msg,
-        },
+        ClientError::InvalidRequest(msg) => {
+            // The client tags messages with `bad URL:` when the
+            // failure is the URL itself (request URL or proxy URL
+            // shape) — those map to InvalidURL on the Python side
+            // rather than the more generic InvalidHttpResponse.
+            if msg.starts_with("bad URL") {
+                Error::UrlError(url::ParseError::RelativeUrlWithoutBase)
+            } else {
+                Error::InvalidHttpResponse {
+                    path: String::new(),
+                    msg,
+                }
+            }
+        }
         ClientError::Io(e) => Error::Io(e),
-        // DNS / TCP / TLS failures — these surface as
-        // `dromedary.errors.ConnectionError` on the Python side so
-        // breezy's retry loop can catch them the way it used to.
-        ClientError::Transport(e) => Error::ConnectionError(e.to_string()),
+        ClientError::Transport(e) => {
+            // Classify: protocol-level parse errors (bad HTTP
+            // version, bad status line, truncated framing) map to
+            // `InvalidHttpResponse` — a semantic "server misbehaved"
+            // that breezy's tests explicitly distinguish from
+            // network-level failures. Everything else (DNS, TCP,
+            // TLS) maps to `ConnectionError` for the retry loop.
+            //
+            // reqwest walks the error source chain for the typed
+            // tests below; we mirror that approach rather than
+            // string-matching the Display output, which would
+            // inevitably drift.
+            let msg = e.to_string();
+            if is_http_parse_error(&e) {
+                Error::InvalidHttpResponse {
+                    path: String::new(),
+                    msg,
+                }
+            } else {
+                Error::ConnectionError(msg)
+            }
+        }
     }
+}
+
+/// Walk an error source chain looking for a `hyper::Error` and
+/// ask it whether this was a protocol-level parse failure. No
+/// string-matching: `hyper::Error::is_parse` / `is_parse_status` /
+/// `is_incomplete_message` are the authoritative classifiers.
+///
+/// Used for both `reqwest::Error` (handshake / request-send
+/// failures) and `std::io::Error` (body-read failures where
+/// reqwest wraps the hyper error in an io::Error) — both surface
+/// the hyper error via their source chain.
+fn is_hyper_parse_chain(start: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(start);
+    while let Some(cause) = cur {
+        if let Some(hyper_err) = cause.downcast_ref::<hyper::Error>() {
+            // `is_parse()` is the general "we couldn't decode this
+            // as HTTP" check; `is_parse_status()` covers specifically
+            // bad status lines (which `is_parse` also catches —
+            // included for clarity). `is_incomplete_message()` is
+            // the truncated-framing case breezy's BadProtocol tests
+            // also exercise, and the same signal truncated response
+            // bodies raise.
+            return hyper_err.is_parse()
+                || hyper_err.is_parse_status()
+                || hyper_err.is_incomplete_message();
+        }
+        cur = cause.source();
+    }
+    false
+}
+
+/// Classifier for `reqwest::Error` — walks the error's own source
+/// chain. Start after the error (skipping `err` itself) because
+/// `reqwest::Error::source()` is the thing carrying the real cause.
+fn is_http_parse_error(err: &reqwest::Error) -> bool {
+    match std::error::Error::source(err) {
+        Some(s) => is_hyper_parse_chain(s),
+        None => false,
+    }
+}
+
+/// Classifier for `std::io::Error` raised while reading a response
+/// body. When the server advertises `Content-Length: N` but closes
+/// the socket early, reqwest surfaces an io::Error whose cause
+/// chain ends in an inner `io::Error` of kind `UnexpectedEof`.
+/// That's the truncated-body signal — bubble it up as a parse
+/// error so the readv retry loop can degrade and retry instead of
+/// treating it as a hard failure.
+fn is_io_hyper_parse_error(err: &std::io::Error) -> bool {
+    // Top-level kind first (best if reqwest ever surfaces kind
+    // directly).
+    if err.kind() == std::io::ErrorKind::UnexpectedEof {
+        return true;
+    }
+    let Some(inner) = err.get_ref() else {
+        return false;
+    };
+    // Dig for the innermost io::Error and check its kind, too —
+    // that's where the IncompleteBody marker ends up.
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(inner);
+    while let Some(cause) = cur {
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+            if io_err.kind() == std::io::ErrorKind::UnexpectedEof {
+                return true;
+            }
+        }
+        cur = cause.source();
+    }
+    // Fall back to the hyper-typed classifier in case the truncation
+    // shape is one of the parse-layer variants.
+    is_hyper_parse_chain(inner)
 }
 
 impl Transport for HttpTransport {
@@ -648,36 +922,42 @@ impl Transport for HttpTransport {
     }
 
     fn abspath(&self, relpath: &UrlFragment) -> Result<Url> {
-        if relpath.is_empty() || relpath == "." {
-            return Ok(self.base.clone());
-        }
         // URLs must be ASCII on the wire. Callers hand us pre-escaped
         // paths (via urlutils.escape); silently percent-encoding here
         // would hide bugs where that escape was skipped.
         if !relpath.is_ascii() {
             return Err(Error::UrlError(url::ParseError::InvalidDomainCharacter));
         }
-        // Unescape unreserved characters (RFC 3986: a-z A-Z 0-9 - . _ ~)
-        // that callers sometimes percent-encode needlessly. Keeps
-        // abspath output canonical so clone()s of sibling branches
-        // produce identical-looking base URLs. (lp:842223)
-        let normalised = crate::urlutils::unquote_unreserved(relpath);
-        let joined = self
-            .base
-            .join(&normalised)
-            .map_err(|_| Error::UrlError(url::ParseError::InvalidDomainCharacter))?;
+        let mut joined = if relpath.is_empty() || relpath == "." {
+            self.base.clone()
+        } else {
+            // Unescape unreserved characters (RFC 3986: a-z A-Z 0-9
+            // - . _ ~) that callers sometimes percent-encode
+            // needlessly. Keeps abspath output canonical so
+            // clone()s of sibling branches produce identical-
+            // looking base URLs. (lp:842223)
+            let normalised = crate::urlutils::unquote_unreserved(relpath);
+            self.base
+                .join(&normalised)
+                .map_err(|_| Error::UrlError(url::ParseError::InvalidDomainCharacter))?
+        };
+        // Collapse `//` and `./` path segments that `url::Url::join`
+        // leaves intact — the test suite expects RFC 3986 §5.2.4
+        // "remove_dot_segments" style normalisation at the abspath
+        // boundary. (url::Url does that for the base URL but not
+        // for the relative join output.)
+        let collapsed = collapse_path_segments(joined.path());
+        if collapsed != joined.path() {
+            joined.set_path(&collapsed);
+        }
         // Match the Python `URL.clone(relpath)` semantics of
         // dropping a trailing slash from the joined path. Callers
         // that explicitly want the directory form re-append `/`
         // themselves (e.g. clone() in the Python subclass).
-        let joined = if joined.path().len() > 1 && joined.path().ends_with('/') {
-            let mut u = joined;
-            let new_path = u.path().trim_end_matches('/').to_string();
-            u.set_path(&new_path);
-            u
-        } else {
-            joined
-        };
+        if joined.path().len() > 1 && joined.path().ends_with('/') {
+            let new_path = joined.path().trim_end_matches('/').to_string();
+            joined.set_path(&new_path);
+        }
         Ok(joined)
     }
 
@@ -845,8 +1125,6 @@ impl Transport for HttpTransport {
         adjust_for_latency: bool,
         upper_limit: Option<u64>,
     ) -> Box<dyn Iterator<Item = Result<(u64, Vec<u8>)>> + Send + 'a> {
-        // Collect everything we need to drive the retry loop into
-        // owned data so the iterator can outlive the initial call.
         let offsets = if adjust_for_latency {
             crate::readv::sort_expand_and_combine(
                 offsets,
@@ -856,12 +1134,11 @@ impl Transport for HttpTransport {
         } else {
             offsets
         };
-        // Drain up-front because `readv` yields an iterator and
-        // doing the HTTP request lazily would complicate error
-        // surfacing. Mirrors the Python impl's approach of running
-        // the whole coalesced chain eagerly and yielding results.
-        let results = self.readv_eager(relpath, offsets);
-        Box::new(results.into_iter())
+        Box::new(LazyReadv::new(
+            Clone::clone(self),
+            relpath.to_string(),
+            offsets,
+        ))
     }
 }
 
@@ -900,17 +1177,27 @@ impl HttpTransport {
                 v.sort();
                 v
             };
-            let coalesced =
-                match crate::readv::coalesce_offsets(&sorted, Some(0), Some(128), Some(0)) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        out.push(Err(Error::InvalidHttpResponse {
-                            path: relpath.to_string(),
-                            msg: format!("overlapping ranges: {}", e),
-                        }));
-                        return out;
-                    }
-                };
+            let tuning = self.readv_tuning();
+            // `coalesce_offsets` treats `Some(0)` as the unlimited
+            // sentinel; pass `None` for defaults and `Some(n)` for
+            // explicit limits so the callee's own defaults don't
+            // override our config.
+            let opt = |v: usize| if v == 0 { None } else { Some(v) };
+            let coalesced = match crate::readv::coalesce_offsets(
+                &sorted,
+                opt(tuning.max_readv_combine),
+                Some(tuning.bytes_to_read_before_seek),
+                opt(tuning.get_max_size),
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    out.push(Err(Error::InvalidHttpResponse {
+                        path: relpath.to_string(),
+                        msg: format!("overlapping ranges: {}", e),
+                    }));
+                    return out;
+                }
+            };
 
             match self.readv_one_pass(relpath, &coalesced, &remaining) {
                 Ok(pass_out) => {
@@ -921,9 +1208,21 @@ impl HttpTransport {
                     remaining: new_remaining,
                     cause,
                 }) => {
-                    // Server misbehaved; try again with a degraded
-                    // range hint.
-                    if !self.degrade_range_hint() {
+                    // Server misbehaved; degrade the range hint.
+                    // Distinguish "server explicitly rejected the
+                    // Range request" (400/416 → InvalidHttpRange)
+                    // from "server's response was corrupt" (truncated
+                    // multipart, bad boundaries, etc. →
+                    // InvalidHttpResponse / ShortReadv). An explicit
+                    // rejection means *any* number of ranges is
+                    // risky — drop straight to full-file rather than
+                    // probe Single one-GET-per-range. The truncation
+                    // case steps Multi→Single→None one rung at a time
+                    // so servers that cope with fewer ranges don't
+                    // force a whole-file download.
+                    let jumped = matches!(cause, Some(Error::InvalidHttpRange { .. }))
+                        && self.jump_range_hint_to_none();
+                    if !jumped && !self.degrade_range_hint() {
                         out.push(Err(cause.or(last_retry_err).unwrap_or_else(|| {
                             Error::InvalidHttpResponse {
                                 path: relpath.to_string(),
@@ -954,14 +1253,42 @@ impl HttpTransport {
         coalesced: &[(usize, usize, Vec<(usize, usize)>)],
         offsets_order: &[(usize, usize)],
     ) -> std::result::Result<Vec<Result<(u64, Vec<u8>)>>, ReadvPassError> {
-        // Apache's default range cap is ~400; pick well under that.
-        const MAX_GET_RANGES: usize = 200;
-
+        let tuning = self.readv_tuning();
+        let max_get_ranges = tuning.max_get_ranges.max(1);
+        let get_max_size = tuning.get_max_size; // 0 = unlimited
         let hint = *self.range_hint.lock().unwrap();
+        // Slice the coalesced list into batches honouring both the
+        // per-request range count and per-request total-bytes caps.
+        // `RangeHint::None` collapses everything into one full-file
+        // GET; `Single` is one chunk per request; `Multi` packs as
+        // much as the caps allow.
         let batches: Vec<&[(usize, usize, Vec<(usize, usize)>)]> = match hint {
             RangeHint::None => vec![coalesced],
             RangeHint::Single => coalesced.chunks(1).collect::<Vec<_>>(),
-            RangeHint::Multi => coalesced.chunks(MAX_GET_RANGES).collect::<Vec<_>>(),
+            RangeHint::Multi => {
+                let mut batches: Vec<&[(usize, usize, Vec<(usize, usize)>)]> = Vec::new();
+                let mut start = 0;
+                let mut acc_bytes = 0usize;
+                let mut acc_ranges = 0usize;
+                for (i, coal) in coalesced.iter().enumerate() {
+                    let length = coal.1;
+                    let would_exceed_size =
+                        get_max_size > 0 && acc_bytes + length > get_max_size && acc_ranges > 0;
+                    let would_exceed_ranges = acc_ranges >= max_get_ranges;
+                    if would_exceed_size || would_exceed_ranges {
+                        batches.push(&coalesced[start..i]);
+                        start = i;
+                        acc_bytes = 0;
+                        acc_ranges = 0;
+                    }
+                    acc_bytes += length;
+                    acc_ranges += 1;
+                }
+                if start < coalesced.len() {
+                    batches.push(&coalesced[start..]);
+                }
+                batches
+            }
         };
 
         let mut results: Vec<Result<(u64, Vec<u8>)>> = Vec::with_capacity(offsets_order.len());
@@ -1140,10 +1467,27 @@ mod tests {
     // ----- abspath / clone_concrete -----
 
     #[test]
-    fn abspath_empty_returns_base() {
+    fn abspath_empty_strips_trailing_slash() {
+        // `abspath` returns the file-form URL (no trailing slash)
+        // even when handed the empty string or "." — matching
+        // Python `URL.clone()`, which breezy's tests assert
+        // against. The directory form lives on `base()` (which
+        // keeps the trailing slash) and `clone()` (which re-adds
+        // one).
         let t = HttpTransport::new("http://example.com/a/", fresh_client()).unwrap();
-        assert_eq!(t.abspath("").unwrap().as_str(), "http://example.com/a/");
-        assert_eq!(t.abspath(".").unwrap().as_str(), "http://example.com/a/");
+        assert_eq!(t.abspath("").unwrap().as_str(), "http://example.com/a");
+        assert_eq!(t.abspath(".").unwrap().as_str(), "http://example.com/a");
+    }
+
+    #[test]
+    fn abspath_collapses_redundant_slashes_and_dots() {
+        // `abspath("foo/1//2/./3")` should canonicalise to
+        // `/foo/1/2/3` per RFC 3986 §5.2.4 "remove_dot_segments".
+        let t = HttpTransport::new("http://example.com/root/", fresh_client()).unwrap();
+        assert_eq!(
+            t.abspath(".bzr/1//2/./3").unwrap().as_str(),
+            "http://example.com/root/.bzr/1/2/3"
+        );
     }
 
     #[test]
@@ -1417,4 +1761,274 @@ enum ReadvPassError {
     },
     /// Hard error — surface to the caller.
     Hard(Error),
+}
+
+/// Lazy `readv` iterator that issues one HTTP GET per batch on
+/// demand. Breezy's `test_*_leave_pipe_clean` tests pull the
+/// first yield, check how many GETs the server saw, then stop —
+/// so an eager implementation that drains all batches up-front
+/// fails those assertions even though the data it returns is
+/// correct.
+///
+/// On a retry-worthy error we fall back to the eager path, which
+/// runs the whole degrade-and-retry loop. The eager fallback
+/// includes any batches we haven't touched yet plus the one that
+/// failed.
+struct LazyReadv {
+    transport: HttpTransport,
+    relpath: String,
+    /// The caller's offsets in yield order. Populated with
+    /// `(offset, size)` pairs; we pop the head each time we yield.
+    pending: std::collections::VecDeque<(usize, usize)>,
+    /// Pre-fetched `(offset, size) -> data` map from the most
+    /// recent batch, read in-order out of the HTTP response.
+    yielded: std::collections::VecDeque<Result<(u64, Vec<u8>)>>,
+    /// Coalesced batches we haven't fetched yet, computed once at
+    /// iterator construction from the sorted+coalesced plan.
+    batches: std::collections::VecDeque<Vec<(usize, usize, Vec<(usize, usize)>)>>,
+    /// Set once we've fallen back to the eager path — all
+    /// subsequent yields come from `yielded` and we stop issuing
+    /// new GETs.
+    exhausted: bool,
+    /// A retry-worthy failure from an earlier batch that we
+    /// haven't acted on yet — deferred so callers can consume
+    /// the ranges we *did* manage to parse from the partial
+    /// response before we start issuing fresh GETs. The error is
+    /// discharged the next time `fetch_next_batch` runs and
+    /// `yielded` has drained.
+    deferred_fallback: Option<Error>,
+}
+
+impl LazyReadv {
+    fn new(transport: HttpTransport, relpath: String, offsets: Vec<(u64, usize)>) -> Self {
+        let offsets_usize: Vec<(usize, usize)> =
+            offsets.iter().map(|(o, s)| (*o as usize, *s)).collect();
+        let sorted: Vec<(usize, usize)> = {
+            let mut v = offsets_usize.clone();
+            v.sort();
+            v
+        };
+        let tuning = transport.readv_tuning();
+        let opt = |v: usize| if v == 0 { None } else { Some(v) };
+        let coalesced = match crate::readv::coalesce_offsets(
+            &sorted,
+            opt(tuning.max_readv_combine),
+            Some(tuning.bytes_to_read_before_seek),
+            opt(tuning.get_max_size),
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                // Can't coalesce — degenerate to the eager path's
+                // error shape for uniformity with existing tests.
+                let mut yielded = std::collections::VecDeque::new();
+                yielded.push_back(Err(Error::InvalidHttpResponse {
+                    path: relpath.clone(),
+                    msg: format!("overlapping ranges: {}", e),
+                }));
+                return Self {
+                    transport,
+                    relpath,
+                    pending: offsets_usize.into(),
+                    yielded,
+                    batches: std::collections::VecDeque::new(),
+                    exhausted: true,
+                    deferred_fallback: None,
+                };
+            }
+        };
+        let batches = compute_batches(&coalesced, &tuning, &transport.range_hint.lock().unwrap());
+        Self {
+            transport,
+            relpath,
+            pending: offsets_usize.into(),
+            yielded: std::collections::VecDeque::new(),
+            batches,
+            exhausted: false,
+            deferred_fallback: None,
+        }
+    }
+
+    /// Issue the next batch's GET and push its sub-ranges into
+    /// `yielded` in the order the caller originally asked for
+    /// them (reordering within the batch using pending's head).
+    fn fetch_next_batch(&mut self) -> bool {
+        // Discharge any pending fallback before issuing a fresh GET:
+        // an earlier batch left partial results and a deferred
+        // error, and now the caller's asking for more offsets than
+        // that partial could satisfy. Running the fallback here
+        // (rather than inline with the failed read) means we yield
+        // the partial ranges first, then only replay the eager
+        // path for the offsets that actually went unsatisfied.
+        if let Some(err) = self.deferred_fallback.take() {
+            self.run_eager_fallback(Some(err));
+            return true;
+        }
+        let Some(batch) = self.batches.pop_front() else {
+            return false;
+        };
+        let flat: Vec<(usize, usize)> = batch
+            .iter()
+            .map(|(start, length, _)| (*start, *length))
+            .collect();
+        let range_header = self.transport.attempted_range_header(&flat, 0);
+        let mut rf = match self.transport._get(&self.relpath, range_header.as_deref()) {
+            Ok((_code, rf)) => rf,
+            Err(e) => {
+                // Fall back to the eager/degrade loop — hand it
+                // the remaining offsets (the current batch's plus
+                // anything we hadn't started yet, reconstructed
+                // from `pending`).
+                self.run_eager_fallback(Some(e));
+                return true;
+            }
+        };
+        // Pull each sub-range's bytes from the response and route
+        // them to either `yielded` (for the next caller request)
+        // or a per-batch data_map for out-of-order reassembly. We
+        // drain `pending` incrementally — if reading later in the
+        // batch fails (e.g. a truncated multipart body), earlier
+        // ranges we already decoded are still yielded before the
+        // fallback kicks in, matching
+        // `test_readv_with_short_reads`'s expectation that partial
+        // progress survives a cut-short response.
+        let mut data_map: std::collections::HashMap<(usize, usize), Vec<u8>> =
+            std::collections::HashMap::new();
+        let flush_available =
+            |data_map: &mut std::collections::HashMap<(usize, usize), Vec<u8>>,
+             pending: &mut std::collections::VecDeque<(usize, usize)>,
+             yielded: &mut std::collections::VecDeque<Result<(u64, Vec<u8>)>>| {
+                while let Some(&(off, size)) = pending.front() {
+                    if let Some(data) = data_map.remove(&(off, size)) {
+                        pending.pop_front();
+                        yielded.push_back(Ok((off as u64, data)));
+                    } else {
+                        break;
+                    }
+                }
+            };
+        for (coal_start, _coal_length, ranges) in &batch {
+            for (sub_offset, sub_size) in ranges {
+                let abs_start = coal_start + sub_offset;
+                match rf.read_at(abs_start as u64, *sub_size) {
+                    Ok(d) => {
+                        data_map.insert((abs_start, *sub_size), d);
+                        flush_available(&mut data_map, &mut self.pending, &mut self.yielded);
+                    }
+                    Err(e) => {
+                        flush_available(&mut data_map, &mut self.pending, &mut self.yielded);
+                        // If we yielded anything this batch, defer
+                        // the fallback — the caller asked for one
+                        // range at a time via next(), so don't
+                        // burn a fresh GET until they actually
+                        // reach a range we couldn't satisfy. If we
+                        // have nothing to show, fall back now so
+                        // the caller sees results rather than an
+                        // infinite empty-batch loop.
+                        if self.yielded.is_empty() {
+                            self.run_eager_fallback(Some(e));
+                        } else {
+                            self.deferred_fallback = Some(e);
+                        }
+                        return true;
+                    }
+                }
+            }
+        }
+        flush_available(&mut data_map, &mut self.pending, &mut self.yielded);
+        true
+    }
+
+    /// Fall back to the eager readv path for any remaining offsets
+    /// plus the current failure. Matches the previous behaviour for
+    /// the retry-worthy error categories — those need the full
+    /// degrade-and-retry loop which is too invasive to replicate
+    /// here. Invoked both synchronously when we have no partial
+    /// results, and as the `deferred_fallback` discharge in
+    /// `fetch_next_batch`. Degrades the range hint based on the
+    /// failure shape before handing off so the eager path doesn't
+    /// replay the same doomed request.
+    fn run_eager_fallback(&mut self, cause: Option<Error>) {
+        let remaining: Vec<(u64, usize)> =
+            self.pending.iter().map(|(o, s)| (*o as u64, *s)).collect();
+        self.pending.clear();
+        self.batches.clear();
+        self.exhausted = true;
+        match &cause {
+            Some(Error::InvalidHttpRange { .. }) => {
+                self.transport.jump_range_hint_to_none();
+            }
+            Some(Error::InvalidHttpResponse { .. }) | Some(Error::ShortReadvError(_, _, _, _)) => {
+                self.transport.degrade_range_hint();
+            }
+            _ => {}
+        }
+        let results = self.transport.readv_eager(&self.relpath, remaining);
+        for r in results {
+            self.yielded.push_back(r);
+        }
+    }
+}
+
+impl Iterator for LazyReadv {
+    type Item = Result<(u64, Vec<u8>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(next) = self.yielded.pop_front() {
+                return Some(next);
+            }
+            if self.exhausted {
+                return None;
+            }
+            if !self.fetch_next_batch() {
+                // No more batches left; whatever is in `yielded`
+                // got yielded on prior iterations.
+                return None;
+            }
+        }
+    }
+}
+
+/// Carve a coalesced offset list into batches honouring the per-
+/// request caps (max_get_ranges, get_max_size) and the current
+/// range hint. Shared between `readv_one_pass` and `LazyReadv`.
+fn compute_batches(
+    coalesced: &[(usize, usize, Vec<(usize, usize)>)],
+    tuning: &ReadvTuning,
+    hint: &RangeHint,
+) -> std::collections::VecDeque<Vec<(usize, usize, Vec<(usize, usize)>)>> {
+    let max_get_ranges = tuning.max_get_ranges.max(1);
+    let get_max_size = tuning.get_max_size;
+    let mut batches: std::collections::VecDeque<Vec<(usize, usize, Vec<(usize, usize)>)>> =
+        std::collections::VecDeque::new();
+    match hint {
+        RangeHint::None => {
+            batches.push_back(coalesced.to_vec());
+        }
+        RangeHint::Single => {
+            for coal in coalesced {
+                batches.push_back(vec![coal.clone()]);
+            }
+        }
+        RangeHint::Multi => {
+            let mut current: Vec<(usize, usize, Vec<(usize, usize)>)> = Vec::new();
+            let mut acc_bytes = 0usize;
+            for coal in coalesced {
+                let length = coal.1;
+                let would_exceed_size =
+                    get_max_size > 0 && acc_bytes + length > get_max_size && !current.is_empty();
+                let would_exceed_ranges = current.len() >= max_get_ranges;
+                if would_exceed_size || would_exceed_ranges {
+                    batches.push_back(std::mem::take(&mut current));
+                    acc_bytes = 0;
+                }
+                current.push(coal.clone());
+                acc_bytes += length;
+            }
+            if !current.is_empty() {
+                batches.push_back(current);
+            }
+        }
+    }
+    batches
 }

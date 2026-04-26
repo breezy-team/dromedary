@@ -86,6 +86,21 @@ def get_negotiate_provider():
     return _http_rs.get_negotiate_provider()
 
 
+def set_auth_header_trace(func):
+    """Register a callback invoked when auth credentials are sent.
+
+    The Rust HTTP client calls ``func(header_name)`` just before
+    sending a request carrying an ``Authorization`` or
+    ``Proxy-Authorization`` header. Breezy wires this up to emit a
+    debug-flag-controlled ``trace.mutter("> <header>: <masked>")``
+    line so users can confirm auth happened without leaking the
+    credential value itself.
+
+    Pass ``None`` to clear any previously-registered callback.
+    """
+    _http_rs.set_auth_header_trace(func)
+
+
 def _default_kerberos_provider(host):
     """Default Negotiate provider using the Python `kerberos` module.
 

@@ -12,6 +12,7 @@ use std::io::{BufRead, BufReader, Read, Seek, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use url::Url;
 
 import_exception!(dromedary.errors, TransportError);
@@ -41,6 +42,61 @@ import_exception!(dromedary.urlutils, InvalidURL);
 
 #[pyclass(subclass)]
 pub(crate) struct Transport(pub(crate) Box<dyn TransportTrait>);
+
+/// Python-visible iterator wrapping the Rust-side `readv` iterator.
+///
+/// Holds a strong reference to the parent Transport pyclass
+/// (`Py<Transport>`) so the `'static`-transmuted inner iterator
+/// never outlives the transport it borrows from. Each `__next__`
+/// pulls one element from the Rust iterator under `py.detach` so
+/// HTTP calls in the iterator body can block without holding the
+/// GIL — the in-process Python test HTTP server lives in another
+/// thread and needs the GIL to serve requests.
+#[pyclass]
+pub(crate) struct ReadvIter {
+    /// Keeps the underlying Transport (and therefore the `dyn
+    /// TransportTrait` + client state the iterator closed over)
+    /// alive for as long as the iterator is live. Python holds a
+    /// strong reference via this `Py`.
+    #[allow(dead_code)]
+    parent: Py<Transport>,
+    /// The Rust iterator. `Option` so `__next__` can hand out the
+    /// final `None` cleanly and drop the iterator early if a
+    /// caller leaks the iterator pyclass. `Mutex` because PyO3's
+    /// `#[pymethods]` takes `&self`, but iterator advancement
+    /// needs mutation.
+    iter: Mutex<Option<Box<dyn Iterator<Item = Result<(u64, Vec<u8>), dromedary::Error>> + Send>>>,
+    /// Path string used for error-mapping; carried alongside the
+    /// iterator for easy access on `__next__`'s Err path.
+    path: String,
+}
+
+#[pymethods]
+impl ReadvIter {
+    fn __iter__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
+    fn __next__<'py>(&self, py: Python<'py>) -> PyResult<Option<(u64, Bound<'py, PyBytes>)>> {
+        let result = py.detach(|| {
+            let mut guard = self.iter.lock().unwrap();
+            guard.as_mut().and_then(|it| it.next())
+        });
+        match result {
+            None => {
+                // Drop the iterator so cached HTTP state releases
+                // as soon as the caller stops consuming.
+                *self.iter.lock().unwrap() = None;
+                Ok(None)
+            }
+            Some(Err(e)) => {
+                *self.iter.lock().unwrap() = None;
+                Err(map_transport_err_to_py_err(e, None, Some(&self.path)))
+            }
+            Some(Ok((offset, data))) => Ok(Some((offset, PyBytes::new(py, &data)))),
+        }
+    }
+}
 
 /// Python-visible base class for Rust-backed transports that talk to
 /// a remote server. Mirrors `dromedary.ConnectedTransport` on the
@@ -87,6 +143,44 @@ impl ConnectedTransport {
     fn _path(slf: PyRef<'_, Self>) -> String {
         let base = slf.as_super().0.base();
         dromedary::connected_url_path(&base)
+    }
+
+    /// Parsed form of the base URL as a `dromedary.urlutils.URL`.
+    /// Historically set on the Python `ConnectedTransport` at
+    /// construction; breezy's `transport/remote.py` reads it for
+    /// host / port / user / password access. We build one on
+    /// demand so Rust-backed transports don't have to carry extra
+    /// state.
+    #[getter]
+    fn _parsed_url<'py>(slf: PyRef<'py, Self>, py: Python<'py>) -> PyResult<Py<PyAny>> {
+        let base = slf.as_super().0.base();
+        let base_str = base.to_string();
+        let module = py.import("dromedary.urlutils")?;
+        let cls = module.getattr("URL")?;
+        let url = cls.call_method1("from_string", (base_str.as_str(),))?;
+        Ok(url.unbind())
+    }
+
+    /// Shared-connection handle. Breezy compares
+    /// `_get_connection()` results across clones to decide whether
+    /// two transports share an underlying connection. We can't
+    /// expose the Rust `Arc<HttpClient>` identity directly across
+    /// the FFI boundary, so we use the next best signal: the
+    /// `(scheme, host, port)` tuple. Two transports with the same
+    /// origin share the same `HttpClient` pool entry and from
+    /// breezy's perspective are "the same connection"; transports
+    /// at different paths under the same origin (e.g. after a
+    /// redirect from `/foo/` to `/foo/subdir/`) are also "the same
+    /// connection" and should compare equal here.
+    fn _get_connection<'py>(slf: PyRef<'py, Self>, py: Python<'py>) -> PyResult<Py<PyAny>> {
+        let base = slf.as_super().0.base();
+        let key = format!(
+            "{}://{}:{}",
+            base.scheme(),
+            base.host_str().unwrap_or(""),
+            base.port_or_known_default().unwrap_or(0),
+        );
+        Ok(pyo3::types::PyString::new(py, &key).into())
     }
 
     /// Default `disconnect` — a no-op. Concrete transports with an
@@ -468,6 +562,40 @@ impl Transport {
         Ok(format!("{:?}", self.0))
     }
 
+    /// Coalesce a list of `(start, length)` offsets into the
+    /// fewest number of reads that still covers every byte of the
+    /// originals, returning `_CoalescedOffset`-shaped tuples.
+    ///
+    /// Historically lived on the Python `Transport` base class. Breezy
+    /// reaches into it from `transport/remote.py` and from a few
+    /// HTTP tests, so we expose it as a staticmethod on the Rust
+    /// base pyclass too. Keep the signature (name and arg order)
+    /// bit-compatible with the Python original — callers pass 0 for
+    /// "no limit" rather than None.
+    #[staticmethod]
+    #[pyo3(signature = (offsets, limit=None, fudge_factor=None, max_size=None))]
+    fn _coalesce_offsets(
+        py: Python,
+        offsets: Vec<(usize, usize)>,
+        limit: Option<usize>,
+        fudge_factor: Option<usize>,
+        max_size: Option<usize>,
+    ) -> PyResult<Py<PyAny>> {
+        let raw = coalesce_offsets(offsets, limit, fudge_factor, max_size)?;
+        // The Python version returns `_CoalescedOffset` namedtuples
+        // (defined in `dromedary.__init__`); wrap each raw tuple so
+        // callers that use attribute access (`coal.start`,
+        // `coal.length`, `coal.ranges`) keep working.
+        let module = py.import("dromedary")?;
+        let cls = module.getattr("_CoalescedOffset")?;
+        let out = pyo3::types::PyList::empty(py);
+        for (start, length, ranges) in raw {
+            let tuple = cls.call1((start, length, ranges))?;
+            out.append(tuple)?;
+        }
+        Ok(out.into())
+    }
+
     fn get_bytes<'a>(
         slf: Bound<'a, Self>,
         py: Python<'a>,
@@ -819,30 +947,58 @@ impl Transport {
 
     #[pyo3(signature = (path, offsets, adjust_for_latency=None, upper_limit=None))]
     fn readv<'a>(
-        &self,
+        slf: PyRef<'a, Self>,
         py: Python<'a>,
-        path: &str,
+        path: String,
         offsets: Vec<(u64, usize)>,
         adjust_for_latency: Option<bool>,
         upper_limit: Option<u64>,
-    ) -> PyResult<Bound<'a, PyIterator>> {
-        let t = &self.0;
-        let buffered = py
-            .detach(|| {
-                t.readv(
-                    path,
-                    offsets,
-                    adjust_for_latency.unwrap_or(false),
-                    upper_limit,
-                )
-            })
-            .map(|r| {
-                r.map_err(|e| map_transport_err_to_py_err(e, None, Some(path)))
-                    .map(|(o, r)| (o, PyBytes::new(py, &r)))
-            })
-            .collect::<PyResult<Vec<(u64, Bound<PyBytes>)>>>()?;
-        let list = PyList::new(py, &buffered)?;
-        PyIterator::from_object(&list)
+    ) -> PyResult<Py<ReadvIter>> {
+        // Construct the Rust iterator up front — that step only
+        // does coalescing, no HTTP, so running it with the GIL
+        // held is fine. The returned iterator borrows the
+        // transport's `dyn TransportTrait` but our HttpTransport
+        // readv constructs a LazyReadv that owns its state (no
+        // borrow of `self`); promote to `'static` via transmute
+        // and keep the parent transport alive via a Python
+        // reference held inside `ReadvIter`. Subsequent `__next__`
+        // calls then pull elements under `py.detach` so blocking
+        // HTTP work doesn't hold the GIL.
+        let boxed: Box<dyn Iterator<Item = _> + Send + '_> = slf.0.readv(
+            &path,
+            offsets,
+            adjust_for_latency.unwrap_or(false),
+            upper_limit,
+        );
+        let mut iter: Box<dyn Iterator<Item = Result<(u64, Vec<u8>), dromedary::Error>> + Send> = unsafe {
+            std::mem::transmute::<
+                Box<dyn Iterator<Item = _> + Send + '_>,
+                Box<dyn Iterator<Item = _> + Send + 'static>,
+            >(boxed)
+        };
+        // Peek the first element synchronously so errors that the
+        // transport raises up-front (NoSuchFile for a missing
+        // file, PermissionDenied, &c) surface from the `readv()`
+        // *call* itself, not from the first `__next__` on the
+        // returned iterator. Python's Transport.readv contract
+        // historically raised there — breezy's pack-repo autopack
+        // (see `test_autopack_reloads_and_stops`) catches those
+        // around `make_readv_reader` construction to translate
+        // deleted-pack races into RetryWithNewPacks.
+        let first = py.detach(|| iter.next());
+        if let Some(Err(e)) = first {
+            return Err(map_transport_err_to_py_err(e, None, Some(&path)));
+        }
+        let prefixed: Box<dyn Iterator<Item = Result<(u64, Vec<u8>), dromedary::Error>> + Send> =
+            Box::new(first.into_iter().chain(iter));
+        Py::new(
+            py,
+            ReadvIter {
+                parent: slf.into_pyobject(py)?.unbind(),
+                iter: Mutex::new(Some(prefixed)),
+                path,
+            },
+        )
     }
 
     fn listable(&self, py: Python) -> bool {
@@ -1409,6 +1565,7 @@ mod webdav;
 fn _transport_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<Transport>()?;
     m.add_class::<ConnectedTransport>()?;
+    m.add_class::<ReadvIter>()?;
     m.add_class::<TransportDecorator>()?;
     let localm = PyModule::new(py, "local")?;
     localm.add_class::<LocalTransport>()?;

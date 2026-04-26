@@ -52,32 +52,25 @@ class HttpTransport(_http_rs.HttpTransport):
     def __new__(cls, base, _from_transport=None, ca_certs=None):
         """Build the Rust transport.
 
+        We defer TLS-related knobs (``ca_certs``) to ``__init__``
+        because breezy test subclasses add the ``ca_certs`` argument
+        in their own ``__init__`` and call ``super().__init__(...,
+        ca_certs=...)`` — which only sees the argument after
+        ``__new__`` has already run. Keep ``__new__`` doing the
+        bare-minimum base-URL setup; ``__init__`` rebuilds the
+        underlying client when ``ca_certs`` finally arrives.
+
         When ``_from_transport`` is supplied we construct a fresh
         Rust instance at ``base`` and then graft the source's
         HttpClient / auth cache / range hint onto it via
         ``_rust_replace_inner_from`` — so clones share all the
         per-client state without losing the Python subclass identity.
         """
-        if ca_certs is None:
-            import dromedary.http as _mod_http
-
-            configured = _mod_http.ssl_ca_certs()
-            if configured:
-                ca_certs = configured
-
-        import ssl as _ssl
-
-        import dromedary.http as _mod_http
-
-        disable_verification = _mod_http.ssl_cert_reqs() == _ssl.CERT_NONE
-        if disable_verification:
-            ca_certs = None
-
         self = super().__new__(
             cls,
             base,
-            ca_certs=ca_certs,
-            disable_verification=disable_verification,
+            ca_certs=None,
+            disable_verification=False,
             user_agent=_default_user_agent(),
         )
         if _from_transport is not None:
@@ -88,14 +81,86 @@ class HttpTransport(_http_rs.HttpTransport):
         return self
 
     def __init__(self, base, _from_transport=None, ca_certs=None):
-        """Initialise Python-side state; Rust ``__new__`` owns transport state."""
-        # The only Python-side attribute is the _medium slot filled in
-        # by breezy when get_smart_medium() is first called.
+        """Initialise Python-side state and TLS-configured inner client.
+
+        Rust ``__new__`` populates the base-URL state with a minimal
+        default client. TLS knobs take effect here so subclasses that
+        override ``__init__`` and call ``super().__init__(..., ca_certs=...)``
+        pick up correctly — otherwise the certs would arrive after the
+        underlying client was built with the wrong ones. We rebuild the
+        whole inner state (fresh HttpClient with the right TLS config)
+        and graft it in.
+        """
         self._medium = None
+        if _from_transport is None:
+            import ssl as _ssl
+
+            import dromedary.http as _mod_http
+
+            if ca_certs is None:
+                configured = _mod_http.ssl_ca_certs()
+                if configured:
+                    ca_certs = configured
+            disable_verification = _mod_http.ssl_cert_reqs() == _ssl.CERT_NONE
+            if disable_verification:
+                ca_certs = None
+            # Build a fresh Rust transport with the right TLS
+            # config, then swap our inner state with it. Creating
+            # a new HttpTransport via the pyclass constructor is
+            # the simplest way to get the config plumbed all the
+            # way down to the reqwest Client — there's no single
+            # setter that re-derives everything.
+            from dromedary._transport_rs.http import (
+                HttpTransport as _RsHttpTransport,
+            )
+
+            fresh = _RsHttpTransport(
+                base,
+                ca_certs=ca_certs,
+                disable_verification=disable_verification,
+                user_agent=_default_user_agent(),
+            )
+            # ``offset=None`` lets ``_rust_replace_inner_from``
+            # share ``fresh``'s inner directly, preserving raw_base
+            # (empty-password URL shape) and segment parameters that
+            # ``clone_concrete(None)`` would otherwise strip.
+            self._rust_replace_inner_from(fresh, None)
+        # Wire an activity callback into the Rust transport so
+        # internal get/has/post/readv calls feed breezy's progress
+        # UI too, not just the explicit ``.request()`` path. We use
+        # a lambda that re-looks-up ``_report_activity`` on each
+        # invocation rather than a bound method so tests that
+        # override ``_report_activity`` at class level (notably
+        # ``TestActivity``) still see the replacement.
+        import weakref
+
+        wself = weakref.ref(self)
+
+        def _forward(byte_count, direction):
+            t = wself()
+            if t is None:
+                return
+            t._report_activity(byte_count, direction)
+
+        self._set_activity_callback(_forward)
 
     def clone(self, offset=None):
-        """Return a new transport sharing this transport's HttpClient."""
-        new_base = self.base if offset is None else self.abspath(offset)
+        """Return a new transport sharing this transport's HttpClient.
+
+        Uses ``urlutils.URL.clone`` path-combine semantics rather
+        than ``abspath`` URL-join semantics — an absolute-URL
+        ``offset`` is treated as a path fragment appended to the
+        current base, not as a wholesale base replacement. Breezy's
+        ``do_catching_redirections`` test relies on this quirk: the
+        redirect callback clones at ``exception.target`` to trigger
+        a controlled loop, which only loops if the host stays put.
+        """
+        if offset is None:
+            new_base = self.base
+        else:
+            from dromedary._transport_rs.urlutils import URL
+
+            new_base = str(URL.from_string(self.base).clone(offset))
         return type(self)(new_base, _from_transport=self)
 
     def _report_activity(self, byte_count, direction):
@@ -164,9 +229,136 @@ class HttpTransport(_http_rs.HttpTransport):
     def _post(self, body_bytes):
         """POST `body_bytes` to .bzr/smart on this transport.
 
-        Returns ``(response_code, response_body_bytes)``.
+        Returns ``(response_code, response_body_filelike)``. The Rust
+        pyclass returns raw bytes; breezy's smart-HTTP medium calls
+        ``.read(count)`` on the result, so we wrap the bytes in a
+        BytesIO for that specific caller.
         """
-        return super()._post(".bzr/smart", body_bytes)
+        from io import BytesIO
+
+        code, body = super()._post(".bzr/smart", body_bytes)
+        return code, BytesIO(body)
+
+    # ------------------------------------------------------------------
+    # Historical breezy-facing helpers. These were public-ish API on
+    # the pre-Rust urllib transport; breezy's own tests and a handful
+    # of production code paths reach into them, so we keep them as
+    # thin shims over the Rust readv / range-header logic.
+
+    def _get(self, relpath, offsets, tail_amount=0):
+        """Range-GET ``relpath`` returning ``(code, seekable_bytes)``.
+
+        `offsets` is either `None` (fetch the whole file) or a list of
+        `_CoalescedOffset` objects from `_coalesce_offsets`. The second
+        element of the returned tuple is a `BytesIO` big enough that
+        `.seek(abs_offset, SEEK_SET)` followed by `.read(length)`
+        produces the bytes that were originally requested — i.e. a
+        sparse file-in-memory.
+
+        The Python urllib transport used to return a live HTTP body
+        that handled the sparseness via content-range parsing. With
+        the Rust readv machinery doing that work for us, we
+        reconstitute the same sparse-file shape by dropping each
+        range's data at its absolute offset in a BytesIO.
+        """
+        from io import BytesIO
+
+        if not offsets and not tail_amount:
+            # Whole-file fetch.
+            data = self._get_bytes_inner(relpath)
+            return 200, BytesIO(data)
+
+        # Expand the coalesced-offset structs into the (start, length)
+        # pairs readv wants. _CoalescedOffset carries a `ranges` list
+        # of (sub_offset, sub_length) pairs relative to `start`.
+        pairs = []
+        if offsets:
+            for coal in offsets:
+                for sub_off, sub_len in coal.ranges:
+                    pairs.append((coal.start + sub_off, sub_len))
+        from dromedary.errors import (
+            InvalidHttpRange as _InvalidHttpRange,
+        )
+        from dromedary.errors import (
+            ShortReadvError as _ShortReadvError,
+        )
+
+        # Reject zero-length ranges as syntactically invalid — the
+        # server-side form `bytes=start-end` with start > end is
+        # rejected by any conforming HTTP server, and breezy's
+        # test_syntactically_invalid_range_header counts on us
+        # raising InvalidHttpRange locally rather than either
+        # silently succeeding or letting the server surface the
+        # failure with its own error shape.
+        if any(length <= 0 for _, length in pairs):
+            abspath = self._remote_path(relpath)
+            raise _InvalidHttpRange(
+                abspath,
+                ",".join(f"{s}-{s + l - 1}" for s, l in pairs),
+                "zero-length byte range",
+            )
+        if tail_amount:
+            # Need the total file length to compute absolute tail
+            # offset; use the Rust stat / HEAD helper.
+            resp = self._head(relpath)
+            length = int(resp.getheader("content-length") or 0)
+            pairs.append((max(length - tail_amount, 0), tail_amount))
+
+        # Compute an upper bound so the BytesIO is large enough to
+        # seek into for each returned range. We size it to the
+        # highest (offset + length) any caller will seek+read.
+        highest = max(start + length for start, length in pairs)
+        out = BytesIO(b"\0" * highest)
+        try:
+            for offset, chunk in self.readv(relpath, pairs):
+                out.seek(offset)
+                out.write(chunk)
+        except _ShortReadvError as e:
+            # Readv ran past the end of the file. At the `_get` API
+            # layer this means the caller asked for an out-of-range
+            # byte range — Python urllib raised InvalidHttpRange
+            # here, matching what breezy's TestRanges expect.
+            # Preserve the original ShortReadv context so callers
+            # debugging a live failure still see where it came from.
+            raise _InvalidHttpRange(
+                self._remote_path(relpath),
+                "bytes=%d-%d" % pairs[0] if pairs else "",
+                str(e),
+            ) from e
+        out.seek(0)
+        return 206, out
+
+    def _get_bytes_inner(self, relpath):
+        """Fetch the entire body of `relpath` as bytes.
+
+        Separate helper so ``_get`` can call it without going through
+        the Python ``get()`` wrapper that returns a file-like object.
+        """
+        f = self.get(relpath)
+        try:
+            return f.read()
+        finally:
+            if hasattr(f, "close"):
+                f.close()
+
+    @staticmethod
+    def _range_header(ranges, tail_amount):
+        """Build an HTTP Range header value from coalesced offsets.
+
+        Historical public-ish API — breezy's TestRangeHeader unit
+        tests call this directly to verify the byte-range encoding.
+        The Rust side does the same formatting internally inside
+        `HttpTransport::attempted_range_header`; this Python staticmethod
+        reimplements the simple case the tests need without going
+        through a full HTTP round-trip.
+        """
+        strings = [
+            "%d-%d" % (offset.start, offset.start + offset.length - 1)
+            for offset in ranges
+        ]
+        if tail_amount:
+            strings.append("-%d" % tail_amount)
+        return ",".join(strings)
 
     # ------------------------------------------------------------------
     # Breezy-facing redirect fix-up. The Rust side surfaces a 3xx as

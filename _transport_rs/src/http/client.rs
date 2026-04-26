@@ -62,8 +62,10 @@ impl CredentialProvider for PythonCredentialProvider {
         host: &str,
         port: Option<u16>,
         realm: Option<&str>,
+        user_hint: Option<&str>,
+        is_proxy: bool,
     ) -> (Option<String>, Option<String>) {
-        super::invoke_credential_lookup(protocol, host, port, realm)
+        super::invoke_credential_lookup(protocol, host, port, realm, user_hint, is_proxy)
     }
 }
 
@@ -120,12 +122,15 @@ impl HttpClient {
             user_agent,
             read_timeout: timeout,
         };
-        let inner = RsHttpClient::with_providers(
+        let mut inner = RsHttpClient::with_providers(
             cfg,
             Box::new(PythonCredentialProvider),
             Box::new(PythonNegotiateProvider),
         )
         .map_err(client_err_to_py)?;
+        inner.set_auth_trace(Some(std::sync::Arc::new(|header: &str| {
+            super::invoke_auth_header_trace(header);
+        })));
         Ok(Self {
             inner,
             defaults: Mutex::new(RequestOptions::default()),

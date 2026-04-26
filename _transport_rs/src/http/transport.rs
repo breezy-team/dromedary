@@ -78,7 +78,7 @@ impl HttpTransport {
             user_agent,
             read_timeout: timeout,
         };
-        let client = HttpClient::with_providers(
+        let mut client = HttpClient::with_providers(
             cfg,
             Box::new(PythonCredentialProvider),
             Box::new(PythonNegotiateProvider) as Box<dyn NegotiateProvider>,
@@ -90,6 +90,13 @@ impl HttpTransport {
                 Some(base),
             )
         })?;
+        // Route auth-header traces back through the Python callback
+        // set via `set_auth_header_trace`. Breezy registers that
+        // callback at import time so debug-flag-controlled
+        // "> Authorization: <masked>" lines reach `trace.mutter`.
+        client.set_auth_trace(Some(std::sync::Arc::new(|header: &str| {
+            super::invoke_auth_header_trace(header);
+        })));
         let rust = RsHttpTransport::new(base, Arc::new(client))
             .map_err(|e| map_transport_err_to_py_err(e, None, Some(base)))?;
         let inner = Arc::new(rust);
@@ -134,11 +141,22 @@ impl HttpTransport {
         source: PyRef<Self>,
         offset: Option<&str>,
     ) -> PyResult<()> {
-        let cloned = source
-            .inner
-            .clone_concrete(offset)
-            .map_err(|e| map_transport_err_to_py_err(e, None, offset))?;
-        let new_inner = Arc::new(cloned);
+        // When no offset is supplied, take the source's inner
+        // directly rather than cloning — clone_concrete's
+        // (deliberate) segment-parameter and raw_base stripping
+        // loses information that matters for ``__init__``-time
+        // TLS-config rebuilds (see
+        // ``dromedary.http.urllib.HttpTransport.__init__``).
+        let new_inner = match offset {
+            None => source.inner.clone(),
+            Some(_) => {
+                let cloned = source
+                    .inner
+                    .clone_concrete(offset)
+                    .map_err(|e| map_transport_err_to_py_err(e, None, offset))?;
+                Arc::new(cloned)
+            }
+        };
         // Replace the base Transport(Box<dyn Transport>) too so
         // calls routed through the dyn vtable see the cloned state.
         let base_box: Box<dyn dromedary::Transport> = Box::new(Clone::clone(&*new_inner));
@@ -148,6 +166,18 @@ impl HttpTransport {
         connected.as_super().0 = base_box;
         slf.inner = new_inner;
         Ok(())
+    }
+
+    /// Install (or clear) the transport-level activity callback.
+    /// Python subclasses invoke this with a bound method reference
+    /// (``self._report_activity``) so internal get / has / post /
+    /// readv calls funnel byte-count updates into breezy's progress
+    /// UI the same way the explicit ``request()`` path already does.
+    /// Pass ``None`` to clear.
+    #[pyo3(signature = (callback))]
+    fn _set_activity_callback(&self, callback: Option<Py<PyAny>>) {
+        let cb = callback.map(super::client::make_activity_callback);
+        self.inner.set_activity(cb);
     }
 
     /// Current range hint as `"multi"`, `"single"`, or `None`. Part
@@ -162,6 +192,58 @@ impl HttpTransport {
     /// stepped, False if we were already at the floor.
     fn _degrade_range_hint(&self) -> bool {
         self.inner.degrade_range_hint()
+    }
+
+    // Readv-tuning getters / setters. These mirror the Python
+    // urllib HttpTransport's instance attributes that breezy's
+    // tests poke at to force specific batching behaviour:
+    // `_max_readv_combine`, `_bytes_to_read_before_seek`,
+    // `_get_max_size`, `_max_get_ranges`. Each setter swaps the
+    // single named field while leaving the others untouched, so
+    // tests that override one don't reset the others.
+
+    #[getter]
+    fn _max_readv_combine(&self) -> usize {
+        self.inner.readv_tuning().max_readv_combine
+    }
+    #[setter]
+    fn set__max_readv_combine(&self, v: usize) {
+        let mut t = self.inner.readv_tuning();
+        t.max_readv_combine = v;
+        self.inner.set_readv_tuning(t);
+    }
+
+    #[getter]
+    fn _bytes_to_read_before_seek(&self) -> usize {
+        self.inner.readv_tuning().bytes_to_read_before_seek
+    }
+    #[setter]
+    fn set__bytes_to_read_before_seek(&self, v: usize) {
+        let mut t = self.inner.readv_tuning();
+        t.bytes_to_read_before_seek = v;
+        self.inner.set_readv_tuning(t);
+    }
+
+    #[getter]
+    fn _get_max_size(&self) -> usize {
+        self.inner.readv_tuning().get_max_size
+    }
+    #[setter]
+    fn set__get_max_size(&self, v: usize) {
+        let mut t = self.inner.readv_tuning();
+        t.get_max_size = v;
+        self.inner.set_readv_tuning(t);
+    }
+
+    #[getter]
+    fn _max_get_ranges(&self) -> usize {
+        self.inner.readv_tuning().max_get_ranges
+    }
+    #[setter]
+    fn set__max_get_ranges(&self, v: usize) {
+        let mut t = self.inner.readv_tuning();
+        t.max_get_ranges = v;
+        self.inner.set_readv_tuning(t);
     }
 
     /// Unqualified HTTP scheme (`"http"` or `"https"`) — strips any
@@ -295,6 +377,20 @@ pub(crate) fn http_transport_initializer(
     inner: Arc<RsHttpTransport>,
 ) -> PyClassInitializer<HttpTransport> {
     let base_box: Box<dyn dromedary::Transport> = Box::new(Clone::clone(&*inner));
+    http_transport_initializer_with_base(inner, base_box)
+}
+
+/// Like `http_transport_initializer` but lets the caller supply a
+/// specific `dyn Transport` to install at the base `Transport`
+/// pyclass layer. Used by the DAV subclass so default-method
+/// dispatch (e.g. `Transport::move` in Python, which goes to the
+/// Rust `dyn Transport::move` in turn) reaches the DAV impls (stat
+/// via PROPFIND, native MOVE) rather than the HTTP parent that
+/// has no stat support.
+pub(crate) fn http_transport_initializer_with_base(
+    inner: Arc<RsHttpTransport>,
+    base_box: Box<dyn dromedary::Transport>,
+) -> PyClassInitializer<HttpTransport> {
     PyClassInitializer::from(Transport(base_box))
         .add_subclass(ConnectedTransport)
         .add_subclass(HttpTransport { inner })

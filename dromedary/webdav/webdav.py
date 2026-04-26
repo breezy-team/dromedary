@@ -45,32 +45,24 @@ class HttpDavTransport(_webdav_rs.HttpDavTransport):
     def __new__(cls, base, _from_transport=None, ca_certs=None):
         """Build the Rust transport.
 
-        Mirrors :class:`dromedary.http.urllib.HttpTransport.__new__`:
-        resolves SSL options from the ``dromedary.http`` module hooks
-        and, if a ``_from_transport`` is supplied, grafts its
-        HttpClient onto the freshly-constructed instance so the
-        connection pool and auth cache are shared.
+        Mirrors :meth:`dromedary.http.urllib.HttpTransport.__new__`:
+        TLS-related knobs are deferred to ``__init__`` so breezy
+        subclasses that add ``ca_certs`` to their own ``__init__``
+        and call ``super().__init__(..., ca_certs=...)`` see it
+        applied. ``__new__`` only does the bare-minimum base-URL
+        setup; ``__init__`` rebuilds the underlying client with the
+        right TLS config when it finally arrives.
+
+        When ``_from_transport`` is supplied we construct a fresh
+        Rust instance at ``base`` and then graft the source's
+        HttpClient / auth cache / range hint onto it via
+        ``_rust_replace_inner_from``.
         """
-        if ca_certs is None:
-            import dromedary.http as _mod_http
-
-            configured = _mod_http.ssl_ca_certs()
-            if configured:
-                ca_certs = configured
-
-        import ssl as _ssl
-
-        import dromedary.http as _mod_http
-
-        disable_verification = _mod_http.ssl_cert_reqs() == _ssl.CERT_NONE
-        if disable_verification:
-            ca_certs = None
-
         self = super().__new__(
             cls,
             base,
-            ca_certs=ca_certs,
-            disable_verification=disable_verification,
+            ca_certs=None,
+            disable_verification=False,
             user_agent=urllib._default_user_agent(),
         )
         if _from_transport is not None:
@@ -81,15 +73,67 @@ class HttpDavTransport(_webdav_rs.HttpDavTransport):
         return self
 
     def __init__(self, base, _from_transport=None, ca_certs=None):
-        """Initialize the Python-side state."""
-        # Rust __new__ populates the transport state. The only
-        # Python-side slot is `_medium`, which breezy's HttpDav
-        # subclass fills in on first `get_smart_medium()` call.
+        """Initialise Python-side state and TLS-configured inner client.
+
+        Rust ``__new__`` populated the base-URL state with a minimal
+        default client. TLS knobs take effect here so subclasses that
+        override ``__init__`` and call ``super().__init__(..., ca_certs=...)``
+        pick up correctly — see
+        :meth:`dromedary.http.urllib.HttpTransport.__init__`.
+        """
         self._medium = None
+        if _from_transport is None:
+            import ssl as _ssl
+
+            import dromedary.http as _mod_http
+
+            if ca_certs is None:
+                configured = _mod_http.ssl_ca_certs()
+                if configured:
+                    ca_certs = configured
+            disable_verification = _mod_http.ssl_cert_reqs() == _ssl.CERT_NONE
+            if disable_verification:
+                ca_certs = None
+            fresh = _webdav_rs.HttpDavTransport(
+                base,
+                ca_certs=ca_certs,
+                disable_verification=disable_verification,
+                user_agent=urllib._default_user_agent(),
+            )
+            # ``offset=None`` lets ``_rust_replace_inner_from`` share
+            # ``fresh``'s inner directly, preserving raw_base and
+            # segment parameters that ``clone_concrete(None)`` would
+            # otherwise strip.
+            self._rust_replace_inner_from(fresh, None)
+        # Wire an activity callback into the Rust transport so
+        # internal get/has/post/readv calls feed breezy's progress
+        # UI too, not just the explicit ``.request()`` path. Same
+        # pattern as ``HttpTransport.__init__``.
+        import weakref
+
+        wself = weakref.ref(self)
+
+        def _forward(byte_count, direction):
+            t = wself()
+            if t is None:
+                return
+            t._report_activity(byte_count, direction)
+
+        self._set_activity_callback(_forward)
 
     def clone(self, offset=None):
-        """Return a new transport sharing this transport's HttpClient."""
-        new_base = self.base if offset is None else self.abspath(offset)
+        """Return a new transport sharing this transport's HttpClient.
+
+        Uses ``urlutils.URL.clone`` path-combine semantics rather
+        than ``abspath`` URL-join semantics — see
+        :meth:`dromedary.http.urllib.HttpTransport.clone`.
+        """
+        if offset is None:
+            new_base = self.base
+        else:
+            from dromedary._transport_rs.urlutils import URL
+
+            new_base = str(URL.from_string(self.base).clone(offset))
         return type(self)(new_base, _from_transport=self)
 
     def _report_activity(self, byte_count, direction):
@@ -139,6 +183,30 @@ class HttpDavTransport(_webdav_rs.HttpDavTransport):
     def append_file(self, relpath, f, mode=None):
         """Append `f.read()` to `relpath`. Returns the old length."""
         return self.append_bytes(relpath, f.read())
+
+    def open_write_stream(self, relpath, mode=None):
+        """Open a writable stream at ``relpath``.
+
+        WebDAV has no native append/stream verbs, so we back the
+        stream with append-based writes: the Transport protocol's
+        ``AppendBasedFileStream`` sends one PUT per ``write()``,
+        each concatenating the new bytes onto the server-side file.
+        Inefficient for large files but correct; bzr only uses
+        open_write_stream for small status/lock files.
+
+        We start by PUT'ing an empty body so the file exists when
+        ``open_write_stream`` returns (the Transport contract
+        requires it — breezy's ``test_opening_a_file_stream_creates_
+        file`` exercises exactly that shape). ``FileStream.close``
+        looks the stream up in the module-level ``_file_streams``
+        registry, so we insert it there too.
+        """
+        from dromedary import AppendBasedFileStream, _file_streams
+
+        self.put_bytes(relpath, b"")
+        handle = AppendBasedFileStream(self, relpath)
+        _file_streams[self.abspath(relpath)] = handle
+        return handle
 
 
 def get_test_permutations():
