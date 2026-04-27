@@ -725,11 +725,11 @@ mod tests {
         // one of the known locations (or the first one as a last resort).
         let result = default_ca_certs();
         let allowed = || SSL_CA_CERTS_KNOWN_LOCATIONS.contains(&result.as_str());
-        if cfg!(target_os = "windows") {
-            assert!(result.ends_with("cacert.pem"));
-        } else if cfg!(target_os = "macos") {
-            // macOS materialises the native root store to a tempfile via
-            // `native_ca_bundle_path`; the result is that tempfile path.
+        if cfg!(any(target_os = "windows", target_os = "macos")) {
+            // Both materialise the native root store to a tempfile via
+            // `native_ca_bundle_path`. Only when that fails does Windows
+            // fall back to the `cacert.pem`-next-to-the-exe convention,
+            // which won't happen in a normal cargo-test run.
             assert!(
                 result.ends_with(".pem") && result.contains("dromedary-native-ca-"),
                 "unexpected CA path: {}",
