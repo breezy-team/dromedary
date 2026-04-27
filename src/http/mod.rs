@@ -727,6 +727,14 @@ mod tests {
         let allowed = || SSL_CA_CERTS_KNOWN_LOCATIONS.contains(&result.as_str());
         if cfg!(target_os = "windows") {
             assert!(result.ends_with("cacert.pem"));
+        } else if cfg!(target_os = "macos") {
+            // macOS materialises the native root store to a tempfile via
+            // `native_ca_bundle_path`; the result is that tempfile path.
+            assert!(
+                result.ends_with(".pem") && result.contains("dromedary-native-ca-"),
+                "unexpected CA path: {}",
+                result,
+            );
         } else {
             assert!(allowed(), "unexpected CA path: {}", result);
         }
