@@ -359,6 +359,14 @@ def _win32_normpath(path):
         # walking up to the host root.
         if path.startswith("//") or path.startswith("\\\\"):
             unified = path.replace("\\", "/")
+            # Collapse runs of `/` (except the leading `//` that marks UNC)
+            # so callers like `osutils.pathjoin("//HOST/", "..")` which emit
+            # `///HOST//..` still parse the host correctly.
+            squeezed = "//"
+            for ch in unified[2:]:
+                if not (ch == "/" and squeezed.endswith("/")):
+                    squeezed += ch
+            unified = squeezed
             host_end = unified.find("/", 2)
             host_part = unified if host_end == -1 else unified[:host_end]
             tail = "" if host_end == -1 else unified[host_end + 1 :]
