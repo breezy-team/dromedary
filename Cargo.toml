@@ -17,7 +17,7 @@ log = "0.4"
 [package]
 name = "dromedary"
 version = { workspace = true }
-edition = "2018"
+edition = "2021"
 description = "Transport layer for Breezy"
 license = "GPL-2.0+"
 repository = "https://github.com/breezy-team/dromedary"
@@ -61,6 +61,9 @@ http = "1"
 quick-xml = { version = "0.37", optional = true }
 gio = { version = "0.22", optional = true }
 glib = { version = "0.22", optional = true }
+# SFTP client used by the optional sftp transport. Construction takes
+# any Read+Write channel so we don't pull in an SSH library here.
+sftp = { version = "0.2.3", optional = true }
 
 [features]
 default = ["pyo3"]
@@ -70,6 +73,9 @@ gio = ["dep:gio", "dep:glib"]
 # multi-status PROPFIND responses; opt-in because callers that only
 # need HTTP shouldn't pay the XML-parser cost.
 webdav = ["dep:quick-xml"]
+# SFTP transport. Caller supplies the SSH byte-stream channel — no
+# SSH-library dep is added here so embedders pick their own backend.
+sftp = ["dep:sftp"]
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["fs", "uio"] }

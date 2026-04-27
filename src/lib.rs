@@ -794,6 +794,9 @@ pub mod readonly;
 
 pub mod ssh;
 
+#[cfg(feature = "sftp")]
+pub mod sftp;
+
 pub mod unlistable;
 
 pub mod osutils;
