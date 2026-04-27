@@ -140,11 +140,37 @@ impl Drop for SSHSubprocessConnection {
 /// non-blocking short reads").
 #[cfg(unix)]
 fn spawn(argv: &[String], host: &str, port: Option<u16>) -> PyResult<SSHSubprocessConnection> {
+    // SOCK_CLOEXEC isn't available as a `SockFlag` on macOS in nix; fall back
+    // to `SockFlag::empty()` and set `FD_CLOEXEC` via fcntl on the parent's
+    // half after creation.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "illumos",
+        target_os = "solaris",
+    ))]
+    let sock_flags = nix::sys::socket::SockFlag::SOCK_CLOEXEC;
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "illumos",
+        target_os = "solaris",
+    )))]
+    let sock_flags = nix::sys::socket::SockFlag::empty();
+
     let pair = nix::sys::socket::socketpair(
         nix::sys::socket::AddressFamily::Unix,
         nix::sys::socket::SockType::Stream,
         None,
-        nix::sys::socket::SockFlag::SOCK_CLOEXEC,
+        sock_flags,
     )
     .ok();
 
@@ -163,6 +189,23 @@ fn spawn(argv: &[String], host: &str, port: Option<u16>) -> PyResult<SSHSubproce
         cmd.stdout(Stdio::from(dup_out));
         // `theirs` is closed in the parent when this `OwnedFd` drops.
         drop(theirs);
+        // Ensure CLOEXEC on the parent's retained half on platforms where
+        // `SOCK_CLOEXEC` couldn't be requested at creation time.
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "illumos",
+            target_os = "solaris",
+        )))]
+        nix::fcntl::fcntl(
+            &mine,
+            nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+        )
+        .map_err(|e| PyRuntimeError::new_err(format!("fcntl FD_CLOEXEC failed: {e}")))?;
         Some(mine)
     } else {
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
