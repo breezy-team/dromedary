@@ -160,53 +160,88 @@ impl SftpTransport {
         remote_path_for(&self.base, relpath)
     }
 
-    fn read_full(&self, file: &sftp::File, size: u64) -> Result<Vec<u8>> {
-        // pread takes u32 lengths; chunk if needed. Server may return
-        // fewer bytes than requested, so loop until we hit EOF.
-        let mut out = Vec::with_capacity(size as usize);
-        let mut offset = 0u64;
-        loop {
-            let want: u32 = u32::try_from(size.saturating_sub(offset))
-                .unwrap_or(u32::MAX)
-                .min(64 * 1024);
-            if want == 0 {
-                break;
-            }
-            match self.sftp.pread(file, offset, want) {
-                Ok(chunk) if chunk.is_empty() => break,
-                Ok(chunk) => {
-                    offset += chunk.len() as u64;
-                    out.extend_from_slice(&chunk);
-                    if chunk.len() < want as usize && offset >= size {
-                        break;
-                    }
-                }
-                Err(sftp::Error::Eof(_, _)) => break,
-                Err(e) => return Err(map_sftp_err(e, None)),
-            }
-        }
-        Ok(out)
-    }
 }
 
-/// In-memory cursor over the bytes of a remote file. SFTP `pread` is
-/// random-access and the existing `ReadStream` contract requires both
-/// `Read + Seek`, so for the simple `get()` case we materialise the
-/// whole file once and serve `Read`/`Seek` from a Cursor. Callers that
-/// need streaming should use `readv` instead.
-struct SftpReadStream(std::io::Cursor<Vec<u8>>);
+/// Streaming reader over a remote SFTP file. Holds an open `sftp::File`
+/// handle and issues `pread` lazily as the caller `read`s, so opening a
+/// large file no longer pulls the whole thing into memory. `Seek` adjusts
+/// the offset without a server round-trip — random access and `read_to_end`
+/// from arbitrary positions both work.
+///
+/// Server `pread` may return fewer bytes than requested but is allowed to
+/// return any non-zero amount up to the requested length. We surface those
+/// short reads to the caller rather than looping internally — that's the
+/// `Read` contract and lets callers detect EOF via the standard
+/// "returned 0" signal. The end of file is communicated either as a
+/// zero-length reply, or as `sftp::Error::Eof`; both are mapped to
+/// `Ok(0)`.
+struct SftpReadStream {
+    sftp: Arc<sftp::SftpClient<BoxedChannel>>,
+    file: sftp::File,
+    /// Current logical position in the remote file. Advances on `read`,
+    /// updated freely by `seek`; the size cache below feeds `SeekFrom::End`.
+    offset: u64,
+    /// Cached file size from the initial `fstat`, so `SeekFrom::End`
+    /// doesn't need a round-trip. Refreshed lazily if a write extends the
+    /// file under us — but a streaming reader is the wrong place to
+    /// observe that, so we leave it stale.
+    size: u64,
+    closed: bool,
+}
 
 impl std::io::Read for SftpReadStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.0.read(buf)
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        // pread length is u32 on the wire; cap to that and to a sensible
+        // chunk so we don't ask the server for an arbitrarily-large reply.
+        let want = u32::try_from(buf.len()).unwrap_or(u32::MAX).min(64 * 1024);
+        match self.sftp.pread(&self.file, self.offset, want) {
+            Ok(chunk) if chunk.is_empty() => Ok(0),
+            Ok(chunk) => {
+                let n = chunk.len();
+                buf[..n].copy_from_slice(&chunk);
+                self.offset += n as u64;
+                Ok(n)
+            }
+            Err(sftp::Error::Eof(_, _)) => Ok(0),
+            Err(e) => Err(std::io::Error::from(e)),
+        }
     }
 }
+
 impl std::io::Seek for SftpReadStream {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
-        self.0.seek(pos)
+        // Pure offset arithmetic — no wire I/O. Rejects negative results
+        // the same way std's Cursor does, so callers see a familiar error.
+        let new = match pos {
+            std::io::SeekFrom::Start(o) => o as i128,
+            std::io::SeekFrom::Current(d) => self.offset as i128 + d as i128,
+            std::io::SeekFrom::End(d) => self.size as i128 + d as i128,
+        };
+        if new < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "seek before start of file",
+            ));
+        }
+        self.offset = new as u64;
+        Ok(self.offset)
     }
 }
+
 impl ReadStream for SftpReadStream {}
+
+impl Drop for SftpReadStream {
+    fn drop(&mut self) {
+        if !self.closed {
+            // Best-effort close; nobody to report errors to here.
+            let _ = self.sftp.fclose(&self.file);
+            self.closed = true;
+        }
+    }
+}
 
 /// Append-only write stream. Buffers locally and flushes via `pwrite`
 /// at every `write` call so that a `sync_data` sees committed bytes.
@@ -269,14 +304,20 @@ impl Transport for SftpTransport {
             .sftp
             .open(&path, opts, &attr)
             .map_err(|e| map_sftp_err(e, Some(&path)))?;
+        // One fstat to seed the size cache for SeekFrom::End. Bytes are
+        // read lazily on Read calls; the file handle stays open until the
+        // returned stream is dropped.
         let st = self
             .sftp
             .fstat(&file, None)
             .map_err(|e| map_sftp_err(e, Some(&path)))?;
-        let size = st.size.unwrap_or(0);
-        let buf = self.read_full(&file, size)?;
-        let _ = self.sftp.fclose(&file);
-        Ok(Box::new(SftpReadStream(std::io::Cursor::new(buf))))
+        Ok(Box::new(SftpReadStream {
+            sftp: Arc::clone(&self.sftp),
+            file,
+            offset: 0,
+            size: st.size.unwrap_or(0),
+            closed: false,
+        }))
     }
 
     fn has(&self, relpath: &UrlFragment) -> Result<bool> {
@@ -678,7 +719,7 @@ fn attrs_to_stat(attr: &sftp::Attributes) -> Stat {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn base() -> Url {
@@ -804,7 +845,7 @@ mod tests {
     // Unix-only because `UnixStream::pair()` is Unix-only.
 
     #[cfg(unix)]
-    mod loopback {
+    pub(crate) mod loopback {
         use super::super::*;
         use std::collections::{HashMap, HashSet};
         use std::io::{Read, Write};
@@ -1412,6 +1453,14 @@ mod tests {
             (transport, server)
         }
 
+        /// Public-in-crate spawn for cross-module tests. The registry
+        /// test wants to verify a registered SFTP factory talks to a
+        /// real (fake) server end-to-end without re-implementing the
+        /// wire harness.
+        pub(crate) fn spawn_for_registry(stream: UnixStream) -> thread::JoinHandle<()> {
+            spawn(stream)
+        }
+
         #[test]
         fn handshake_succeeds() {
             let (t, server) = server_with_transport("sftp://test/tmp/");
@@ -1654,6 +1703,55 @@ mod tests {
             let got = t.get_bytes("big").unwrap();
             assert_eq!(got.len(), big.len());
             assert!(got == big, "256 KiB round-trip content differs");
+            drop(t);
+            server.join().unwrap();
+        }
+
+        #[test]
+        fn get_streams_lazily_via_seek_and_read() {
+            use std::io::{Read, Seek, SeekFrom};
+            // Lay down 8 KiB so SeekFrom::End is meaningful.
+            let (t, server) = server_with_transport("sftp://test/tmp/");
+            let payload: Vec<u8> = (0..8192).map(|i| (i % 251) as u8).collect();
+            t.put_bytes("f", &payload, None).unwrap();
+
+            let mut s = t.get("f").unwrap();
+            // Read first 100 bytes from a fresh stream — confirms the
+            // initial offset is 0 and pread returns the head.
+            let mut head = [0u8; 100];
+            s.read_exact(&mut head).unwrap();
+            assert_eq!(&head[..], &payload[..100]);
+
+            // Seek mid-file and read 50 bytes — confirms Seek/Current
+            // and that Read advances after the seek.
+            let pos = s.seek(SeekFrom::Start(2000)).unwrap();
+            assert_eq!(pos, 2000);
+            let mut mid = [0u8; 50];
+            s.read_exact(&mut mid).unwrap();
+            assert_eq!(&mid[..], &payload[2000..2050]);
+
+            // Seek from end and read to EOF — confirms the size cache
+            // and that read returns 0 at EOF.
+            let pos = s.seek(SeekFrom::End(-30)).unwrap();
+            assert_eq!(pos, 8192 - 30);
+            let mut tail = Vec::new();
+            s.read_to_end(&mut tail).unwrap();
+            assert_eq!(tail, payload[8162..]);
+
+            drop(s);
+            drop(t);
+            server.join().unwrap();
+        }
+
+        #[test]
+        fn get_seek_before_start_errors() {
+            use std::io::{Seek, SeekFrom};
+            let (t, server) = server_with_transport("sftp://test/tmp/");
+            t.put_bytes("f", b"abc", None).unwrap();
+            let mut s = t.get("f").unwrap();
+            let err = s.seek(SeekFrom::Current(-5)).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            drop(s);
             drop(t);
             server.join().unwrap();
         }

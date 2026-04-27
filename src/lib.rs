@@ -797,6 +797,8 @@ pub mod ssh;
 #[cfg(feature = "sftp")]
 pub mod sftp;
 
+pub mod registry;
+
 pub mod unlistable;
 
 pub mod osutils;
