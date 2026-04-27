@@ -34,7 +34,7 @@ Repository = "https://github.com/breezy-team/dromedary"
 [project.optional-dependencies]
 paramiko = ["paramiko>=1.6.2"]
 dev = [
-    "ruff==0.15.11",
+    "ruff==0.15.12",
     "types-paramiko",
 ]
 testing = [
