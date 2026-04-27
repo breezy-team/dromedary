@@ -26,7 +26,10 @@ fn validate_win32_file_url(url: &str) -> PyResult<()> {
         && url.starts_with("file:///")
         && url.len() > "file:///".len()
     {
-        return Err(InvalidURL::new_err(("Invalid Win32 local URL", url)));
+        return Err(InvalidURL::new_err((
+            "Invalid Win32 local URL".to_string(),
+            url.to_string(),
+        )));
     }
     Ok(())
 }
