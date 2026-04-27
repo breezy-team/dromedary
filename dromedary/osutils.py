@@ -351,31 +351,32 @@ def _win32_normpath(path):
         Normalized path string
     """
     if sys.platform == "win32":
-        # On Windows, normalize path separators and handle drive letters
-        import os.path
-
-        normalized = os.path.normpath(path).replace("\\", "/")
-        # Python's ntpath.normpath does not collapse `..` segments against
-        # a UNC root (`//HOST/..` stays `//HOST/..`). Treat anything that
-        # tries to walk above the host as the host itself, so transports
-        # built from UNC URLs can clone past the root without producing
-        # invalid paths.
-        if normalized.startswith("//"):
-            host_end = normalized.find("/", 2)
-            host_part = normalized if host_end == -1 else normalized[:host_end]
-            tail = "" if host_end == -1 else normalized[host_end + 1 :]
-            depth = 0
+        # For UNC paths we do our own `..` collapse before delegating to
+        # `ntpath.normpath`. Python treats the share as the UNC root and
+        # refuses to walk above it (so `\\HOST\share\..` stays
+        # `\\HOST\share\`), but `EmulatedWin32LocalTransport.clone` needs
+        # `..` from the share to land at `\\HOST` so callers can keep
+        # walking up to the host root.
+        if path.startswith("//") or path.startswith("\\\\"):
+            unified = path.replace("\\", "/")
+            host_end = unified.find("/", 2)
+            host_part = unified if host_end == -1 else unified[:host_end]
+            tail = "" if host_end == -1 else unified[host_end + 1 :]
+            stack = []
             for segment in tail.split("/"):
                 if segment == "..":
-                    if depth > 0:
-                        depth -= 1
+                    if stack:
+                        stack.pop()
                     # else: silently absorbed; can't go above the host
                 elif segment and segment != ".":
-                    depth += 1
-            # Reconstruct: keep only the leading components that survived
-            if depth == 0:
+                    stack.append(segment)
+            if not stack:
                 return host_part
-        return normalized
+            return host_part + "/" + "/".join(stack)
+
+        import os.path
+
+        return os.path.normpath(path).replace("\\", "/")
     else:
         # On non-Windows, just return the path as-is
         return path
