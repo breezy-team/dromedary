@@ -905,13 +905,16 @@ class TestWin32LocalTransport(tests.TestCase):
         # Win32 UNC path like \\HOST\path
         # clone to root should stop at least at \\HOST part
         # not on \\
+        # The Rust `url::Url` parser normalises hosts to lowercase per
+        # RFC 3986, so compare case-insensitively (URL hosts are
+        # case-insensitive).
         t = local.EmulatedWin32LocalTransport("file://HOST/path/to/some/dir/")
         for _i in range(4):
             t = t.clone("..")
-        self.assertEqual(t.base, "file://HOST/")
+        self.assertEqual(t.base.lower(), "file://host/")
         # make sure we reach the root
         t = t.clone("..")
-        self.assertEqual(t.base, "file://HOST/")
+        self.assertEqual(t.base.lower(), "file://host/")
 
 
 class TestConnectedTransport(tests.TestCase):
