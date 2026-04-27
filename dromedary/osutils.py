@@ -354,7 +354,28 @@ def _win32_normpath(path):
         # On Windows, normalize path separators and handle drive letters
         import os.path
 
-        return os.path.normpath(path).replace("\\", "/")
+        normalized = os.path.normpath(path).replace("\\", "/")
+        # Python's ntpath.normpath does not collapse `..` segments against
+        # a UNC root (`//HOST/..` stays `//HOST/..`). Treat anything that
+        # tries to walk above the host as the host itself, so transports
+        # built from UNC URLs can clone past the root without producing
+        # invalid paths.
+        if normalized.startswith("//"):
+            host_end = normalized.find("/", 2)
+            host_part = normalized if host_end == -1 else normalized[:host_end]
+            tail = "" if host_end == -1 else normalized[host_end + 1 :]
+            depth = 0
+            for segment in tail.split("/"):
+                if segment == "..":
+                    if depth > 0:
+                        depth -= 1
+                    # else: silently absorbed; can't go above the host
+                elif segment and segment != ".":
+                    depth += 1
+            # Reconstruct: keep only the leading components that survived
+            if depth == 0:
+                return host_part
+        return normalized
     else:
         # On non-Windows, just return the path as-is
         return path
