@@ -632,17 +632,26 @@ pub mod win32 {
         }
         let win32_path = crate::osutils::path::win32::abspath(path.as_ref())?;
         let win32_path = win32_path.as_path().to_str().unwrap();
-        if win32_path.starts_with("//") {
+        // `path_clean` can leave a trailing slash on UNC paths (e.g.
+        // `//HOST/path/`); the caller passed a path-like input, so strip
+        // the trailing slash that wasn't in the input. Keep the URL root
+        // case (just `//`) intact.
+        let trimmed = if win32_path.len() > 2 && win32_path.ends_with('/') {
+            &win32_path[..win32_path.len() - 1]
+        } else {
+            win32_path
+        };
+        if trimmed.starts_with("//") {
             Ok(format!(
                 "file:{}",
-                super::escape(win32_path.as_bytes(), Some("/~"))
+                super::escape(trimmed.as_bytes(), Some("/~"))
             ))
         } else {
-            let drive = win32_path.chars().next().unwrap().to_ascii_uppercase();
+            let drive = trimmed.chars().next().unwrap().to_ascii_uppercase();
             Ok(format!(
                 "file:///{}:{}",
                 drive,
-                super::escape(win32_path[2..].as_bytes(), Some("/~"))
+                super::escape(trimmed[2..].as_bytes(), Some("/~"))
             ))
         }
     }
@@ -678,10 +687,17 @@ pub mod win32 {
         {
             return Err(super::Error::InvalidWin32LocalUrl(url.to_string()));
         }
+        // Use backslashes on Windows so the result round-trips with
+        // `os.path.abspath` and matches what `os.getcwd()` reports there.
+        // On non-Windows we keep forward slashes (the test harness exercises
+        // win32-style URLs even on Linux for parser coverage).
+        let tail = super::unescape(&win32_url[5..])?;
+        #[cfg(target_os = "windows")]
+        let tail = tail.replace('/', "\\");
         Ok(PathBuf::from(format!(
             "{}:{}",
             win32_url[3..=3].to_uppercase(),
-            super::unescape(&win32_url[5..])?
+            tail,
         )))
     }
 

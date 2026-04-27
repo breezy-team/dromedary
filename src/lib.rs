@@ -118,14 +118,40 @@ pub fn map_io_err_to_transport_err(err: std::io::Error, path: Option<&str>) -> E
         //
         // std::io::ErrorKind::NotADirectoryError => Error::NotADirectoryError(None),
         // std::io::ErrorKind::IsADirectoryError => Error::IsADirectoryError(None),
-        _ => match err.raw_os_error() {
-            Some(e) if e == libc::ENOTDIR => Error::NotADirectoryError(path.map(|p| p.to_string())),
-            Some(e) if e == libc::EISDIR => Error::IsADirectoryError(path.map(|p| p.to_string())),
-            Some(e) if e == libc::ENOTEMPTY => {
-                Error::DirectoryNotEmptyError(path.map(|p| p.to_string()))
+        _ => {
+            #[cfg(unix)]
+            {
+                match err.raw_os_error() {
+                    Some(e) if e == libc::ENOTDIR => {
+                        Error::NotADirectoryError(path.map(|p| p.to_string()))
+                    }
+                    Some(e) if e == libc::EISDIR => {
+                        Error::IsADirectoryError(path.map(|p| p.to_string()))
+                    }
+                    Some(e) if e == libc::ENOTEMPTY => {
+                        Error::DirectoryNotEmptyError(path.map(|p| p.to_string()))
+                    }
+                    _ => Error::Io(err),
+                }
             }
-            _ => Error::Io(err),
-        },
+            #[cfg(windows)]
+            {
+                // Windows error codes from winerror.h. Mirror the unix
+                // mapping above for the equivalents that show up via
+                // `std::fs` operations.
+                const ERROR_DIRECTORY: i32 = 267; // The directory name is invalid.
+                const ERROR_DIR_NOT_EMPTY: i32 = 145;
+                match err.raw_os_error() {
+                    Some(e) if e == ERROR_DIRECTORY => {
+                        Error::NotADirectoryError(path.map(|p| p.to_string()))
+                    }
+                    Some(e) if e == ERROR_DIR_NOT_EMPTY => {
+                        Error::DirectoryNotEmptyError(path.map(|p| p.to_string()))
+                    }
+                    _ => Error::Io(err),
+                }
+            }
+        }
     }
 }
 
