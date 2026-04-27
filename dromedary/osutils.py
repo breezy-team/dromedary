@@ -18,12 +18,16 @@
 """Operating system utilities for dromedary transport layer."""
 
 import errno
-import fcntl
 import os
 import random
 import stat
 import string
 import sys
+
+if sys.platform != "win32":
+    import fcntl
+else:
+    fcntl = None  # type: ignore[assignment]
 
 
 def pumpfile(from_file, to_file, read_length=-1, buff_size=32768):
@@ -188,7 +192,7 @@ def set_fd_cloexec(fd):
     if hasattr(fd, "fileno"):
         fd = fd.fileno()
 
-    if hasattr(fcntl, "FD_CLOEXEC"):
+    if fcntl is not None and hasattr(fcntl, "FD_CLOEXEC"):
         flags = fcntl.fcntl(fd, fcntl.F_GETFD)
         fcntl.fcntl(fd, fcntl.F_SETFD, flags | fcntl.FD_CLOEXEC)
 
