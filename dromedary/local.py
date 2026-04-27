@@ -72,7 +72,7 @@ class EmulatedWin32LocalTransport(LocalTransport):  # type:ignore
         """
         if base[-1] != "/":
             base = base + "/"
-        super(LocalTransport, self).__init__(base)
+        super().__init__(base)
         self._local_base = urlutils._win32_local_path_from_url(base)
 
     def abspath(self, relpath):
