@@ -687,17 +687,10 @@ pub mod win32 {
         {
             return Err(super::Error::InvalidWin32LocalUrl(url.to_string()));
         }
-        // Use backslashes on Windows so the result round-trips with
-        // `os.path.abspath` and matches what `os.getcwd()` reports there.
-        // On non-Windows we keep forward slashes (the test harness exercises
-        // win32-style URLs even on Linux for parser coverage).
-        let tail = super::unescape(&win32_url[5..])?;
-        #[cfg(target_os = "windows")]
-        let tail = tail.replace('/', "\\");
         Ok(PathBuf::from(format!(
             "{}:{}",
             win32_url[3..=3].to_uppercase(),
-            tail,
+            super::unescape(&win32_url[5..])?
         )))
     }
 
