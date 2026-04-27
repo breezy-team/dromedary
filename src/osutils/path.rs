@@ -151,15 +151,21 @@ pub fn abspath(path: &Path) -> Result<PathBuf, std::io::Error> {
 
 pub fn normpath<P: AsRef<Path>>(path: P) -> PathBuf {
     let mut stack = Vec::new();
+    let mut had_prefix = false;
 
     for component in path.as_ref().components() {
         match component {
             Component::Prefix(_) => {
                 stack.clear();
                 stack.push(component.as_os_str());
+                had_prefix = true;
             }
             Component::RootDir => {
-                stack.clear();
+                // On Windows `Prefix("A:")` is followed by `RootDir`; both
+                // belong to the path root and we must not drop the prefix.
+                if !had_prefix {
+                    stack.clear();
+                }
                 stack.push(component.as_os_str());
             }
             Component::CurDir => {}

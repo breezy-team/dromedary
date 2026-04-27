@@ -296,8 +296,16 @@ def getcwd():
 
 
 def abspath(path):
-    """Return the absolute version of a path."""
-    return os.path.abspath(path)
+    """Return the absolute version of a path.
+
+    On Windows the returned path uses forward slashes so that callers can
+    compare it directly against URL-derived paths (which are constructed
+    with forward slashes throughout the codebase).
+    """
+    result = os.path.abspath(path)
+    if sys.platform == "win32":
+        result = result.replace("\\", "/")
+    return result
 
 
 def get_umask():
@@ -327,7 +335,7 @@ MIN_ABS_PATHLENGTH = 3 if sys.platform == "win32" else 1
 
 
 def _win32_abspath(path):
-    return os.path.abspath(path)
+    return os.path.abspath(path).replace("\\", "/")
 
 
 def _win32_normpath(path):

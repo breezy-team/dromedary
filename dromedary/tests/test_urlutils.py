@@ -443,7 +443,9 @@ class TestUrlToPath(TestCase):
             raise TestSkipped("local encoding cannot handle unicode") from err
 
         self.assertEqual("file://HOST/path/to/r%C3%A4ksm%C3%B6rg%C3%A5s", result)
-        self.assertNotIsInstance(result, str)
+        # The Python 2 original asserted bytes vs unicode; in Python 3 the
+        # result is always `str`, matching `_posix_local_path_to_url` above.
+        self.assertIsInstance(result, str)
 
     def test_win32_local_path_from_url(self):
         from_url = urlutils._win32_local_path_from_url
