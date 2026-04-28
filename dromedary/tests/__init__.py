@@ -270,7 +270,11 @@ class TestCaseInTempDir(TestCase):
     def setUp(self):
         super().setUp()
         self._original_dir = os.getcwd()
-        self._tempdir = tempfile.mkdtemp(prefix="dromedary-test-")
+        # Resolve symlinks so `_tempdir` matches `os.getcwd()` after `chdir`.
+        # On macOS `tempfile.mkdtemp` returns `/var/folders/...` but `getcwd`
+        # then reports the realpath `/private/var/folders/...`, breaking
+        # tests that compare paths through both code paths.
+        self._tempdir = os.path.realpath(tempfile.mkdtemp(prefix="dromedary-test-"))
         os.chdir(self._tempdir)
         self.addCleanup(self._cleanup_tempdir)
 

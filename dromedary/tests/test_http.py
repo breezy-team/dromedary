@@ -84,11 +84,15 @@ class TestDefaultCaCerts(unittest.TestCase):
         self.assertIsInstance(result, str)
         self.assertNotEqual("", result)
 
-    @unittest.skipIf(sys.platform == "win32", "Linux/BSD-specific behaviour")
+    @unittest.skipIf(
+        sys.platform in ("win32", "darwin"),
+        "Linux/BSD-specific behaviour: macOS/Windows materialise the native "
+        "root store to a tempfile rather than using a known on-disk location.",
+    )
     def test_result_is_from_known_locations(self):
-        # On macOS the default falls back to the first known location; on
-        # Linux/BSD the first existing one (or the first known location if
-        # none exist) is returned. Either way the result must be in the list.
+        # On Linux/BSD `default_ca_certs()` returns the first existing path
+        # from `_ssl_ca_certs_known_locations` (or the first listed entry as
+        # a breadcrumb when none exist on disk).
         self.assertIn(http.default_ca_certs(), http._ssl_ca_certs_known_locations)
 
     def test_known_locations_non_empty(self):

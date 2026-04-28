@@ -18,12 +18,16 @@
 """Operating system utilities for dromedary transport layer."""
 
 import errno
-import fcntl
 import os
 import random
 import stat
 import string
 import sys
+
+if sys.platform != "win32":
+    import fcntl
+else:
+    fcntl = None  # type: ignore[assignment]
 
 
 def pumpfile(from_file, to_file, read_length=-1, buff_size=32768):
@@ -188,7 +192,7 @@ def set_fd_cloexec(fd):
     if hasattr(fd, "fileno"):
         fd = fd.fileno()
 
-    if hasattr(fcntl, "FD_CLOEXEC"):
+    if fcntl is not None and hasattr(fcntl, "FD_CLOEXEC"):
         flags = fcntl.fcntl(fd, fcntl.F_GETFD)
         fcntl.fcntl(fd, fcntl.F_SETFD, flags | fcntl.FD_CLOEXEC)
 
@@ -292,8 +296,16 @@ def getcwd():
 
 
 def abspath(path):
-    """Return the absolute version of a path."""
-    return os.path.abspath(path)
+    """Return the absolute version of a path.
+
+    On Windows the returned path uses forward slashes so that callers can
+    compare it directly against URL-derived paths (which are constructed
+    with forward slashes throughout the codebase).
+    """
+    result = os.path.abspath(path)
+    if sys.platform == "win32":
+        result = result.replace("\\", "/")
+    return result
 
 
 def get_umask():
@@ -323,7 +335,7 @@ MIN_ABS_PATHLENGTH = 3 if sys.platform == "win32" else 1
 
 
 def _win32_abspath(path):
-    return os.path.abspath(path)
+    return os.path.abspath(path).replace("\\", "/")
 
 
 def _win32_normpath(path):
@@ -339,7 +351,37 @@ def _win32_normpath(path):
         Normalized path string
     """
     if sys.platform == "win32":
-        # On Windows, normalize path separators and handle drive letters
+        # For UNC paths we do our own `..` collapse before delegating to
+        # `ntpath.normpath`. Python treats the share as the UNC root and
+        # refuses to walk above it (so `\\HOST\share\..` stays
+        # `\\HOST\share\`), but `EmulatedWin32LocalTransport.clone` needs
+        # `..` from the share to land at `\\HOST` so callers can keep
+        # walking up to the host root.
+        if path.startswith("//") or path.startswith("\\\\"):
+            unified = path.replace("\\", "/")
+            # Collapse runs of `/` (except the leading `//` that marks UNC)
+            # so callers like `osutils.pathjoin("//HOST/", "..")` which emit
+            # `///HOST//..` still parse the host correctly.
+            squeezed = "//"
+            for ch in unified[2:]:
+                if not (ch == "/" and squeezed.endswith("/")):
+                    squeezed += ch
+            unified = squeezed
+            host_end = unified.find("/", 2)
+            host_part = unified if host_end == -1 else unified[:host_end]
+            tail = "" if host_end == -1 else unified[host_end + 1 :]
+            stack = []
+            for segment in tail.split("/"):
+                if segment == "..":
+                    if stack:
+                        stack.pop()
+                    # else: silently absorbed; can't go above the host
+                elif segment and segment != ".":
+                    stack.append(segment)
+            if not stack:
+                return host_part
+            return host_part + "/" + "/".join(stack)
+
         import os.path
 
         return os.path.normpath(path).replace("\\", "/")

@@ -630,19 +630,47 @@ pub mod win32 {
         if path.as_ref().as_os_str() == "/" {
             return Ok("file:///".to_string());
         }
-        let win32_path = crate::osutils::path::win32::abspath(path.as_ref())?;
-        let win32_path = win32_path.as_path().to_str().unwrap();
-        if win32_path.starts_with("//") {
+        // UNC paths (`\\HOST\path` or `//HOST/path`) are already absolute;
+        // running them through `win32::abspath` on Windows would join with
+        // cwd and mangle them into a drive-letter path because Rust's
+        // `Path::is_absolute` doesn't recognise the forward-slash form.
+        let raw = path.as_ref().to_str().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "non-utf8 path")
+        })?;
+        let unc_input = raw.starts_with("//") || raw.starts_with(r"\\");
+        let win32_path_owned;
+        let win32_path: &str = if unc_input {
+            // Normalise separators but skip cwd-join.
+            win32_path_owned = raw.replace('\\', "/");
+            &win32_path_owned
+        } else {
+            win32_path_owned = crate::osutils::path::win32::abspath(path.as_ref())?
+                .as_path()
+                .to_str()
+                .unwrap()
+                .to_owned();
+            &win32_path_owned
+        };
+        // `path_clean` can leave a trailing slash on UNC paths (e.g.
+        // `//HOST/path/`); the caller passed a path-like input, so strip
+        // the trailing slash that wasn't in the input. Keep the URL root
+        // case (just `//`) intact.
+        let trimmed = if win32_path.len() > 2 && win32_path.ends_with('/') {
+            &win32_path[..win32_path.len() - 1]
+        } else {
+            win32_path
+        };
+        if trimmed.starts_with("//") {
             Ok(format!(
                 "file:{}",
-                super::escape(win32_path.as_bytes(), Some("/~"))
+                super::escape(trimmed.as_bytes(), Some("/~"))
             ))
         } else {
-            let drive = win32_path.chars().next().unwrap().to_ascii_uppercase();
+            let drive = trimmed.chars().next().unwrap().to_ascii_uppercase();
             Ok(format!(
                 "file:///{}:{}",
                 drive,
-                super::escape(win32_path[2..].as_bytes(), Some("/~"))
+                super::escape(trimmed[2..].as_bytes(), Some("/~"))
             ))
         }
     }
@@ -798,10 +826,21 @@ pub fn file_relpath(base: &str, path: &str) -> Result<String> {
         ));
     }
 
-    Ok(escape(
-        relpath.unwrap().as_os_str().as_encoded_bytes(),
-        None,
-    ))
+    let relpath = relpath.unwrap();
+    // On Windows `relpath` returns components joined with `\`; URLs always
+    // use `/` as the path separator, so normalise before escaping.
+    #[cfg(target_os = "windows")]
+    let bytes = relpath
+        .to_str()
+        .ok_or_else(|| Error::UrlTooShort(String::new()))?
+        .replace('\\', "/")
+        .into_bytes();
+    #[cfg(target_os = "windows")]
+    let bytes_ref: &[u8] = &bytes;
+    #[cfg(not(target_os = "windows"))]
+    let bytes_ref: &[u8] = relpath.as_os_str().as_encoded_bytes();
+
+    Ok(escape(bytes_ref, None))
 }
 
 /// Run the URL_HEX_ESCAPES_RE pass over a path, decoding "safe" hex

@@ -11,7 +11,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
         python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
       fail-fast: false
 
@@ -24,6 +24,7 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Install dependencies
+        shell: bash
         run: |
           python -m pip install --upgrade pip
           python -m pip install -U "setuptools>=60" setuptools-rust
@@ -33,10 +34,12 @@ jobs:
             python -m pip install -e ".[dev,testing,paramiko]"
           fi
       - name: Run ruff
+        if: matrix.os == 'ubuntu-latest'
         run: |
           ruff check .
           ruff format --check .
       - name: Run mypy
+        if: matrix.os == 'ubuntu-latest'
         run: |
           python -m pip install mypy types-paramiko typing-extensions
           python -m mypy dromedary

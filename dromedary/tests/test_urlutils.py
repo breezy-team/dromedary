@@ -20,6 +20,7 @@ import ntpath
 import os
 import posixpath
 import sys
+import unittest
 
 from dromedary import osutils, urlutils
 from dromedary import tests as features
@@ -442,7 +443,9 @@ class TestUrlToPath(TestCase):
             raise TestSkipped("local encoding cannot handle unicode") from err
 
         self.assertEqual("file://HOST/path/to/r%C3%A4ksm%C3%B6rg%C3%A5s", result)
-        self.assertNotIsInstance(result, str)
+        # The Python 2 original asserted bytes vs unicode; in Python 3 the
+        # result is always `str`, matching `_posix_local_path_to_url` above.
+        self.assertIsInstance(result, str)
 
     def test_win32_local_path_from_url(self):
         from_url = urlutils._win32_local_path_from_url
@@ -1100,6 +1103,12 @@ class TestFileRelpath(TestCase):
         self.overrideAttr(osutils, "split", ntpath.split)
         self.overrideAttr(osutils, "MIN_ABS_PATHLENGTH", 3)
 
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "file_relpath is now implemented in Rust and reads platform-specific "
+        "MIN_ABS_FILEURL_LENGTH at compile time; the Python overrideAttr "
+        "shims used here no longer affect it.",
+    )
     def test_same_url_posix(self):
         self._with_posix_paths()
         self.assertEqual("", urlutils.file_relpath("file:///a", "file:///a"))
@@ -1119,6 +1128,10 @@ class TestFileRelpath(TestCase):
         self.assertEqual("", urlutils.file_relpath("file:///A:/b", "file:///A:/b/"))
         self.assertEqual("", urlutils.file_relpath("file:///A:/b/", "file:///A:/b"))
 
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "Rust-backed file_relpath uses platform-native MIN_ABS_FILEURL_LENGTH",
+    )
     def test_child_posix(self):
         self._with_posix_paths()
         self.assertEqual("b", urlutils.file_relpath("file:///a", "file:///a/b"))
@@ -1139,6 +1152,10 @@ class TestFileRelpath(TestCase):
             "c/d", urlutils.file_relpath("file:///A:/b", "file:///A:/b/c/d")
         )
 
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "Rust-backed file_relpath uses platform-native MIN_ABS_FILEURL_LENGTH",
+    )
     def test_sibling_posix(self):
         self._with_posix_paths()
         self.assertRaises(
@@ -1163,6 +1180,10 @@ class TestFileRelpath(TestCase):
             PathNotChild, urlutils.file_relpath, "file:///A:/b/", "file:///A:/c/"
         )
 
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "Rust-backed file_relpath uses platform-native MIN_ABS_FILEURL_LENGTH",
+    )
     def test_parent_posix(self):
         self._with_posix_paths()
         self.assertRaises(

@@ -72,7 +72,9 @@ class EmulatedWin32LocalTransport(LocalTransport):  # type:ignore
         """
         if base[-1] != "/":
             base = base + "/"
-        super(LocalTransport, self).__init__(base)
+        # The pyo3 LocalTransport base class only defines `__new__`; no
+        # `__init__` to chain to. The base URL is already wired up by the
+        # `__new__` call in `LocalTransport(base)`.
         self._local_base = urlutils._win32_local_path_from_url(base)
 
     def abspath(self, relpath):

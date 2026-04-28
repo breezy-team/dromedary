@@ -61,7 +61,12 @@ pub mod posix {
 
     pub fn abspath(path: &Path) -> Result<PathBuf, std::io::Error> {
         use path_clean::PathClean;
-        if path.is_absolute() {
+        // Treat leading-`/` paths as absolute even on Windows, where
+        // `Path::is_absolute` returns false for them. The posix helpers must
+        // produce posix-style URLs from posix-style inputs regardless of
+        // host OS — that's the whole point of having a `posix` module.
+        let posix_absolute = path.as_os_str().as_encoded_bytes().first().copied() == Some(b'/');
+        if path.is_absolute() || posix_absolute {
             return Ok(path.to_path_buf());
         }
         let cwd = std::env::current_dir()?;
@@ -146,15 +151,21 @@ pub fn abspath(path: &Path) -> Result<PathBuf, std::io::Error> {
 
 pub fn normpath<P: AsRef<Path>>(path: P) -> PathBuf {
     let mut stack = Vec::new();
+    let mut had_prefix = false;
 
     for component in path.as_ref().components() {
         match component {
             Component::Prefix(_) => {
                 stack.clear();
                 stack.push(component.as_os_str());
+                had_prefix = true;
             }
             Component::RootDir => {
-                stack.clear();
+                // On Windows `Prefix("A:")` is followed by `RootDir`; both
+                // belong to the path root and we must not drop the prefix.
+                if !had_prefix {
+                    stack.clear();
+                }
                 stack.push(component.as_os_str());
             }
             Component::CurDir => {}

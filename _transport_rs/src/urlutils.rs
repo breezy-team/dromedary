@@ -15,10 +15,87 @@ fn is_url(url: &str) -> bool {
     dromedary::urlutils::is_url(url)
 }
 
+/// On Windows, `file://` URLs without a drive letter are invalid. The
+/// `split`/`basename`/`dirname`/`strip_trailing_slash` helpers historically
+/// raised `InvalidURL` for such URLs (matching breezy's behaviour). The
+/// underlying Rust `split` is platform-agnostic and just splits at the last
+/// path separator, so do the validation here in the Python boundary.
+#[cfg(target_os = "windows")]
+fn validate_win32_file_url(url: &str) -> PyResult<()> {
+    if !is_win32_drive_letter_url(url)
+        && url.starts_with("file:///")
+        && url.len() > "file:///".len()
+    {
+        return Err(InvalidURL::new_err((
+            "Invalid Win32 local URL".to_string(),
+            url.to_string(),
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+#[inline]
+fn validate_win32_file_url(_url: &str) -> PyResult<()> {
+    Ok(())
+}
+
+/// Whether `url` is a `file:///<letter>:|...` or `file:///<letter>|...` URL.
+#[cfg(target_os = "windows")]
+fn is_win32_drive_letter_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("file:///") else {
+        return false;
+    };
+    let mut chars = rest.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic())
+        && matches!(chars.next(), Some(':') | Some('|'))
+}
+
 #[pyfunction]
 #[pyo3(signature = (url, exclude_trailing_slash = true))]
-fn split(url: &str, exclude_trailing_slash: Option<bool>) -> (String, String) {
-    dromedary::urlutils::split(url, exclude_trailing_slash.unwrap_or(true))
+fn split(url: &str, exclude_trailing_slash: Option<bool>) -> PyResult<(String, String)> {
+    validate_win32_file_url(url)?;
+    Ok(split_impl(url, exclude_trailing_slash.unwrap_or(true)))
+}
+
+#[cfg(not(target_os = "windows"))]
+#[inline]
+fn split_impl(url: &str, exclude_trailing_slash: bool) -> (String, String) {
+    dromedary::urlutils::split(url, exclude_trailing_slash)
+}
+
+/// On Windows, drive-letter local URLs split as `file:///C:` + `/path`. The
+/// generic split treats the URL as `file://` + `/C:/path` and produces the
+/// wrong head/tail; mirror breezy's `_win32_split` here.
+#[cfg(target_os = "windows")]
+fn split_impl(url: &str, exclude_trailing_slash: bool) -> (String, String) {
+    if is_win32_drive_letter_url(url) {
+        let url_base = "file://";
+        // SAFETY: validated above that the URL has shape `file:///<L><:|>...`
+        let path = &url["file://".len()..]; // starts with `/<letter><:|>...`
+        if let Ok((url_base, path)) =
+            dromedary::urlutils::win32::extract_drive_letter(url_base, path)
+        {
+            // `path` is now the part after the drive (e.g. "/foo/bar").
+            return split_after_drive(&url_base, &path, exclude_trailing_slash);
+        }
+    }
+    dromedary::urlutils::split(url, exclude_trailing_slash)
+}
+
+#[cfg(target_os = "windows")]
+fn split_after_drive(url_base: &str, path: &str, exclude_trailing_slash: bool) -> (String, String) {
+    let mut p = path;
+    if exclude_trailing_slash && p.len() > 1 && p.ends_with('/') {
+        p = &p[..p.len() - 1];
+    }
+    match p.rsplit_once('/') {
+        None => (url_base.to_string(), p.to_string()),
+        Some((head, tail)) => {
+            let head = if head.is_empty() { "/" } else { head };
+            (url_base.to_string() + head, tail.to_string())
+        }
+    }
 }
 
 #[pyfunction]
@@ -27,20 +104,31 @@ fn _find_scheme_and_separator(url: &str) -> (Option<usize>, Option<usize>) {
 }
 
 #[pyfunction]
-fn strip_trailing_slash(url: &str) -> &str {
-    dromedary::urlutils::strip_trailing_slash(url)
+fn strip_trailing_slash(url: &str) -> PyResult<String> {
+    validate_win32_file_url(url)?;
+    #[cfg(target_os = "windows")]
+    {
+        if url.ends_with('/') && is_win32_drive_letter_url(url) {
+            // Drive-letter local URL: preserve `file:///C:/` as-is and
+            // strip exactly one trailing slash from anything longer.
+            return Ok(dromedary::urlutils::win32::strip_local_trailing_slash(url));
+        }
+    }
+    Ok(dromedary::urlutils::strip_trailing_slash(url).to_string())
 }
 
 #[pyfunction]
 #[pyo3(signature = (url, exclude_trailing_slash = true))]
-fn dirname(url: &str, exclude_trailing_slash: Option<bool>) -> String {
-    dromedary::urlutils::dirname(url, exclude_trailing_slash.unwrap_or(true))
+fn dirname(url: &str, exclude_trailing_slash: Option<bool>) -> PyResult<String> {
+    validate_win32_file_url(url)?;
+    Ok(split_impl(url, exclude_trailing_slash.unwrap_or(true)).0)
 }
 
 #[pyfunction]
 #[pyo3(signature = (url, exclude_trailing_slash = true))]
-fn basename(url: &str, exclude_trailing_slash: Option<bool>) -> String {
-    dromedary::urlutils::basename(url, exclude_trailing_slash.unwrap_or(true))
+fn basename(url: &str, exclude_trailing_slash: Option<bool>) -> PyResult<String> {
+    validate_win32_file_url(url)?;
+    Ok(split_impl(url, exclude_trailing_slash.unwrap_or(true)).1)
 }
 
 fn map_urlutils_error_to_pyerr(e: dromedary::urlutils::Error) -> PyErr {
