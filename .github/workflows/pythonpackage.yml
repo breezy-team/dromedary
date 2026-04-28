@@ -9,11 +9,6 @@ env:
 jobs:
   build:
     runs-on: ${{ matrix.os }}
-    # Windows has a number of pre-existing test failures unrelated to the
-    # macOS/Windows wheel build fixes (urlutils path handling, FakeNFS
-    # rename semantics, etc.). Run the suite there for visibility but do
-    # not gate on it until those are addressed.
-    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
