@@ -144,3 +144,4 @@ archs = ["auto", "aarch64"]
 [tool.cibuildwheel.macos]
 
 [tool.cibuildwheel.windows]
+skip = "*-win32"
