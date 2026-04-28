@@ -39,6 +39,15 @@ type Result<K> = std::result::Result<K, Error>;
 /// Returns: (parent_url, child_dir).  child_dir may be the empty string if
 ///     we're at the root.
 pub fn split(url: &str, exclude_trailing_slash: bool) -> (String, String) {
+    #[cfg(target_os = "windows")]
+    return win32::split(url, exclude_trailing_slash);
+    #[cfg(not(target_os = "windows"))]
+    return generic_split(url, exclude_trailing_slash);
+}
+
+/// Platform-agnostic URL split used by `split` on POSIX and as the
+/// fallback for non-drive-letter URLs in `win32::split`.
+fn generic_split(url: &str, exclude_trailing_slash: bool) -> (String, String) {
     let (scheme_loc, first_path_slash) = find_scheme_and_separator(url);
 
     if first_path_slash.is_none() {
@@ -69,17 +78,6 @@ pub fn split(url: &str, exclude_trailing_slash: bool) -> (String, String) {
     // We have a fully defined path
     let url_base = &url[..first_path_slash.unwrap()]; // http://host, file://
     let mut path = &url[first_path_slash.unwrap()..]; // /file/foo
-
-    // TODO(windows): the original breezy code rebinds `url_base`/`path` here
-    // via `_extract_drive_letter` so that `file:///C:/foo` splits as
-    // `file:///C:` + `/foo` rather than `file://` + `/C:/foo`. The direct port
-    // below shadowed but never used the rebinding, so on Windows `split` for
-    // drive-letter URLs is currently wrong. See `win32::extract_drive_letter`.
-    #[cfg(target_os = "windows")]
-    {
-        // Reference the symbol so the cfg-gated branch compiles; no-op for now.
-        let _ = win32::extract_drive_letter;
-    }
 
     if exclude_trailing_slash && path.len() > 1 && path.ends_with('/') {
         path = &path[..path.len() - 1];
@@ -145,18 +143,20 @@ pub fn is_url(url: &str) -> bool {
 ///     # This is unique on win32 platforms, and is the only URL
 ///     # format which does it differently.
 ///     file:///c|/       => file:///c:/
-pub fn strip_trailing_slash(url: &str) -> &str {
+pub fn strip_trailing_slash(url: &str) -> std::borrow::Cow<'_, str> {
+    #[cfg(target_os = "windows")]
+    return win32::strip_trailing_slash(url);
+    #[cfg(not(target_os = "windows"))]
+    return std::borrow::Cow::Borrowed(generic_strip_trailing_slash(url));
+}
+
+/// Platform-agnostic strip used by `strip_trailing_slash` on POSIX and as
+/// the fallback for non-drive-letter URLs in `win32::strip_trailing_slash`.
+fn generic_strip_trailing_slash(url: &str) -> &str {
     if !url.ends_with('/') {
         // Nothing to do
         return url;
     }
-
-    // TODO(windows): `win32::strip_local_trailing_slash` returns `String`,
-    // so we can't return it from this `&str`-returning function directly.
-    // The Python original returned a new string here; porting that requires
-    // changing the signature to `Cow<'_, str>`. For now Windows callers get
-    // the same generic handling as Unix, which is incorrect for drive-letter
-    // file:/// URLs but compiles.
 
     let (scheme_loc, first_path_slash) = find_scheme_and_separator(url);
     if scheme_loc.is_none() {
@@ -294,7 +294,11 @@ pub fn split_segment_parameters_raw(url: &str) -> (&str, Vec<&str>) {
     // GZ 2011-11-18: Dodgy removing the terminal slash like this, function
     // operates on urls not url+segments, and Transport classes
     // should not be blindly adding slashes in the first place.
-    let lurl = strip_trailing_slash(url);
+    //
+    // Use the always-borrowing generic strip: drive-letter / win32 root
+    // handling is irrelevant to segment-parameter parsing, and this lets us
+    // keep the `&str` return type without an extra allocation on Windows.
+    let lurl = generic_strip_trailing_slash(url);
     let segment_start = lurl.rfind('/').map_or_else(|| 0, |i| i + 1);
     if !lurl[segment_start..].contains(',') {
         return (url, vec![]);
@@ -733,6 +737,51 @@ pub mod win32 {
         } else {
             url.to_owned()
         }
+    }
+
+    /// Whether `url` has the shape `file:///<letter><:|>/...`. The trailing
+    /// `/` matters: `extract_drive_letter` rejects shorter inputs, so this
+    /// predicate stays in lockstep to keep `split` total.
+    fn is_drive_letter_url(url: &str) -> bool {
+        let Some(rest) = url.strip_prefix("file:///") else {
+            return false;
+        };
+        let bytes = rest.as_bytes();
+        bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && matches!(bytes[1], b':' | b'|')
+            && bytes[2] == b'/'
+    }
+
+    /// Win32-aware variant of [`super::split`]. Drive-letter URLs split as
+    /// `file:///C:` + `/path` rather than the generic `file://` + `/C:/path`.
+    pub fn split(url: &str, exclude_trailing_slash: bool) -> (String, String) {
+        if !is_drive_letter_url(url) {
+            return super::generic_split(url, exclude_trailing_slash);
+        }
+        // `is_drive_letter_url` matched the same shape `extract_drive_letter`
+        // requires, so the call is infallible.
+        let (url_base, path) = extract_drive_letter("file://", &url["file://".len()..]).unwrap();
+        let mut p = path.as_str();
+        if exclude_trailing_slash && p.len() > 1 && p.ends_with('/') {
+            p = &p[..p.len() - 1];
+        }
+        match p.rsplit_once('/') {
+            None => (url_base, p.to_string()),
+            Some((head, tail)) => {
+                let head = if head.is_empty() { "/" } else { head };
+                (url_base + head, tail.to_string())
+            }
+        }
+    }
+
+    /// Win32-aware variant of [`super::strip_trailing_slash`]. Preserves the
+    /// trailing slash on a drive-letter root like `file:///C:/`.
+    pub fn strip_trailing_slash(url: &str) -> std::borrow::Cow<'_, str> {
+        if url.ends_with('/') && is_drive_letter_url(url) {
+            return std::borrow::Cow::Owned(strip_local_trailing_slash(url));
+        }
+        std::borrow::Cow::Borrowed(super::generic_strip_trailing_slash(url))
     }
 }
 

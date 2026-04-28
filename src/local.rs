@@ -17,6 +17,11 @@ use walkdir;
 
 pub struct LocalTransport {
     base: Url,
+    /// Original textual base, preserved verbatim so callers see the
+    /// case they passed in. `Url::parse` lowercases hosts per RFC 3986
+    /// (e.g. `file://HOST/` → `file://host/`), which round-trips
+    /// surprisingly through transport.base on UNC paths.
+    base_str: String,
     path: PathBuf,
 }
 
@@ -42,6 +47,7 @@ impl Clone for LocalTransport {
         LocalTransport {
             path: self.path.clone(),
             base: self.base.clone(),
+            base_str: self.base_str.clone(),
         }
     }
 }
@@ -56,17 +62,21 @@ impl ReadStream for File {}
 
 impl LocalTransport {
     pub fn new(base: &str) -> Result<Self> {
-        let base = if base.ends_with('/') {
+        let base_str = if base.ends_with('/') {
             base.to_string()
         } else {
             format!("{}/", base)
         };
-        let mut path = crate::urlutils::local_path_from_url(&base)?;
+        let mut path = crate::urlutils::local_path_from_url(&base_str)?;
         if !path.to_string_lossy().ends_with('/') {
             path.push("")
         }
-        let base = Url::parse(&base)?;
-        Ok(LocalTransport { base, path })
+        let base = Url::parse(&base_str)?;
+        Ok(LocalTransport {
+            base,
+            base_str,
+            path,
+        })
     }
 
     pub fn from_abspath(path: &Path) -> Result<Self> {
@@ -114,6 +124,10 @@ impl Transport for LocalTransport {
 
     fn base(&self) -> Url {
         self.base.clone()
+    }
+
+    fn base_str(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Borrowed(&self.base_str)
     }
 
     fn local_abspath(&self, relpath: &UrlFragment) -> Result<PathBuf> {
@@ -175,11 +189,15 @@ impl Transport for LocalTransport {
     }
 
     fn clone(&self, offset: Option<&UrlFragment>) -> Result<Box<dyn Transport>> {
-        let new_base = match offset {
-            Some(offset) => self.abspath(offset)?,
-            None => self.base.clone(),
+        // Reuse our case-preserving textual base so a UNC host like
+        // `file://HOST/` doesn't collapse to `file://host/` on clone.
+        // `Cow` lets the no-offset arm borrow without an extra allocation;
+        // `LocalTransport::new` will copy the bytes once into its own field.
+        let new_base: std::borrow::Cow<'_, str> = match offset {
+            Some(offset) => std::borrow::Cow::Owned(self.abspath(offset)?.to_string()),
+            None => std::borrow::Cow::Borrowed(&self.base_str),
         };
-        Ok(Box::new(LocalTransport::new(new_base.as_str())?))
+        Ok(Box::new(LocalTransport::new(&new_base)?))
     }
 
     fn abspath(&self, relpath: &UrlFragment) -> Result<Url> {

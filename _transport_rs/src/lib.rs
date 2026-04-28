@@ -620,7 +620,7 @@ impl Transport {
 
     #[getter]
     fn base(&self) -> PyResult<String> {
-        Ok(self.0.base().to_string())
+        Ok(self.0.base_str().into_owned())
     }
 
     fn has(&self, py: Python, path: &str) -> PyResult<bool> {

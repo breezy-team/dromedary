@@ -283,6 +283,17 @@ pub trait Transport: std::fmt::Debug + 'static + Send + Sync {
 
     fn base(&self) -> Url;
 
+    /// Textual form of the base URL.
+    ///
+    /// Default: `self.base().to_string()` as a `Cow::Owned`. Override when
+    /// the transport preserves a textual form that differs from `Url`'s
+    /// normalized serialization — e.g. `LocalTransport` keeps the original
+    /// UNC host case rather than the RFC 3986 lowercase form, and can
+    /// return a borrowing `Cow` for free.
+    fn base_str(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Owned(self.base().to_string())
+    }
+
     /// Ensure that the directory this transport references exists.
     ///
     /// This will create a directory if it doesn't exist.
