@@ -18,11 +18,9 @@
 
 This package exposes :class:`HttpDavTransport`, a subclass of
 :class:`dromedary.http.urllib.HttpTransport` that implements the subset of
-WebDAV (RFC 4918) needed to support writes over HTTP. It intentionally does
-not register the ``http+webdav://`` / ``https+webdav://`` schemes itself —
-callers that want those schemes wired up should do the registration
-themselves (e.g. breezy registers them pointing at its own subclass that
-adds a smart-server medium).
+WebDAV (RFC 4918) needed to support writes over HTTP. The
+``http+webdav://`` and ``https+webdav://`` schemes are registered in
+:mod:`dromedary` so the transport is available out of the box.
 """
 
 from dromedary.webdav.webdav import HttpDavTransport
