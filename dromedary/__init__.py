@@ -1722,6 +1722,13 @@ register_transport_proto(
 register_lazy_transport("http://", "dromedary.http.urllib", "HttpTransport")
 register_lazy_transport("https://", "dromedary.http.urllib", "HttpTransport")
 
+register_transport_proto("http+webdav://", register_netloc=True)
+register_transport_proto("https+webdav://", register_netloc=True)
+register_lazy_transport("http+webdav://", "dromedary.webdav.webdav", "HttpDavTransport")
+register_lazy_transport(
+    "https+webdav://", "dromedary.webdav.webdav", "HttpDavTransport"
+)
+
 register_transport_proto("gio+", help="Access using any GIO supported protocols.")
 register_lazy_transport("gio+", "dromedary.gio_transport", "GioTransport")
 
