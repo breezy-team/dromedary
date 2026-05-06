@@ -29,6 +29,13 @@ lazy_static! {
     /// Called as `cb(host) -> Optional[str]`; the returned string
     /// goes after `Negotiate ` in the Authorization header.
     static ref NEGOTIATE_PROVIDER: Mutex<Option<Py<PyAny>>> = Mutex::new(None);
+    /// Registered preemptive token-provider callback. Called as
+    /// `cb(protocol, host, port=None, path=None) -> (token, scheme)`
+    /// or `(None, None)` when no token is configured. The HTTP
+    /// client uses the result to attach `Authorization: <scheme>
+    /// <token>` before the request goes on the wire — no server
+    /// challenge required.
+    static ref TOKEN_PROVIDER: Mutex<Option<Py<PyAny>>> = Mutex::new(None);
     /// Registered auth-header-sent callback. The Rust client calls
     /// this just before sending a request carrying an Authorization
     /// or Proxy-Authorization header; breezy uses it to emit a
@@ -52,6 +59,39 @@ pub(crate) fn invoke_auth_header_trace(header_name: &str) {
             let _ = cb.bind(py).call1((header_name,));
         }
     });
+}
+
+/// Invoke the registered token-provider callback. Returns `None`
+/// if no callback is set, the callback raised, or it returned
+/// `(None, _)` / `(_, None)`. The breezy callback maps this to an
+/// `authentication.conf` lookup against the request URL.
+pub(super) fn invoke_token_provider(
+    protocol: &str,
+    host: &str,
+    port: Option<u16>,
+    path: Option<&str>,
+) -> Option<(String, String)> {
+    Python::attach(|py| {
+        let cb = {
+            let guard = TOKEN_PROVIDER.lock().unwrap();
+            guard.as_ref().map(|p| p.clone_ref(py))
+        };
+        let cb = cb?;
+        let kwargs = pyo3::types::PyDict::new(py);
+        kwargs.set_item("port", port).ok()?;
+        kwargs.set_item("path", path).ok()?;
+        let result = cb.bind(py).call((protocol, host), Some(&kwargs)).ok()?;
+        let tup = result.cast::<PyTuple>().ok()?;
+        if tup.len() != 2 {
+            return None;
+        }
+        let token: Option<String> = tup.get_item(0).ok()?.extract().ok()?;
+        let scheme: Option<String> = tup.get_item(1).ok()?.extract().ok()?;
+        match (token, scheme) {
+            (Some(t), Some(s)) => Some((s, t)),
+            _ => None,
+        }
+    })
 }
 
 /// Invoke the registered Negotiate callback. Returns `None` if no
@@ -344,6 +384,35 @@ fn get_negotiate_provider(py: Python) -> Py<PyAny> {
         .unwrap_or_else(|| py.None())
 }
 
+/// Register a preemptive token-provider callback. The callable is
+/// invoked as `func(protocol, host, port=None, path=None)` and
+/// should return `(token, scheme)`, with either field `None` when
+/// no token applies. The HTTP client attaches `Authorization:
+/// <scheme> <token>` before the request goes out — caller-supplied
+/// `Authorization` headers always win.
+///
+/// Passing `None` clears any previously-registered callback.
+#[pyfunction]
+fn set_token_provider(py: Python, func: Py<PyAny>) {
+    let mut slot = TOKEN_PROVIDER.lock().unwrap();
+    *slot = if func.bind(py).is_none() {
+        None
+    } else {
+        Some(func)
+    };
+}
+
+/// Return the currently-registered token-provider callback, or `None`.
+#[pyfunction]
+fn get_token_provider(py: Python) -> Py<PyAny> {
+    TOKEN_PROVIDER
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|p| p.clone_ref(py))
+        .unwrap_or_else(|| py.None())
+}
+
 /// Look up credentials via the registered callback. Returns
 /// `(None, None)` if no callback is set (the historical default).
 #[pyfunction]
@@ -396,6 +465,8 @@ pub(crate) fn register(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_credentials, m)?)?;
     m.add_function(wrap_pyfunction!(set_negotiate_provider, m)?)?;
     m.add_function(wrap_pyfunction!(get_negotiate_provider, m)?)?;
+    m.add_function(wrap_pyfunction!(set_token_provider, m)?)?;
+    m.add_function(wrap_pyfunction!(get_token_provider, m)?)?;
     m.add_function(wrap_pyfunction!(set_auth_header_trace, m)?)?;
     m.add_function(wrap_pyfunction!(evaluate_proxy_bypass, m)?)?;
 

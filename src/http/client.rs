@@ -621,6 +621,42 @@ impl NegotiateProvider for NoNegotiateProvider {
     }
 }
 
+/// Source of preemptive bearer-style auth tokens.
+///
+/// Unlike Basic/Digest, no server challenge is required: the lookup
+/// runs before the request goes on the wire and, if a token is
+/// configured for the location, the client attaches
+/// `Authorization: <scheme> <token>` (default scheme `Bearer`).
+/// Caller-supplied `Authorization` headers always win.
+pub trait TokenProvider: Send + Sync {
+    /// Return `(scheme, token)` for the request URL, or `None`
+    /// when no token is configured. `scheme` is the Authorization
+    /// prefix (e.g. `"Bearer"`, `"token"`).
+    fn lookup(
+        &self,
+        protocol: &str,
+        host: &str,
+        port: Option<u16>,
+        path: Option<&str>,
+    ) -> Option<(String, String)>;
+}
+
+/// A [`TokenProvider`] that never returns a token. The default when
+/// no callback is registered.
+pub struct NoTokenProvider;
+
+impl TokenProvider for NoTokenProvider {
+    fn lookup(
+        &self,
+        _protocol: &str,
+        _host: &str,
+        _port: Option<u16>,
+        _path: Option<&str>,
+    ) -> Option<(String, String)> {
+        None
+    }
+}
+
 /// Direction of an auth challenge: origin (401 → WWW-Authenticate
 /// → Authorization) vs proxy (407 → Proxy-Authenticate →
 /// Proxy-Authorization). The logic is identical other than the
@@ -731,6 +767,10 @@ pub struct HttpClient {
     /// no-op provider; the PyO3 layer swaps in a callback that
     /// delegates to Python's `kerberos` module.
     negotiate: Box<dyn NegotiateProvider>,
+    /// Source of preemptive bearer-style auth tokens. Defaults to a
+    /// no-op provider; breezy installs one that consults
+    /// `authentication.conf`.
+    tokens: Box<dyn TokenProvider>,
     /// Optional tracing hook invoked just before a request carrying
     /// an Authorization or Proxy-Authorization header goes on the
     /// wire. Breezy uses this to emit a "> Authorization: <masked>"
@@ -762,12 +802,23 @@ impl HttpClient {
     }
 
     /// Build a new client with custom credential and negotiate
-    /// providers. The general-purpose constructor — the simpler
-    /// `new` / `with_credentials` helpers delegate here.
+    /// providers, and the default no-op token provider.
     pub fn with_providers(
         config: HttpClientConfig,
         credentials: Box<dyn CredentialProvider>,
         negotiate: Box<dyn NegotiateProvider>,
+    ) -> Result<Self> {
+        Self::with_full_providers(config, credentials, negotiate, Box::new(NoTokenProvider))
+    }
+
+    /// Build a new client with all three provider types. The
+    /// general-purpose constructor — the simpler helpers delegate
+    /// here.
+    pub fn with_full_providers(
+        config: HttpClientConfig,
+        credentials: Box<dyn CredentialProvider>,
+        negotiate: Box<dyn NegotiateProvider>,
+        tokens: Box<dyn TokenProvider>,
     ) -> Result<Self> {
         // Eagerly build the no-proxy client so construction fails
         // loudly on a bad config (missing CA bundle, etc.) rather
@@ -782,6 +833,7 @@ impl HttpClient {
             proxy_auth_cache: AuthCache::new(),
             credentials,
             negotiate,
+            tokens,
             auth_trace: None,
         })
     }
@@ -948,6 +1000,17 @@ impl HttpClient {
         if !has_explicit_origin_auth {
             if let Some(hdr) = self.attach_cached(&self.auth_cache, &origin_key, method, &uri) {
                 first_headers.push(("Authorization".into(), hdr));
+            } else if let Some((scheme, token)) = self.tokens.lookup(
+                uri.scheme_str().unwrap_or(""),
+                uri.host().unwrap_or(""),
+                uri.port_u16(),
+                Some(uri.path()),
+            ) {
+                // Preemptive bearer-style auth: no challenge required.
+                // Attached only when no cached Basic/Digest entry
+                // applies, so a successful 401 dance still wins for
+                // hosts that mix token and password auth.
+                first_headers.push(("Authorization".into(), format!("{} {}", scheme, token)));
             }
         }
         if !has_explicit_proxy_auth {
@@ -2542,5 +2605,51 @@ mod tests {
         if let CachedAuth::Digest(orig) = cached {
             assert_eq!(orig.nonce_count, 5);
         }
+    }
+
+    #[test]
+    fn no_token_provider_returns_none() {
+        let p = NoTokenProvider;
+        assert!(p.lookup("https", "example.com", None, Some("/")).is_none());
+    }
+
+    #[test]
+    fn token_provider_records_lookup_arguments() {
+        // Custom provider that captures the lookup args so we can
+        // assert send_with_auth (and direct callers) hand through
+        // protocol/host/port/path verbatim.
+        struct Recorder {
+            seen: Mutex<Option<(String, String, Option<u16>, Option<String>)>>,
+            answer: Option<(String, String)>,
+        }
+        impl TokenProvider for Recorder {
+            fn lookup(
+                &self,
+                protocol: &str,
+                host: &str,
+                port: Option<u16>,
+                path: Option<&str>,
+            ) -> Option<(String, String)> {
+                *self.seen.lock().unwrap() =
+                    Some((protocol.into(), host.into(), port, path.map(str::to_string)));
+                self.answer.clone()
+            }
+        }
+
+        let rec = Recorder {
+            seen: Mutex::new(None),
+            answer: Some(("Bearer".into(), "abc123".into())),
+        };
+        let result = rec.lookup("https", "example.com", Some(8443), Some("/foo"));
+        assert_eq!(result, Some(("Bearer".into(), "abc123".into())));
+        assert_eq!(
+            *rec.seen.lock().unwrap(),
+            Some((
+                "https".into(),
+                "example.com".into(),
+                Some(8443),
+                Some("/foo".into()),
+            ))
+        );
     }
 }

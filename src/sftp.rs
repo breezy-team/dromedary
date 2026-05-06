@@ -52,9 +52,7 @@ fn map_sftp_err(e: sftp::Error, path: Option<&str>) -> Error {
         sftp::Error::DirNotEmpty(_, _) => {
             Error::DirectoryNotEmptyError(path.map(|s| s.to_string()))
         }
-        sftp::Error::NotADirectory(_, _) => {
-            Error::NotADirectoryError(path.map(|s| s.to_string()))
-        }
+        sftp::Error::NotADirectory(_, _) => Error::NotADirectoryError(path.map(|s| s.to_string())),
         sftp::Error::FileIsADirectory(_, _) => {
             Error::IsADirectoryError(path.map(|s| s.to_string()))
         }
@@ -159,7 +157,6 @@ impl SftpTransport {
     fn remote_path(&self, relpath: &UrlFragment) -> Result<String> {
         remote_path_for(&self.base, relpath)
     }
-
 }
 
 /// Streaming reader over a remote SFTP file. Holds an open `sftp::File`
@@ -449,7 +446,10 @@ impl Transport for SftpTransport {
         let path = self.remote_path(relpath)?;
         // Open with append flag; capture the pre-existing size as the
         // returned offset (Transport contract).
-        let opts = sftp::OpenOptions::new().write(true).create(true).append(true);
+        let opts = sftp::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .append(true);
         let attr = perms_to_attr(permissions);
         let file = self
             .sftp
@@ -759,10 +759,7 @@ pub(crate) mod tests {
     fn remote_path_percent_decodes() {
         // %20 in a relpath should be delivered to the server as a
         // literal space so SFTP can find the file.
-        assert_eq!(
-            remote_path_for(&base(), "a%20b").unwrap(),
-            "/home/user/a b"
-        );
+        assert_eq!(remote_path_for(&base(), "a%20b").unwrap(), "/home/user/a b");
     }
 
     #[test]
@@ -1011,7 +1008,9 @@ pub(crate) mod tests {
 
             fn parent_of(path: &str) -> Option<&str> {
                 let trimmed = path.trim_end_matches('/');
-                trimmed.rsplit_once('/').map(|(p, _)| if p.is_empty() { "/" } else { p })
+                trimmed
+                    .rsplit_once('/')
+                    .map(|(p, _)| if p.is_empty() { "/" } else { p })
             }
 
             fn entries_under(&self, dir: &str) -> Vec<(String, bool)> {
@@ -1239,7 +1238,13 @@ pub(crate) mod tests {
                             }
                             let h_id = NEXT_HANDLE.fetch_add(1, Ordering::SeqCst);
                             let h = format!("d{}", h_id).into_bytes();
-                            handles.insert(h.clone(), Handle::Dir { path, drained: false });
+                            handles.insert(
+                                h.clone(),
+                                Handle::Dir {
+                                    path,
+                                    drained: false,
+                                },
+                            );
                             let mut r = req_id.to_be_bytes().to_vec();
                             r.extend_from_slice(&(h.len() as u32).to_be_bytes());
                             r.extend_from_slice(&h);
@@ -1281,16 +1286,17 @@ pub(crate) mod tests {
                                         } else {
                                             encode_attrs(
                                                 Some(
-                                                    fs.files.get(&format!(
-                                                        "{}/{}",
-                                                        match handles.get(&h).unwrap() {
-                                                            Handle::Dir { path, .. } => path,
-                                                            _ => unreachable!(),
-                                                        },
-                                                        name
-                                                    ))
-                                                    .map(|v| v.len() as u64)
-                                                    .unwrap_or(0),
+                                                    fs.files
+                                                        .get(&format!(
+                                                            "{}/{}",
+                                                            match handles.get(&h).unwrap() {
+                                                                Handle::Dir { path, .. } => path,
+                                                                _ => unreachable!(),
+                                                            },
+                                                            name
+                                                        ))
+                                                        .map(|v| v.len() as u64)
+                                                        .unwrap_or(0),
                                                 ),
                                                 Some(0o100644),
                                             )
@@ -1316,8 +1322,7 @@ pub(crate) mod tests {
                             let offset = read_u64(&mut c) as usize;
                             let data_len = read_u32(&mut c) as usize;
                             let pos = c.position() as usize;
-                            let data =
-                                c.get_ref()[pos..pos + data_len].to_vec();
+                            let data = c.get_ref()[pos..pos + data_len].to_vec();
                             let path = match handles.get(&h) {
                                 Some(Handle::File { path, append }) => {
                                     let p = path.clone();
@@ -1370,11 +1375,9 @@ pub(crate) mod tests {
                             let pos = c.position() as usize;
                             let h = c.get_ref()[pos..pos + h_len].to_vec();
                             let size = match handles.get(&h) {
-                                Some(Handle::File { path, .. }) => fs
-                                    .files
-                                    .get(path)
-                                    .map(|v| v.len() as u64)
-                                    .unwrap_or(0),
+                                Some(Handle::File { path, .. }) => {
+                                    fs.files.get(path).map(|v| v.len() as u64).unwrap_or(0)
+                                }
                                 _ => {
                                     send_status(&mut stream, SSH_FX_FAILURE, "bad handle");
                                     continue;
@@ -1485,8 +1488,7 @@ pub(crate) mod tests {
             t.mkdir("sub", None).unwrap();
             t.put_bytes("sub/a", b"A", None).unwrap();
             t.put_bytes("sub/b", b"BB", None).unwrap();
-            let entries: Vec<String> =
-                t.list_dir("sub").filter_map(|r| r.ok()).collect();
+            let entries: Vec<String> = t.list_dir("sub").filter_map(|r| r.ok()).collect();
             let mut sorted = entries.clone();
             sorted.sort();
             assert_eq!(sorted, vec!["a".to_string(), "b".to_string()]);
@@ -1608,8 +1610,7 @@ pub(crate) mod tests {
             t.put_bytes("top", b"x", None).unwrap();
             t.put_bytes("a/inside", b"y", None).unwrap();
             t.put_bytes("a/b/deep", b"z", None).unwrap();
-            let mut files: Vec<String> =
-                t.iter_files_recursive().filter_map(|r| r.ok()).collect();
+            let mut files: Vec<String> = t.iter_files_recursive().filter_map(|r| r.ok()).collect();
             files.sort();
             assert_eq!(
                 files,

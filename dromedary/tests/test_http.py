@@ -20,9 +20,12 @@ import os
 import ssl
 import sys
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from dromedary import http
+from dromedary._transport_rs.http import HttpClient
 from dromedary.http import ca_bundle
 
 
@@ -143,6 +146,108 @@ class TestCredentialLookup(unittest.TestCase):
             http.get_credentials("https", "example.com", port=443, path="/", realm="r"),
         )
         self.assertEqual(("https", "example.com", 443, "/", "r"), seen["args"])
+
+
+class TestTokenProvider(unittest.TestCase):
+    def setUp(self):
+        self._original = http.get_token_provider()
+        self.addCleanup(http.set_token_provider, self._original)
+
+    def test_default_is_unset(self):
+        http.set_token_provider(None)
+        self.assertIsNone(http.get_token_provider())
+
+    def test_set_and_get_roundtrip(self):
+        def cb(protocol, host, port=None, path=None):
+            return (None, None)
+
+        http.set_token_provider(cb)
+        self.assertIs(cb, http.get_token_provider())
+
+    def test_clear_with_none(self):
+        http.set_token_provider(lambda *a, **kw: (None, None))
+        http.set_token_provider(None)
+        self.assertIsNone(http.get_token_provider())
+
+
+class _CaptureAuthHandler(BaseHTTPRequestHandler):
+    """HTTP handler that records the request's Authorization header
+    and replies 200 OK regardless. Used to verify that the dromedary
+    client attaches preemptive bearer tokens.
+    """
+
+    def do_GET(self):
+        self.server.last_authorization = self.headers.get("Authorization")
+        self.send_response(200)
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, *args, **kwargs):  # silence stderr noise
+        pass
+
+
+class TestTokenProviderEndToEnd(unittest.TestCase):
+    """Drive the Rust HTTP client against a stdlib HTTPServer to
+    verify that a registered token provider results in an
+    Authorization header on the wire.
+    """
+
+    def setUp(self):
+        self._original_token = http.get_token_provider()
+        self.addCleanup(http.set_token_provider, self._original_token)
+
+        self.server = HTTPServer(("127.0.0.1", 0), _CaptureAuthHandler)
+        self.server.last_authorization = None
+        self.thread = threading.Thread(target=self.server.serve_forever)
+        self.thread.daemon = True
+        self.thread.start()
+        self.addCleanup(self._stop_server)
+
+    def _stop_server(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+    def _url(self, path="/"):
+        host, port = self.server.server_address
+        return f"http://{host}:{port}{path}"
+
+    def test_token_attached_when_no_explicit_authorization(self):
+        seen = []
+
+        def lookup(protocol, host, port=None, path=None):
+            seen.append((protocol, host, port, path))
+            return ("abc123", "Bearer")
+
+        http.set_token_provider(lookup)
+        client = HttpClient()
+        resp = client.request("GET", self._url("/foo"), [], b"")
+        self.assertEqual(200, resp.status)
+        self.assertEqual("Bearer abc123", self.server.last_authorization)
+        # The provider was asked with the URL's components.
+        self.assertEqual(1, len(seen))
+        protocol, host, port, path = seen[0]
+        self.assertEqual("http", protocol)
+        self.assertEqual("127.0.0.1", host)
+        self.assertEqual(self.server.server_address[1], port)
+        self.assertEqual("/foo", path)
+
+    def test_explicit_authorization_wins(self):
+        http.set_token_provider(lambda *a, **kw: ("abc123", "Bearer"))
+        client = HttpClient()
+        resp = client.request(
+            "GET", self._url(), [("Authorization", "Custom keep-me")], b""
+        )
+        self.assertEqual(200, resp.status)
+        self.assertEqual("Custom keep-me", self.server.last_authorization)
+
+    def test_provider_returning_none_skips_header(self):
+        http.set_token_provider(lambda *a, **kw: (None, None))
+        client = HttpClient()
+        resp = client.request("GET", self._url(), [], b"")
+        self.assertEqual(200, resp.status)
+        self.assertIsNone(self.server.last_authorization)
 
 
 if __name__ == "__main__":

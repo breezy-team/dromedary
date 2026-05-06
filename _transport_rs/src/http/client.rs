@@ -18,7 +18,7 @@ use std::time::Duration;
 use dromedary::http::client::{
     ActivityCallback, ActivityDirection, ClientError, CredentialProvider,
     HttpClient as RsHttpClient, HttpClientConfig, HttpResponse as RsHttpResponse,
-    NegotiateProvider, RequestOptions,
+    NegotiateProvider, RequestOptions, TokenProvider,
 };
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::import_exception;
@@ -81,6 +81,23 @@ impl NegotiateProvider for PythonNegotiateProvider {
     }
 }
 
+/// TokenProvider that delegates to the Python callback registered
+/// via `set_token_provider`. Breezy installs one that pulls
+/// preemptive bearer tokens from `authentication.conf`.
+pub(crate) struct PythonTokenProvider;
+
+impl TokenProvider for PythonTokenProvider {
+    fn lookup(
+        &self,
+        protocol: &str,
+        host: &str,
+        port: Option<u16>,
+        path: Option<&str>,
+    ) -> Option<(String, String)> {
+        super::invoke_token_provider(protocol, host, port, path)
+    }
+}
+
 #[pyclass(module = "dromedary._transport_rs.http", frozen)]
 pub(crate) struct HttpClient {
     inner: RsHttpClient,
@@ -122,10 +139,11 @@ impl HttpClient {
             user_agent,
             read_timeout: timeout,
         };
-        let mut inner = RsHttpClient::with_providers(
+        let mut inner = RsHttpClient::with_full_providers(
             cfg,
             Box::new(PythonCredentialProvider),
             Box::new(PythonNegotiateProvider),
+            Box::new(PythonTokenProvider),
         )
         .map_err(client_err_to_py)?;
         inner.set_auth_trace(Some(std::sync::Arc::new(|header: &str| {
