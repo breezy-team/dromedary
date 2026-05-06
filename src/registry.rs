@@ -123,9 +123,9 @@ fn register_builtins(m: &mut HashMap<String, Box<dyn TransportFactory>>) {
                 )
                 .map_err(http_client_err_to_transport_err)?,
             );
-            Ok(Box::new(
-                crate::webdav::transport::HttpDavTransport::new(url, client)?,
-            ))
+            Ok(Box::new(crate::webdav::transport::HttpDavTransport::new(
+                url, client,
+            )?))
         }
         m.insert("webdav://".into(), Box::new(|u: &str| build_webdav(u)));
         m.insert("webdavs://".into(), Box::new(|u: &str| build_webdav(u)));
@@ -147,9 +147,7 @@ fn register_builtins(m: &mut HashMap<String, Box<dyn TransportFactory>>) {
         "unlistable+".into(),
         Box::new(|url: &str| -> Result<Box<dyn Transport + Send + Sync>> {
             let inner = decorate_inner(url, "unlistable+")?;
-            Ok(Box::new(crate::unlistable::UnlistableTransport::new(
-                inner,
-            )))
+            Ok(Box::new(crate::unlistable::UnlistableTransport::new(inner)))
         }),
     );
     m.insert(
@@ -301,13 +299,15 @@ where
     let opener = std::sync::Arc::new(opener);
     register(
         "sftp://",
-        Box::new(move |url: &str| -> Result<Box<dyn Transport + Send + Sync>> {
-            let parsed = url::Url::parse(url)?;
-            let channel = opener(&parsed)?;
-            Ok(Box::new(crate::sftp::SftpTransport::from_channel(
-                url, channel,
-            )?))
-        }),
+        Box::new(
+            move |url: &str| -> Result<Box<dyn Transport + Send + Sync>> {
+                let parsed = url::Url::parse(url)?;
+                let channel = opener(&parsed)?;
+                Ok(Box::new(crate::sftp::SftpTransport::from_channel(
+                    url, channel,
+                )?))
+            },
+        ),
     );
 }
 
@@ -415,7 +415,9 @@ mod tests {
         assert!(!t.listable());
         // list_dir must yield TransportNotPossible (via the iterator).
         let mut it = t.list_dir(".");
-        let first = it.next().expect("at least one item from unlistable list_dir");
+        let first = it
+            .next()
+            .expect("at least one item from unlistable list_dir");
         assert!(matches!(first, Err(Error::TransportNotPossible(_))));
     }
 

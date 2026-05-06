@@ -25,7 +25,7 @@ use crate::{ConnectedTransport, Transport};
 
 use super::client::{
     client_err_to_py, extract_body, extract_headers, make_activity_callback, HttpResponse,
-    PythonCredentialProvider, PythonNegotiateProvider,
+    PythonCredentialProvider, PythonNegotiateProvider, PythonTokenProvider,
 };
 
 /// Python-bound Rust HTTP transport.
@@ -78,10 +78,11 @@ impl HttpTransport {
             user_agent,
             read_timeout: timeout,
         };
-        let mut client = HttpClient::with_providers(
+        let mut client = HttpClient::with_full_providers(
             cfg,
             Box::new(PythonCredentialProvider),
             Box::new(PythonNegotiateProvider) as Box<dyn NegotiateProvider>,
+            Box::new(PythonTokenProvider),
         )
         .map_err(|e| {
             map_transport_err_to_py_err(

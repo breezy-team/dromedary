@@ -86,6 +86,26 @@ def get_negotiate_provider():
     return _http_rs.get_negotiate_provider()
 
 
+def set_token_provider(func):
+    """Register a preemptive bearer-token provider.
+
+    The callable is invoked as
+    ``func(protocol, host, port=None, path=None)`` and should return
+    ``(token, scheme)`` (or ``(None, None)`` when no token applies).
+    The HTTP client attaches ``Authorization: <scheme> <token>``
+    before the request goes on the wire — no server challenge
+    required. Caller-supplied ``Authorization`` headers always win.
+
+    Pass ``None`` to clear any previously-registered callback.
+    """
+    _http_rs.set_token_provider(func)
+
+
+def get_token_provider():
+    """Return the currently-registered token provider, or None."""
+    return _http_rs.get_token_provider()
+
+
 def set_auth_header_trace(func):
     """Register a callback invoked when auth credentials are sent.
 
