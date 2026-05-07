@@ -398,7 +398,11 @@ impl PyWriteStream {
     #[pyo3(signature = (want_fdatasync=None))]
     fn close(&mut self, py: Python, want_fdatasync: Option<bool>) -> PyResult<()> {
         if want_fdatasync.unwrap_or(false) {
-            self.fdatasync(py)?;
+            if let Err(err) = self.fdatasync(py) {
+                if !err.is_instance_of::<TransportNotPossible>(py) {
+                    return Err(err);
+                }
+            }
         }
         Ok(())
     }
