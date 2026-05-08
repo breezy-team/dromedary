@@ -3,4 +3,5 @@ include Cargo.toml Cargo.lock
 recursive-include dromedary *.py *.rs *.toml
 recursive-include dromedary/tests/ssl_certs *
 recursive-include crates Cargo.toml *.rs
+recursive-include _transport_rs Cargo.toml *.rs
 include dromedary/py.typed
