@@ -387,12 +387,24 @@ struct PyBufReadStream {
 }
 
 #[pyclass]
-struct PyWriteStream(Box<dyn WriteStream + Sync + Send>);
+struct PyWriteStream(Option<Box<dyn WriteStream + Sync + Send>>);
+
+impl PyWriteStream {
+    fn inner_mut(&mut self) -> PyResult<&mut (dyn WriteStream + Sync + Send)> {
+        match self.0.as_deref_mut() {
+            Some(s) => Ok(s),
+            None => Err(pyo3::exceptions::PyValueError::new_err(
+                "I/O operation on closed file",
+            )),
+        }
+    }
+}
 
 #[pymethods]
 impl PyWriteStream {
     fn write(&mut self, py: Python, data: &[u8]) -> PyResult<usize> {
-        py.detach(|| self.0.write(data)).map_err(|e| e.into())
+        let inner = self.inner_mut()?;
+        py.detach(|| inner.write(data)).map_err(|e| e.into())
     }
 
     #[pyo3(signature = (want_fdatasync=None))]
@@ -404,11 +416,16 @@ impl PyWriteStream {
                 }
             }
         }
+        // Drop the underlying writer so its file descriptor is released
+        // immediately — Python's FileStream.close() contract promises
+        // the file is no longer in use after this returns.
+        self.0 = None;
         Ok(())
     }
 
     fn fdatasync(&mut self, py: Python) -> PyResult<()> {
-        py.detach(|| self.0.sync_data()).map_err(|e| e.into())
+        let inner = self.inner_mut()?;
+        py.detach(|| inner.sync_data()).map_err(|e| e.into())
     }
 
     fn __enter__(slf: PyRef<Self>) -> Py<Self> {
@@ -416,16 +433,19 @@ impl PyWriteStream {
     }
 
     fn __exit__(
-        &self,
+        &mut self,
+        py: Python<'_>,
         _exc_type: Option<&Bound<PyType>>,
         _exc_val: Option<&Bound<PyAny>>,
         _exc_tb: Option<&Bound<PyAny>>,
     ) -> PyResult<bool> {
+        self.close(py, None)?;
         Ok(false)
     }
 
     fn flush(&mut self, py: Python) -> PyResult<()> {
-        py.detach(|| self.0.flush()).map_err(|e| e.into())
+        let inner = self.inner_mut()?;
+        py.detach(|| inner.flush()).map_err(|e| e.into())
     }
 
     fn writelines(&mut self, py: Python, lines: &Bound<PyList>) -> PyResult<()> {
@@ -1066,7 +1086,7 @@ impl Transport {
         let t = &slf.borrow().0;
         py.detach(|| t.open_write_stream(path, mode.and_then(perms_from_py_object)))
             .map_err(|e| Transport::map_to_py_err(slf.borrow(), py, e, Some(path)))
-            .map(PyWriteStream)
+            .map(|w| PyWriteStream(Some(w)))
     }
 
     fn delete_tree(&self, py: Python, path: &str) -> PyResult<()> {
