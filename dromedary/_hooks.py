@@ -16,27 +16,36 @@
 
 """Minimal standalone hooks implementation for dromedary."""
 
+from collections.abc import Callable, Iterator
+from typing import Any
+
 
 class HookPoint:
     """A named hook point that maintains a list of callbacks."""
 
-    def __init__(self, name, doc, introduced=None, deprecated=None):
+    def __init__(
+        self,
+        name: str,
+        doc: str,
+        introduced: tuple[int, ...] | None = None,
+        deprecated: tuple[int, ...] | None = None,
+    ) -> None:
         self.name = name
         self.__doc__ = doc
         self.introduced = introduced
         self.deprecated = deprecated
-        self._callbacks = []
+        self._callbacks: list[Callable[..., Any]] = []
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[Callable[..., Any]]:
         return iter(self._callbacks)
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self._callbacks)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"<HookPoint({self.name!r}), callbacks={self._callbacks!r}>"
 
-    def docs(self):
+    def docs(self) -> str:
         """Generate plain-text documentation for this hook point."""
         import textwrap
 
@@ -55,18 +64,24 @@ class HookPoint:
         return "\n".join(strings)
 
 
-class Hooks(dict):
+class Hooks(dict[str, HookPoint]):
     """A dict mapping hook names to HookPoint instances."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         dict.__init__(self)
-        self._callable_names = {}
+        self._callable_names: dict[Callable[..., Any], str] = {}
 
-    def add_hook(self, name, doc, introduced, deprecated=None):
+    def add_hook(
+        self,
+        name: str,
+        doc: str,
+        introduced: tuple[int, ...],
+        deprecated: tuple[int, ...] | None = None,
+    ) -> None:
         """Register a new hook point."""
         self[name] = HookPoint(name, doc, introduced=introduced, deprecated=deprecated)
 
-    def docs(self):
+    def docs(self) -> str:
         """Generate plain-text documentation for all registered hooks."""
         hook_docs = []
         cls_name = self.__class__.__name__
@@ -77,7 +92,9 @@ class Hooks(dict):
             hook_docs.append(self[hook_name].docs())
         return "\n".join(hook_docs)
 
-    def install_named_hook(self, hook_name, a_callable, name):
+    def install_named_hook(
+        self, hook_name: str, a_callable: Callable[..., Any], name: str | None
+    ) -> None:
         """Install a callable on the named hook point."""
         try:
             hook = self[hook_name]
@@ -87,7 +104,7 @@ class Hooks(dict):
         if name is not None:
             self._callable_names[a_callable] = name
 
-    def uninstall_named_hook(self, hook_name, label):
+    def uninstall_named_hook(self, hook_name: str, label: str) -> None:
         """Remove a callable from the named hook point by label."""
         hook = self[hook_name]
         for i, cb in enumerate(hook._callbacks):
@@ -97,6 +114,6 @@ class Hooks(dict):
                 return
         raise KeyError(f"No hook named {label!r} on {hook_name!r}")
 
-    def get_hook_name(self, a_callable):
+    def get_hook_name(self, a_callable: Callable[..., Any]) -> str:
         """Return the name associated with a callable, or a repr."""
         return self._callable_names.get(a_callable, repr(a_callable))

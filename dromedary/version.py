@@ -23,7 +23,7 @@ __version__ = "0.1.4"
 version_info = (0, 1, 4, "final", 0)
 
 
-def _format_version_tuple(version_info):
+def _format_version_tuple(version_info: tuple) -> str:
     """Format version tuple into a version string.
 
     Args:

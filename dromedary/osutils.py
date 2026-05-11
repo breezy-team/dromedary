@@ -23,6 +23,13 @@ import random
 import stat
 import string
 import sys
+from collections.abc import Callable
+from typing import IO, Protocol
+
+
+class _Writable(Protocol):
+    def write(self, b: bytes) -> int: ...
+
 
 if sys.platform != "win32":
     import fcntl
@@ -30,7 +37,12 @@ else:
     fcntl = None  # type: ignore[assignment]
 
 
-def pumpfile(from_file, to_file, read_length=-1, buff_size=32768):
+def pumpfile(
+    from_file: IO[bytes],
+    to_file: IO[bytes],
+    read_length: int = -1,
+    buff_size: int = 32768,
+) -> int:
     """Copy bytes from from_file to to_file, optionally limiting total length.
 
     Args:
@@ -64,7 +76,9 @@ def pumpfile(from_file, to_file, read_length=-1, buff_size=32768):
     return written
 
 
-def pump_string_file(string, to_file, segment_size=8192):
+def pump_string_file(
+    string: bytes | str, to_file: _Writable, segment_size: int = 8192
+) -> None:
     """Write a string to a file efficiently.
 
     Args:
@@ -82,7 +96,12 @@ def pump_string_file(string, to_file, segment_size=8192):
         offset += len(segment)
 
 
-def fancy_rename(old, new, rename_func, unlink_func):
+def fancy_rename(
+    old: str,
+    new: str,
+    rename_func: Callable[[str, str], None],
+    unlink_func: Callable[[str], None],
+) -> None:
     """A fancy rename, when you don't have atomic rename.
 
     :param old: The old path, to rename from
@@ -109,14 +128,9 @@ def fancy_rename(old, new, rename_func, unlink_func):
         pass
     except (FileNotFoundError, NotADirectoryError):
         pass
-    except OSError:
+    except OSError as e:
         # paramiko SFTP rename raises IOError with errno=None on failure.
-        raise
-    except Exception as e:
-        if getattr(e, "errno", None) is None or e.errno not in (
-            errno.ENOENT,
-            errno.ENOTDIR,
-        ):
+        if e.errno not in (errno.ENOENT, errno.ENOTDIR, None):
             raise
     else:
         file_existed = True
@@ -140,7 +154,7 @@ def fancy_rename(old, new, rename_func, unlink_func):
                 rename_func(tmp_name, new)
 
 
-def fdatasync(fileno):
+def fdatasync(fileno: int | IO[bytes]) -> None:
     """Force data to be written to disk.
 
     Args:
@@ -156,7 +170,7 @@ def fdatasync(fileno):
     # If neither is available, do nothing (some platforms don't support this)
 
 
-def file_kind_from_stat_mode(stat_mode):
+def file_kind_from_stat_mode(stat_mode: int) -> str:
     """Determine file type from stat mode bits.
 
     Args:
@@ -183,7 +197,7 @@ def file_kind_from_stat_mode(stat_mode):
         return "unknown"
 
 
-def set_fd_cloexec(fd):
+def set_fd_cloexec(fd: int | IO[bytes]) -> None:
     """Set the close-on-exec flag for a file descriptor.
 
     Args:
@@ -197,7 +211,7 @@ def set_fd_cloexec(fd):
         fcntl.fcntl(fd, fcntl.F_SETFD, flags | fcntl.FD_CLOEXEC)
 
 
-def rand_chars(n):
+def rand_chars(n: int) -> str:
     """Generate random characters.
 
     Args:
@@ -210,7 +224,7 @@ def rand_chars(n):
     return "".join(random.choice(chars) for _ in range(n))  # noqa: S311
 
 
-def splitpath(path):
+def splitpath(path: str) -> list[str]:
     """Split a path into components.
 
     Args:
@@ -236,7 +250,7 @@ def splitpath(path):
     return path.split("/")
 
 
-def pathjoin(*args):
+def pathjoin(*args: str) -> str:
     """Join path components, handling various edge cases.
 
     Args:
@@ -264,7 +278,7 @@ def pathjoin(*args):
     return result
 
 
-def get_terminal_encoding():
+def get_terminal_encoding() -> str:
     """Get the terminal's character encoding.
 
     Returns:
@@ -290,12 +304,12 @@ def get_terminal_encoding():
     return encoding
 
 
-def getcwd():
+def getcwd() -> str:
     """Return the current working directory as a unicode string."""
     return os.getcwd()
 
 
-def abspath(path):
+def abspath(path: str) -> str:
     """Return the absolute version of a path.
 
     On Windows the returned path uses forward slashes so that callers can
@@ -308,24 +322,24 @@ def abspath(path):
     return result
 
 
-def get_umask():
+def get_umask() -> int:
     """Return the current umask."""
     umask = os.umask(0)
     os.umask(umask)
     return umask
 
 
-def supports_symlinks(path=None):
+def supports_symlinks(path: str | None = None) -> bool:
     """Return True if the filesystem supports symlinks."""
     return getattr(os, "symlink", None) is not None
 
 
-def get_user_encoding():
+def get_user_encoding() -> str:
     """Return the encoding used for user-facing text."""
     return get_terminal_encoding()
 
 
-def _posix_normpath(path):
+def _posix_normpath(path: str) -> str:
     return os.path.normpath(path)
 
 
@@ -334,11 +348,11 @@ split = os.path.split
 MIN_ABS_PATHLENGTH = 3 if sys.platform == "win32" else 1
 
 
-def _win32_abspath(path):
+def _win32_abspath(path: str) -> str:
     return os.path.abspath(path).replace("\\", "/")
 
 
-def _win32_normpath(path):
+def _win32_normpath(path: str) -> str:
     """Normalize a Windows path.
 
     This is used on Windows to normalize path separators and handle

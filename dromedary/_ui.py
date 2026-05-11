@@ -20,13 +20,15 @@ Embedders should replace these functions to integrate with their UI.
 The defaults provide basic functionality using the standard library.
 """
 
+from typing import Literal
 
-def report_transport_activity(transport, byte_count, direction):
+
+def report_transport_activity(transport: object, byte_count: int, direction: Literal["read", "write"]) -> None:
     """Called during transport I/O to report activity. Default: no-op."""
     pass
 
 
-def get_password(prompt="", **kwargs):
+def get_password(prompt: str = "", **kwargs: object) -> str:
     """Prompt for a password. Default: uses getpass."""
     import getpass
 
@@ -35,14 +37,14 @@ def get_password(prompt="", **kwargs):
     return getpass.getpass(prompt)
 
 
-def get_username(prompt, **kwargs):
+def get_username(prompt: str, **kwargs: object) -> str:
     """Prompt for a username. Default: uses input()."""
     if kwargs:
         prompt = prompt % kwargs
     return input(prompt)
 
 
-def show_message(msg):
+def show_message(msg: str) -> None:
     """Show a message to the user. Default: print to stderr."""
     import sys
 

@@ -18,8 +18,13 @@
 root.
 """
 
+from typing import TYPE_CHECKING
+
 from dromedary import pathfilter, register_transport
 from dromedary._transport_rs.pathfilter import ChrootTransport
+
+if TYPE_CHECKING:
+    from dromedary import Transport
 
 __all__ = ["ChrootServer", "ChrootTransport", "get_test_permutations"]
 
@@ -32,20 +37,20 @@ class ChrootServer(pathfilter.PathFilteringServer):
     filter_func.
     """
 
-    def __init__(self, backing_transport):
+    def __init__(self, backing_transport: "Transport") -> None:
         """Initialize the ChrootServer."""
         pathfilter.PathFilteringServer.__init__(self, backing_transport, None)
 
-    def _factory(self, url):
+    def _factory(self, url: str) -> ChrootTransport:
         return ChrootTransport(self, url)
 
-    def start_server(self):
+    def start_server(self) -> None:
         """Start the chroot server and register its transport."""
         self.scheme = "chroot-%d:///" % id(self)
         register_transport(self.scheme, self._factory)
 
 
-def get_test_permutations():
+def get_test_permutations() -> list[tuple[type, type]]:
     """Return the permutations to be used in testing."""
     from dromedary.tests import test_server
 

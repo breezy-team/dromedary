@@ -16,8 +16,14 @@
 
 """A transport decorator that filters all paths that are passed to it."""
 
+from collections.abc import Callable
+from typing import TYPE_CHECKING
+
 from dromedary import Server, register_transport, unregister_transport
 from dromedary._transport_rs.pathfilter import PathFilteringTransport
+
+if TYPE_CHECKING:
+    from dromedary import Transport
 
 __all__ = [
     "PathFilteringServer",
@@ -34,7 +40,11 @@ class PathFilteringServer(Server):
     backing_transport.
     """
 
-    def __init__(self, backing_transport, filter_func):
+    def __init__(
+        self,
+        backing_transport: "Transport",
+        filter_func: Callable[[str], str] | None,
+    ) -> None:
         """Constructor.
 
         :param backing_transport: a transport
@@ -44,24 +54,24 @@ class PathFilteringServer(Server):
         self.backing_transport = backing_transport
         self.filter_func = filter_func
 
-    def _factory(self, url):
+    def _factory(self, url: str) -> PathFilteringTransport:
         return PathFilteringTransport(self, url)
 
-    def get_url(self):
+    def get_url(self) -> str:
         """Return the URL scheme for this server."""
         return self.scheme
 
-    def start_server(self):
+    def start_server(self) -> None:
         """Start the path filtering transport server."""
         self.scheme = "filtered-%d:///" % id(self)
         register_transport(self.scheme, self._factory)
 
-    def stop_server(self):
+    def stop_server(self) -> None:
         """Stop the path filtering transport server."""
         unregister_transport(self.scheme, self._factory)
 
 
-def get_test_permutations():
+def get_test_permutations() -> list[tuple[type, type]]:
     """Return the permutations to be used in testing."""
     from dromedary.tests import test_server
 

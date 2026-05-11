@@ -23,7 +23,8 @@ better error handling in multi-threaded applications.
 
 import sys
 import threading
-from collections.abc import Callable
+import types
+from collections.abc import Callable, Iterable, Mapping
 
 
 class CatchingExceptionThread(threading.Thread):
@@ -33,39 +34,40 @@ class CatchingExceptionThread(threading.Thread):
     re-raised when the thread is joined().
     """
 
-    ignored_exceptions: Callable[[Exception], bool] | None
+    ignored_exceptions: Callable[[BaseException], bool] | None
+    exception: tuple[type[BaseException], BaseException, types.TracebackType] | tuple[None, None, None] | None
 
-    def __init__(self, *args, **kwargs):
+    def __init__(
+        self,
+        group: None = None,
+        target: Callable[..., object] | None = None,
+        name: str | None = None,
+        args: Iterable[object] = (),
+        kwargs: Mapping[str, object] | None = None,
+        *,
+        daemon: bool | None = None,
+        sync_event: threading.Event | None = None,
+    ) -> None:
         """Initialize a CatchingExceptionThread instance.
 
         Args:
-            *args: Positional arguments passed to threading.Thread.
-            **kwargs: Keyword arguments passed to threading.Thread, with special handling for:
-                sync_event: An optional threading.Event used for synchronization. If not
-                    provided, a new Event will be created. This event is used to coordinate
-                    exception handling between threads.
-
-        Note:
-            The sync_event is particularly useful when the calling thread must wait for
-            this thread to reach a certain state. If an exception occurs, the event
-            will be set to unblock the waiting thread.
+            sync_event: An optional threading.Event used for synchronization. If not
+                provided, a new Event will be created. This event is used to coordinate
+                exception handling between threads.
         """
         # There are cases where the calling thread must wait, yet, if an
         # exception occurs, the event should be set so the caller is not
         # blocked. The main example is a calling thread that want to wait for
         # the called thread to be in a given state before continuing.
-        try:
-            sync_event = kwargs.pop("sync_event")
-        except KeyError:
-            # If the caller didn't pass a specific event, create our own
+        if sync_event is None:
             sync_event = threading.Event()
-        super().__init__(*args, **kwargs)
+        super().__init__(group=group, target=target, name=name, args=args, kwargs=kwargs, daemon=daemon)
         self.set_sync_event(sync_event)
         self.exception = None
         self.ignored_exceptions = None  # see set_ignored_exceptions
         self.lock = threading.Lock()
 
-    def set_sync_event(self, event):
+    def set_sync_event(self, event: threading.Event) -> None:
         """Set the ``sync_event`` event used to synchronize exception catching.
 
         When the thread uses an event to synchronize itself with another thread
@@ -89,7 +91,7 @@ class CatchingExceptionThread(threading.Thread):
         """
         self.sync_event = event
 
-    def switch_and_set(self, new):
+    def switch_and_set(self, new: threading.Event) -> None:
         """Switch to a new ``sync_event`` and set the current one.
 
         Using this method protects against race conditions while setting a new
@@ -121,11 +123,11 @@ class CatchingExceptionThread(threading.Thread):
 
     def set_ignored_exceptions(
         self,
-        ignored: Callable[[Exception], bool]
+        ignored: Callable[[BaseException], bool]
         | None
         | list[type[Exception]]
         | type[Exception],
-    ):
+    ) -> None:
         """Declare which exceptions will be ignored.
 
         :param ignored: Can be either:
@@ -146,7 +148,7 @@ class CatchingExceptionThread(threading.Thread):
         else:
             self.ignored_exceptions = ignored  # type: ignore
 
-    def run(self):
+    def run(self) -> None:
         """Overrides Thread.run to capture any exception."""
         self.sync_event.clear()
         try:
@@ -158,7 +160,7 @@ class CatchingExceptionThread(threading.Thread):
             # Make sure the calling thread is released
             self.sync_event.set()
 
-    def join(self, timeout=None):
+    def join(self, timeout: float | None = None) -> None:
         """Overrides Thread.join to raise any exception caught.
 
         Calling join(timeout=0) will raise the caught exception or return None
@@ -168,13 +170,14 @@ class CatchingExceptionThread(threading.Thread):
         if self.exception is not None:
             _exc_class, exc_value, _exc_tb = self.exception
             self.exception = None  # The exception should be raised only once
-            if self.ignored_exceptions is None or not self.ignored_exceptions(
-                exc_value
+            if exc_value is not None and (
+                self.ignored_exceptions is None
+                or not self.ignored_exceptions(exc_value)
             ):
                 # Raise non ignored exceptions
                 raise exc_value
 
-    def pending_exception(self):
+    def pending_exception(self) -> None:
         """Raise the caught exception.
 
         This does nothing if no exception occurred.

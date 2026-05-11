@@ -16,6 +16,11 @@
 
 """Exception classes for dromedary transport layer."""
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from dromedary import Transport
+
 
 class TransportError(Exception):
     """Base class for transport-related errors."""
@@ -24,7 +29,7 @@ class TransportError(Exception):
 
     _fmt = "Transport error: %(msg)s %(orig_error)s"
 
-    def __init__(self, msg=None, orig_error=None):
+    def __init__(self, msg: str | None = None, orig_error: object = None) -> None:
         """Initialize with an optional message and originating error."""
         if msg is None and orig_error is not None:
             msg = str(orig_error)
@@ -36,10 +41,10 @@ class TransportError(Exception):
         self.orig_error = orig_error
         Exception.__init__(self)
 
-    def _get_format_string(self):
+    def _get_format_string(self) -> str | None:
         return self._fmt
 
-    def __str__(self):
+    def __str__(self) -> str:
         """Return the formatted error message."""
         fmt = self._get_format_string()
         if fmt is not None:
@@ -52,17 +57,17 @@ class TransportError(Exception):
             return str(self.args[0])
         return self.msg or ""
 
-    def __eq__(self, other):
+    def __eq__(self, other: object) -> bool:
         """Return True if both errors are of the same class and have equal state."""
         if self.__class__ is not other.__class__:
-            return NotImplemented
+            return NotImplemented  # type: ignore[return-value]
         return self.__dict__ == other.__dict__
 
-    def __hash__(self):
+    def __hash__(self) -> int:
         """Return a hash based on object identity."""
         return id(self)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         """Return a debug representation including the instance dict."""
         return f"<{self.__class__.__name__}({self.__dict__!r})>"
 
@@ -72,7 +77,7 @@ class PathError(TransportError):
 
     _fmt = "Generic path error: %(path)r%(extra)s)"
 
-    def __init__(self, path, extra=None):
+    def __init__(self, path: str, extra: str | BaseException | None = None) -> None:
         """Initialize with the offending path and optional extra detail."""
         TransportError.__init__(self)
         self.path = path
@@ -140,7 +145,14 @@ class ShortReadvError(PathError):
 
     internal_error = True
 
-    def __init__(self, path, offset, length, actual, extra=None):
+    def __init__(
+        self,
+        path: str,
+        offset: int,
+        length: int,
+        actual: int,
+        extra: str | BaseException | None = None,
+    ) -> None:
         """Initialize with the path, requested offset/length and actual bytes read."""
         PathError.__init__(self, path, extra=extra)
         self.offset = offset
@@ -155,7 +167,7 @@ class PathNotChild(PathError, ValueError):
 
     internal_error = False
 
-    def __init__(self, path, base, extra=None):
+    def __init__(self, path: str, base: str, extra: str | None = None) -> None:
         """Initialize with the path, expected base path and optional extra detail."""
         TransportError.__init__(self)
         self.path = path
@@ -177,7 +189,7 @@ class NotLocalUrl(TransportError):
 
     _fmt = "%(url)s is not a local path."
 
-    def __init__(self, url):
+    def __init__(self, url: str) -> None:
         """Initialize with the offending URL."""
         self.url = url
         TransportError.__init__(self)
@@ -188,7 +200,7 @@ class DependencyNotPresent(TransportError):
 
     _fmt = 'Unable to import library "%(library)s": %(error)s'
 
-    def __init__(self, library, error):
+    def __init__(self, library: str, error: str | BaseException) -> None:
         """Initialize with the missing library name and import error."""
         self.library = library
         self.error = error
@@ -200,7 +212,7 @@ class RedirectRequested(TransportError):
 
     _fmt = "%(source)s is%(permanently)s redirected to %(target)s"
 
-    def __init__(self, source, target, is_permanent=False):
+    def __init__(self, source: str, target: str, is_permanent: bool = False) -> None:
         """Initialize with the source URL, target URL and whether permanent."""
         self.source = source
         self.target = target
@@ -222,7 +234,7 @@ class InProcessTransport(TransportError):
 
     _fmt = "The transport '%(transport)s' is only accessible within this process."
 
-    def __init__(self, transport):
+    def __init__(self, transport: "Transport") -> None:
         """Initialize with the in-process-only transport."""
         self.transport = transport
         TransportError.__init__(self)
@@ -239,7 +251,7 @@ class UnusableRedirect(TransportError):
 
     _fmt = "Unable to follow redirect from %(source)s to %(target)s: %(reason)s."
 
-    def __init__(self, source, target, reason):
+    def __init__(self, source: str, target: str, reason: str) -> None:
         """Initialize with the source URL, target URL and reason."""
         TransportError.__init__(self)
         self.source = source
@@ -253,7 +265,13 @@ class InvalidHttpResponse(TransportError):
 
     _fmt = "Invalid http response for %(path)s: %(msg)s%(orig_error)s"
 
-    def __init__(self, path, msg, orig_error=None, headers=None):
+    def __init__(
+        self,
+        path: str,
+        msg: str,
+        orig_error: str | BaseException | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         """Initialize with the path, message, original error and headers."""
         self.path = path
         if orig_error is None:
@@ -269,7 +287,13 @@ class UnexpectedHttpStatus(InvalidHttpResponse):
 
     _fmt = "Unexpected HTTP status %(code)d for %(path)s: %(extra)s"
 
-    def __init__(self, path, code, extra=None, headers=None):
+    def __init__(
+        self,
+        path: str,
+        code: int,
+        extra: str | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         """Initialize with the path, HTTP status code, optional extra and headers."""
         self.path = path
         self.code = code
@@ -285,7 +309,7 @@ class InvalidHttpRange(InvalidHttpResponse):
 
     _fmt = "Invalid http range %(range)r for %(path)s: %(msg)s"
 
-    def __init__(self, path, range, msg):
+    def __init__(self, path: str, range: tuple[int, int], msg: str) -> None:
         """Initialize with the path, requested range and message."""
         self.range = range
         InvalidHttpResponse.__init__(self, path, msg)
@@ -296,7 +320,7 @@ class HttpBoundaryMissing(InvalidHttpResponse):
 
     _fmt = "HTTP MIME Boundary missing for %(path)s: %(msg)s"
 
-    def __init__(self, path, msg):
+    def __init__(self, path: str, msg: str) -> None:
         """Initialize with the path and message."""
         InvalidHttpResponse.__init__(self, path, msg)
 
@@ -306,7 +330,7 @@ class BadHttpRequest(UnexpectedHttpStatus):
 
     _fmt = "Bad http request for %(path)s: %(reason)s"
 
-    def __init__(self, path, reason):
+    def __init__(self, path: str, reason: str) -> None:
         """Initialize with the path and reason."""
         self.path = path
         self.reason = reason
@@ -318,7 +342,7 @@ class InvalidRange(TransportError):
 
     _fmt = "Invalid range access in %(path)s at %(offset)s: %(msg)s"
 
-    def __init__(self, path, offset, msg=None):
+    def __init__(self, path: str, offset: int, msg: str | None = None) -> None:
         """Initialize with the path, offset and optional message."""
         TransportError.__init__(self, msg)
         self.path = path
@@ -331,7 +355,7 @@ class SmartProtocolError(TransportError):
 
     _fmt = "Generic bzr smart protocol error: %(details)s"
 
-    def __init__(self, details):
+    def __init__(self, details: str) -> None:
         """Initialize with the protocol error details."""
         self.details = details
         TransportError.__init__(self)
@@ -344,11 +368,11 @@ class ErrorFromSmartServer(TransportError):
 
     internal_error = True
 
-    def __init__(self, error_tuple):
+    def __init__(self, error_tuple: tuple[bytes, ...]) -> None:
         """Initialize with the raw error tuple from the smart server."""
         self.error_tuple = error_tuple
         try:
-            self.error_verb = error_tuple[0]
+            self.error_verb: bytes | None = error_tuple[0]
         except IndexError:
             self.error_verb = None
         self.error_args = error_tuple[1:]
@@ -360,7 +384,7 @@ class UnexpectedSmartServerResponse(TransportError):
 
     _fmt = "Could not understand response from smart server: %(response_tuple)r"
 
-    def __init__(self, response_tuple):
+    def __init__(self, response_tuple: tuple[bytes, ...]) -> None:
         """Initialize with the unexpected response tuple."""
         self.response_tuple = response_tuple
         TransportError.__init__(self)
@@ -373,7 +397,7 @@ class UnknownSmartMethod(TransportError):
 
     internal_error = True
 
-    def __init__(self, verb):
+    def __init__(self, verb: str) -> None:
         """Initialize with the unrecognised verb."""
         self.verb = verb
         TransportError.__init__(self)
@@ -393,7 +417,7 @@ class LockContention(TransportError):
 
     internal_error = False
 
-    def __init__(self, lock, msg=""):
+    def __init__(self, lock: str, msg: str = "") -> None:
         """Initialize with the contended lock and optional message."""
         self.lock = lock
         self.msg = msg
@@ -407,7 +431,7 @@ class LockFailed(TransportError):
 
     _fmt = "Cannot lock %(lock)s: %(why)s"
 
-    def __init__(self, lock, why):
+    def __init__(self, lock: str, why: str) -> None:
         """Initialize with the lock and the reason it could not be acquired."""
         self.lock = lock
         self.why = why
@@ -419,15 +443,21 @@ class SocketConnectionError(ConnectionError):
 
     _fmt = "%(formatted_msg)s"
 
-    def __init__(self, host, port=None, msg=None, orig_error=None):
+    def __init__(
+        self,
+        host: str,
+        port: int | None = None,
+        msg: str | None = None,
+        orig_error: str | BaseException | None = None,
+    ) -> None:
         """Initialize with the host, optional port, message and originating error."""
         if msg is None:
             msg = "Failed to connect to"
-        orig_error = "" if orig_error is None else "; " + str(orig_error)
+        orig_error_str = "" if orig_error is None else "; " + str(orig_error)
         self.host = host
-        port = "" if port is None else f":{port}"
-        self.port = port
-        self.formatted_msg = f"{msg} {host}{port}{orig_error}"
+        port_str = "" if port is None else f":{port}"
+        self.port = port_str
+        self.formatted_msg = f"{msg} {host}{port_str}{orig_error_str}"
         ConnectionError.__init__(self, self.formatted_msg)
 
 
@@ -436,7 +466,7 @@ class StrangeHostname(TransportError):
 
     _fmt = "Refusing to connect to strange SSH hostname %(hostname)s"
 
-    def __init__(self, hostname):
+    def __init__(self, hostname: str) -> None:
         """Initialize with the rejected hostname."""
         self.hostname = hostname
         TransportError.__init__(self)

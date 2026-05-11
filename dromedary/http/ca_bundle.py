@@ -23,7 +23,7 @@ re-exports a thin wrapper so that existing callers keep working.
 from .._transport_rs import http as _http_rs
 
 
-def get_ca_path(use_cache=True):
+def get_ca_path(use_cache: bool = True) -> str:
     """Return location of CA bundle.
 
     Honours the ``CURL_CA_BUNDLE`` environment variable and, on Windows,
@@ -33,6 +33,6 @@ def get_ca_path(use_cache=True):
     return _http_rs.get_ca_path(use_cache)
 
 
-def _clear_cache():
+def _clear_cache() -> None:
     """Clear the cached CA path (for tests)."""
     _http_rs.clear_ca_path_cache()

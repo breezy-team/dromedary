@@ -38,7 +38,7 @@ class InvalidURLJoin(errors.PathError):
 
     _fmt = "Invalid URL join request: %(reason)s: %(base)r + %(join_args)r"
 
-    def __init__(self, reason, base, join_args):
+    def __init__(self, reason: str, base: str, join_args: tuple[str, ...]) -> None:
         """Initialize with the join failure reason, base URL, and join args."""
         self.reason = reason
         self.base = base
@@ -54,7 +54,7 @@ class InvalidRebaseURLs(errors.TransportError):
 
     _fmt = "URLs differ by more than path: %(old_base)r and %(new_base)r"
 
-    def __init__(self, old_base, new_base):
+    def __init__(self, old_base: str, new_base: str) -> None:
         """Initialize with the original and new base URLs."""
         self.old_base = old_base
         self.new_base = new_base
@@ -136,7 +136,7 @@ _url_dont_escape_characters = set(
 )
 
 
-def _unescape_segment_for_display(segment, encoding):
+def _unescape_segment_for_display(segment: str, encoding: str) -> str:
     """Unescape a segment for display.
 
     Helper for unescape_for_display
@@ -148,19 +148,19 @@ def _unescape_segment_for_display(segment, encoding):
     Returns: A unicode string which can be safely encoded into the
          specified encoding.
     """
-    escaped_chunks = segment.split("%")
-    escaped_chunks[0] = escaped_chunks[0].encode("utf-8")
-    for j in range(1, len(escaped_chunks)):
-        item = escaped_chunks[j]
+    str_chunks = segment.split("%")
+    byte_chunks: list[bytes] = [str_chunks[0].encode("utf-8")]
+    for j in range(1, len(str_chunks)):
+        item = str_chunks[j]
         try:
-            escaped_chunks[j] = _hex_display_map[item[:2]]
+            chunk = _hex_display_map[item[:2]]
         except KeyError:
             # Put back the percent symbol
-            escaped_chunks[j] = b"%" + (item[:2].encode("utf-8"))
+            chunk = b"%" + item[:2].encode("utf-8")
         except UnicodeDecodeError:
-            escaped_chunks[j] = chr(int(item[:2], 16)).encode("utf-8")
-        escaped_chunks[j] += item[2:].encode("utf-8")
-    unescaped = b"".join(escaped_chunks)
+            chunk = chr(int(item[:2], 16)).encode("utf-8")
+        byte_chunks.append(chunk + item[2:].encode("utf-8"))
+    unescaped = b"".join(byte_chunks)
     try:
         decoded = unescaped.decode("utf-8")
     except UnicodeDecodeError:
@@ -179,7 +179,7 @@ def _unescape_segment_for_display(segment, encoding):
             return decoded
 
 
-def unescape_for_display(url, encoding):
+def unescape_for_display(url: str, encoding: str) -> str:
     """Decode what you can for a URL, so that we get a nice looking path.
 
     This will turn file:// urls into local paths, and try to decode
@@ -212,11 +212,11 @@ def unescape_for_display(url, encoding):
     return "/".join(res)
 
 
-def _is_absolute(url):
+def _is_absolute(url: str) -> bool:
     return url.startswith("/")
 
 
-def rebase_url(url, old_base, new_base):
+def rebase_url(url: str, old_base: str, new_base: str) -> str:
     """Convert a relative path from an old base URL to a new base URL.
 
     The result will be a relative path.
@@ -234,7 +234,7 @@ def rebase_url(url, old_base, new_base):
     return determine_relative_path(new_parsed[2], join(old_parsed[2], url))
 
 
-def determine_relative_path(from_path, to_path):
+def determine_relative_path(from_path: str, to_path: str) -> str:
     """Determine a relative path from from_path to to_path."""
     from_segments = splitpath(from_path)
     to_segments = splitpath(to_path)

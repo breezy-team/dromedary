@@ -21,12 +21,19 @@ The defaults provide basic functionality using the standard library.
 """
 
 
-def get_ssh_vendor_name():
+def get_ssh_vendor_name() -> str | None:
     """Return the configured SSH vendor name, or None for auto-detect."""
     return None
 
 
-def get_auth_user(scheme, host, port=None, default=None, ask=False, prompt=None):
+def get_auth_user(
+    scheme: str,
+    host: str,
+    port: int | None = None,
+    default: str | None = None,
+    ask: bool = False,
+    prompt: str | None = None,
+) -> str:
     """Get username for authentication.
 
     Default: returns default, or falls back to the system username.
@@ -38,7 +45,9 @@ def get_auth_user(scheme, host, port=None, default=None, ask=False, prompt=None)
     return getpass.getuser()
 
 
-def get_auth_password(scheme, host, user, port=None):
+def get_auth_password(
+    scheme: str, host: str, user: str, port: int | None = None
+) -> str:
     """Get password for authentication.
 
     Default: prompts via getpass.

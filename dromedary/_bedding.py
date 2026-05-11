@@ -23,12 +23,12 @@ The defaults use XDG-style paths.
 import os
 
 
-def config_dir():
+def config_dir() -> str:
     """Return the configuration directory path."""
     xdg = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
     return os.path.join(xdg, "breezy")
 
 
-def ensure_config_dir_exists():
+def ensure_config_dir_exists() -> None:
     """Ensure the config directory exists."""
     os.makedirs(config_dir(), exist_ok=True)
