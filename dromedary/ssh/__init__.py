@@ -22,6 +22,10 @@ import logging
 import os
 import socket
 from binascii import hexlify
+from typing import IO, TYPE_CHECKING, Any, NoReturn, Protocol
+
+if TYPE_CHECKING:
+    import paramiko as paramiko_t
 
 from catalogus import registry
 
@@ -36,6 +40,36 @@ from .._transport_rs import ssh as _ssh_rs
 logger = logging.getLogger("dromedary.ssh")
 
 SFTPClient = _sftp_rs.SFTPClient
+
+
+class SFTPClientProtocol(Protocol):
+    """Shared interface between dromedary (Rust) and paramiko SFTP clients."""
+
+    def close(self) -> None: ...
+    def stat(self, path: str) -> "_sftp_rs.SFTPAttributes": ...
+    def lstat(self, path: str) -> "_sftp_rs.SFTPAttributes": ...
+    def listdir(self, path: str) -> list: ...
+    def file(self, path: str, mode: str = "r") -> IO[bytes]: ...
+    def open(
+        self,
+        path: str,
+        attr: "_sftp_rs.SFTPAttributes",
+        *,
+        read: bool = False,
+        write: bool = False,
+        append: bool = False,
+        create: bool = False,
+        truncate: bool = False,
+        excl: bool = False,
+    ) -> IO[bytes]: ...
+    def chmod(self, path: str, mode: int) -> None: ...
+    def mkdir(self, path: str, mode: int = 0o777) -> None: ...
+    def rmdir(self, path: str) -> None: ...
+    def remove(self, path: str) -> None: ...
+    def rename(self, oldpath: str, newpath: str) -> None: ...
+    def readlink(self, path: str) -> str: ...
+    def symlink(self, source: str, dest: str) -> None: ...
+
 
 try:
     import paramiko
@@ -59,7 +93,7 @@ class UnknownSSH(errors.TransportError):
 
     _fmt = "Unrecognised value for BRZ_SSH environment variable: %(vendor)s"
 
-    def __init__(self, vendor):
+    def __init__(self, vendor: str) -> None:
         """Initialize with the unrecognised vendor name."""
         self.vendor = vendor
         errors.TransportError.__init__(self)
@@ -68,19 +102,19 @@ class UnknownSSH(errors.TransportError):
 class SSHVendorManager(registry.Registry[str, "SSHVendor", None]):
     """Manager for manage SSH vendors."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize the SSH vendor manager.
 
         Sets up the registry and initializes the vendor cache.
         """
         super().__init__()
-        self._cached_ssh_vendor = None
+        self._cached_ssh_vendor: SSHVendor | None = None
 
-    def clear_cache(self):
+    def clear_cache(self) -> None:
         """Clear previously cached lookup result."""
         self._cached_ssh_vendor = None
 
-    def _get_vendor_by_config(self):
+    def _get_vendor_by_config(self) -> "SSHVendor | None":
         """Get SSH vendor based on configuration.
 
         Looks up the SSH vendor from the global configuration. If a vendor
@@ -106,7 +140,7 @@ class SSHVendorManager(registry.Registry[str, "SSHVendor", None]):
             return vendor
         return None
 
-    def _get_vendor_by_inspection(self):
+    def _get_vendor_by_inspection(self) -> "SSHVendor | None":
         """Return the vendor or None by checking for known SSH implementations.
 
         Runs 'ssh -V' to determine the SSH implementation in use. Detection
@@ -122,7 +156,7 @@ class SSHVendorManager(registry.Registry[str, "SSHVendor", None]):
         logger.debug("ssh implementation detected as %s", key)
         return self.get(key)
 
-    def _get_vendor_from_path(self, path):
+    def _get_vendor_from_path(self, path: str) -> "SSHVendor | None":
         """Return the vendor or None using the program at the given path.
 
         Runs the specified executable with '-V' to determine its type.
@@ -139,7 +173,7 @@ class SSHVendorManager(registry.Registry[str, "SSHVendor", None]):
         logger.debug("ssh implementation at %s detected as %s", path, key)
         return self.get(key)
 
-    def get_vendor(self):
+    def get_vendor(self) -> "SSHVendor":
         """Find out what version of SSH is on the system.
 
         :raises SSHVendorNotFound: if no any SSH vendor is found
@@ -168,15 +202,11 @@ register_lazy_ssh_vendor = _ssh_vendor_manager.register_lazy
 class SocketAsChannelAdapter:
     """Simple wrapper for a socket that pretends to be a paramiko Channel."""
 
-    def __init__(self, sock):
-        """Initialize the adapter with a socket.
-
-        Args:
-            sock: A socket object to wrap.
-        """
+    def __init__(self, sock: socket.socket) -> None:
+        """Initialize the adapter with a socket."""
         self.__socket = sock
 
-    def get_name(self):
+    def get_name(self) -> str:
         """Get the name of this channel adapter.
 
         Returns:
@@ -184,7 +214,7 @@ class SocketAsChannelAdapter:
         """
         return "bzr SocketAsChannelAdapter"
 
-    def send(self, data):
+    def send(self, data: bytes) -> int:
         """Send data through the socket.
 
         Args:
@@ -195,7 +225,7 @@ class SocketAsChannelAdapter:
         """
         return self.__socket.send(data)
 
-    def recv(self, n):
+    def recv(self, n: int) -> bytes:
         """Receive data from the socket.
 
         Args:
@@ -218,12 +248,12 @@ class SocketAsChannelAdapter:
                 errno.ECONNABORTED,
                 errno.EBADF,
             ):
-                # Connection has closed.  Paramiko expects an empty string in
+                # Connection has closed.  Paramiko expects an empty bytes in
                 # this case, not an exception.
-                return ""
+                return b""
             raise
 
-    def recv_ready(self):
+    def recv_ready(self) -> bool:
         """Check if data is available for reading.
 
         Returns:
@@ -240,7 +270,7 @@ class SocketAsChannelAdapter:
         # available, otherwise we probably don't get any benefit
         return True
 
-    def close(self):
+    def close(self) -> None:
         """Close the underlying socket."""
         self.__socket.close()
 
@@ -248,7 +278,11 @@ class SocketAsChannelAdapter:
 class SSHVendor:
     """Abstract base class for SSH vendor implementations."""
 
-    def connect_sftp(self, username, password, host, port):
+    executable_path: str | None = None
+
+    def connect_sftp(
+        self, username: str, password: str | None, host: str, port: int | None
+    ) -> SFTPClientProtocol:
         """Make an SSH connection, and return an SFTPClient.
 
         :param username: an ascii string
@@ -263,7 +297,14 @@ class SSHVendor:
         """
         raise NotImplementedError(self.connect_sftp)
 
-    def connect_ssh(self, username, password, host, port, command):
+    def connect_ssh(
+        self,
+        username: str,
+        password: str | None,
+        host: str,
+        port: int | None,
+        command: list[str],
+    ) -> "SSHConnection":
         """Make an SSH connection.
 
         :returns: an SSHConnection.
@@ -271,8 +312,12 @@ class SSHVendor:
         raise NotImplementedError(self.connect_ssh)
 
     def _raise_connection_error(
-        self, host, port=None, orig_error=None, msg="Unable to connect to SSH host"
-    ):
+        self,
+        host: str,
+        port: int | None = None,
+        orig_error: Exception | None = None,
+        msg: str = "Unable to connect to SSH host",
+    ) -> "NoReturn":
         """Raise a SocketConnectionError with properly formatted host.
 
         This just unifies all the locations that try to raise ConnectionError,
@@ -295,7 +340,9 @@ class SSHVendor:
 class LoopbackVendor(SSHVendor):
     """SSH "vendor" that connects over a plain TCP socket, not SSH."""
 
-    def connect_sftp(self, username, password, host, port):
+    def connect_sftp(
+        self, username: str, password: str | None, host: str, port: int | None
+    ) -> SFTPClientProtocol:
         """Connect to an SFTP server using a plain TCP socket.
 
         This is a loopback implementation that bypasses SSH and connects
@@ -337,7 +384,13 @@ if paramiko is not None:
     register_lazy_ssh_vendor("none", "dromedary.ssh.paramiko", "paramiko_vendor")
 
 
-def _paramiko_auth(username, password, host, port, paramiko_transport):
+def _paramiko_auth(
+    username: str | None,
+    password: str | None,
+    host: str,
+    port: int | None,
+    paramiko_transport: "paramiko_t.Transport",
+) -> None:
     # paramiko requires a username, but it might be none if nothing was
     # supplied.  If so, use the local username.
     if username is None:
@@ -423,7 +476,12 @@ def _paramiko_auth(username, password, host, port, paramiko_transport):
         )
 
 
-def _try_pkey_auth(paramiko_transport, pkey_class, username, filename):
+def _try_pkey_auth(
+    paramiko_transport: "paramiko_t.Transport",
+    pkey_class: "type[Any]",
+    username: str,
+    filename: str,
+) -> bool:
     filename = os.path.expanduser("~/.ssh/" + filename)
     try:
         key = pkey_class.from_private_key_file(filename)
@@ -451,11 +509,15 @@ def _try_pkey_auth(paramiko_transport, pkey_class, username, filename):
     return False
 
 
-def _ssh_host_keys_config_dir():
+SYSTEM_HOSTKEYS: "paramiko_t.HostKeys | dict" = {}
+BRZ_HOSTKEYS: "paramiko_t.HostKeys | dict" = {}
+
+
+def _ssh_host_keys_config_dir() -> str:
     return pathjoin(bedding.config_dir(), "ssh_host_keys")
 
 
-def load_host_keys():
+def load_host_keys() -> None:
     """Load system host keys (probably doesn't work on windows) and any
     "discovered" keys from previous sessions.
     """
@@ -474,7 +536,7 @@ def load_host_keys():
         save_host_keys()
 
 
-def save_host_keys():
+def save_host_keys() -> None:
     """Save "discovered" host keys in $(config)/ssh_host_keys/."""
     global SYSTEM_HOSTKEYS, BRZ_HOSTKEYS
     bzr_hostkey_path = _ssh_host_keys_config_dir()
@@ -493,7 +555,7 @@ def save_host_keys():
 class SSHConnection:
     """Abstract base class for SSH connections."""
 
-    def get_sock_or_pipes(self):
+    def get_sock_or_pipes(self) -> tuple[str, object]:
         """Returns a (kind, io_object) pair.
 
         If kind == 'socket', then io_object is a socket.
@@ -508,10 +570,6 @@ class SSHConnection:
         """
         raise NotImplementedError(self.get_sock_or_pipes)
 
-    def close(self):
-        """Close the SSH connection.
-
-        Subclasses must implement this method to properly close their
-        connection type.
-        """
+    def close(self) -> None:
+        """Close the SSH connection."""
         raise NotImplementedError(self.close)

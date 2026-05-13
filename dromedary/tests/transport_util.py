@@ -20,7 +20,7 @@ from dromedary import Transport
 
 # SFTPTransport is the only bundled transport that properly counts connections
 # at the moment.
-from . import test_sftp_transport
+from . import test_sftp_transport  # type: ignore[attr-defined]
 
 
 class TestCaseWithConnectionHookedTransport(test_sftp_transport.TestCaseWithSFTPServer):

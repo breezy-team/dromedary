@@ -35,7 +35,11 @@ class CatchingExceptionThread(threading.Thread):
     """
 
     ignored_exceptions: Callable[[BaseException], bool] | None
-    exception: tuple[type[BaseException], BaseException, types.TracebackType] | tuple[None, None, None] | None
+    exception: (
+        tuple[type[BaseException], BaseException, types.TracebackType]
+        | tuple[None, None, None]
+        | None
+    )
 
     def __init__(
         self,
@@ -61,7 +65,14 @@ class CatchingExceptionThread(threading.Thread):
         # the called thread to be in a given state before continuing.
         if sync_event is None:
             sync_event = threading.Event()
-        super().__init__(group=group, target=target, name=name, args=args, kwargs=kwargs, daemon=daemon)
+        super().__init__(
+            group=group,
+            target=target,
+            name=name,
+            args=args,
+            kwargs=kwargs,
+            daemon=daemon,
+        )
         self.set_sync_event(sync_event)
         self.exception = None
         self.ignored_exceptions = None  # see set_ignored_exceptions

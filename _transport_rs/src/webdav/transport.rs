@@ -97,7 +97,7 @@ impl HttpDavTransport {
     /// Clone this transport at an optional offset, sharing the
     /// underlying HttpClient. Returns an instance of the Rust-level
     /// HttpDavTransport pyclass; Python subclasses override
-    /// `clone()` to rebrand via `_rust_replace_inner_from` (the
+    /// `clone()` to rebrand via `_clone_from` (the
     /// HttpTransport-inherited helper).
     #[pyo3(signature = (offset=None))]
     fn clone<'a>(
@@ -113,11 +113,11 @@ impl HttpDavTransport {
     }
 
     /// Replace this transport's inner state with a clone of
-    /// `source`. Mirrors `HttpTransport._rust_replace_inner_from`
+    /// `source`. Mirrors `HttpTransport._clone_from`
     /// but cascades down to refresh the DAV layer too, so the
     /// Python subclass's `clone()` preserves subclass identity
     /// while still sharing the HttpClient across siblings.
-    fn _rust_replace_inner_from(
+    fn _clone_from(
         mut slf: PyRefMut<Self>,
         py: Python,
         source: PyRef<HttpDavTransport>,

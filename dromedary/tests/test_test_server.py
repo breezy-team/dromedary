@@ -97,7 +97,7 @@ class TCPConnectionHandler(socketserver.BaseRequestHandler):
 class TestTCPServerInAThreadBase:
     """Mixin with test methods for TCP server implementations."""
 
-    server_class = None
+    server_class: "type[test_server.TestingTCPServerMixin] | None" = None
 
     def get_server(self, server_class=None, connection_handler_class=None):
         if server_class is not None:

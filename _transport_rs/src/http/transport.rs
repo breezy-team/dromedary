@@ -110,7 +110,7 @@ impl HttpTransport {
     /// Returns an instance of the base Rust ``HttpTransport``.
     /// Python subclasses that want ``type(self)``-preserving cloning
     /// should override ``clone`` and use
-    /// ``_rust_replace_inner_from`` to graft the shared state onto
+    /// ``_clone_from`` to graft the shared state onto
     /// a freshly-constructed subclass instance.
     #[pyo3(signature = (offset=None))]
     fn clone<'a>(
@@ -137,7 +137,7 @@ impl HttpTransport {
     /// After calling this, the two transports share the same
     /// underlying Rust state exactly as if the receiver had been
     /// produced by ``source.clone(offset)``.
-    fn _rust_replace_inner_from(
+    fn _clone_from(
         mut slf: PyRefMut<Self>,
         source: PyRef<Self>,
         offset: Option<&str>,

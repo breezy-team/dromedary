@@ -23,7 +23,9 @@ The defaults provide basic functionality using the standard library.
 from typing import Literal
 
 
-def report_transport_activity(transport: object, byte_count: int, direction: Literal["read", "write"]) -> None:
+def report_transport_activity(
+    transport: object, byte_count: int, direction: Literal["read", "write"]
+) -> None:
     """Called during transport I/O to report activity. Default: no-op."""
     pass
 

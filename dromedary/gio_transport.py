@@ -47,15 +47,15 @@ class GioLocalURLServer(TestServer):
     this just exists to tell the test code how to get to it.
     """
 
-    def start_server(self):
+    def start_server(self) -> None:
         """Start the server (no-op for local filesystem access)."""
         pass
 
-    def get_url(self):
+    def get_url(self) -> str:
         """See Transport.Server.get_url."""
         return "gio+" + urlutils.local_path_to_url("")
 
 
-def get_test_permutations():
+def get_test_permutations() -> list[tuple[type, type]]:
     """Return the permutations to be used in testing."""
     return [(GioTransport, GioLocalURLServer)]

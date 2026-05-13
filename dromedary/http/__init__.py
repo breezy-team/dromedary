@@ -55,7 +55,9 @@ def default_user_agent() -> str:
     return _http_rs.default_user_agent()
 
 
-def set_credential_lookup(func: Callable[..., tuple[str | None, str | None]] | None) -> None:
+def set_credential_lookup(
+    func: Callable[..., tuple[str | None, str | None]] | None,
+) -> None:
     """Set the function used to look up HTTP credentials.
 
     Args:
@@ -88,7 +90,9 @@ def get_negotiate_provider() -> Callable[[str], str | None] | None:
     return _http_rs.get_negotiate_provider()
 
 
-def set_token_provider(func: Callable[..., tuple[str | None, str | None]] | None) -> None:
+def set_token_provider(
+    func: Callable[..., tuple[str | None, str | None]] | None,
+) -> None:
     """Register a preemptive bearer-token provider.
 
     The callable is invoked as

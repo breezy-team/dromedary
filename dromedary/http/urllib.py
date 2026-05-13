@@ -31,11 +31,16 @@ and redirect handling. This module subclasses it and layers:
   ``dromedary/tests/per_transport.py``
 """
 
+from io import BytesIO
+from typing import IO, TYPE_CHECKING, Literal, Self
 from urllib.parse import urlencode
 
 import dromedary as _mod_dromedary
 from dromedary._transport_rs import http as _http_rs
 from dromedary.errors import RedirectRequested, UnusableRedirect
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 # Re-export for backwards compatibility with code that imports the
 # HttpClient pyclass from dromedary.http.urllib.
@@ -49,7 +54,12 @@ class HttpTransport(_http_rs.HttpTransport):
     accepted and dropped — there is only one implementation now.
     """
 
-    def __new__(cls, base, _from_transport=None, ca_certs=None):
+    def __new__(
+        cls,
+        base: str,
+        _from_transport: "HttpTransport | None" = None,
+        ca_certs: str | None = None,
+    ) -> Self:
         """Build the Rust transport.
 
         We defer TLS-related knobs (``ca_certs``) to ``__init__``
@@ -63,7 +73,7 @@ class HttpTransport(_http_rs.HttpTransport):
         When ``_from_transport`` is supplied we construct a fresh
         Rust instance at ``base`` and then graft the source's
         HttpClient / auth cache / range hint onto it via
-        ``_rust_replace_inner_from`` — so clones share all the
+        ``_clone_from`` — so clones share all the
         per-client state without losing the Python subclass identity.
         """
         self = super().__new__(
@@ -77,10 +87,15 @@ class HttpTransport(_http_rs.HttpTransport):
             # Compute the offset so the grafted state targets the
             # right base URL, then swap in the shared state.
             offset = _offset_from_base(_from_transport.base, base)
-            self._rust_replace_inner_from(_from_transport, offset)
+            self._clone_from(_from_transport, offset)
         return self
 
-    def __init__(self, base, _from_transport=None, ca_certs=None):
+    def __init__(
+        self,
+        base: str,
+        _from_transport: "HttpTransport | None" = None,
+        ca_certs: str | None = None,
+    ) -> None:
         """Initialise Python-side state and TLS-configured inner client.
 
         Rust ``__new__`` populates the base-URL state with a minimal
@@ -120,11 +135,11 @@ class HttpTransport(_http_rs.HttpTransport):
                 disable_verification=disable_verification,
                 user_agent=_default_user_agent(),
             )
-            # ``offset=None`` lets ``_rust_replace_inner_from``
+            # ``offset=None`` lets ``_clone_from``
             # share ``fresh``'s inner directly, preserving raw_base
             # (empty-password URL shape) and segment parameters that
             # ``clone_concrete(None)`` would otherwise strip.
-            self._rust_replace_inner_from(fresh, None)
+            self._clone_from(fresh, None)
         # Wire an activity callback into the Rust transport so
         # internal get/has/post/readv calls feed breezy's progress
         # UI too, not just the explicit ``.request()`` path. We use
@@ -136,7 +151,7 @@ class HttpTransport(_http_rs.HttpTransport):
 
         wself = weakref.ref(self)
 
-        def _forward(byte_count, direction):
+        def _forward(byte_count: int, direction: Literal["read", "write"]) -> None:
             t = wself()
             if t is None:
                 return
@@ -144,7 +159,7 @@ class HttpTransport(_http_rs.HttpTransport):
 
         self._set_activity_callback(_forward)
 
-    def clone(self, offset=None):
+    def clone(self, offset: str | None = None) -> "HttpTransport":
         """Return a new transport sharing this transport's HttpClient.
 
         Uses ``urlutils.URL.clone`` path-combine semantics rather
@@ -163,13 +178,15 @@ class HttpTransport(_http_rs.HttpTransport):
             new_base = str(URL.from_string(self.base).clone(offset))
         return type(self)(new_base, _from_transport=self)
 
-    def _report_activity(self, byte_count, direction):
+    def _report_activity(
+        self, byte_count: int, direction: Literal["read", "write"]
+    ) -> None:
         """Report byte-count progress to the dromedary UI hook.
 
         Called back from the Rust client during ``request()``; feeds
         into breezy's transport-activity progress bar.
         """
-        from dromedary import ui as _ui
+        from dromedary import _ui
 
         _ui.report_transport_activity(self, byte_count, direction)
 
@@ -178,7 +195,18 @@ class HttpTransport(_http_rs.HttpTransport):
     # The Rust ``request`` uses ``follow_redirects`` (bool) and no
     # fields encoding.
 
-    def request(self, method, url, fields=None, headers=None, **urlopen_kw):
+    def request(
+        self,
+        method: str,
+        url: str,
+        headers: dict[str, str] | None = None,
+        body: bytes | None = None,
+        follow_redirects: bool = False,
+        report_activity: "Callable[[int, Literal['read', 'write']], None] | None" = None,
+        fields: dict[str, str] | None = None,
+        retries: int = 0,
+        **urlopen_kw: object,
+    ) -> _http_rs.HttpResponse:
         """Issue a single HTTP request.
 
         ``body`` and ``fields`` are mutually exclusive; ``retries > 0``
@@ -186,16 +214,16 @@ class HttpTransport(_http_rs.HttpTransport):
         pre-Rust API shape). Any remaining keyword arguments raise
         ``NotImplementedError`` to catch typos early.
         """
-        body = urlopen_kw.pop("body", None)
         if fields is not None:
             if body is not None:
                 raise ValueError("body and fields are mutually exclusive")
             body = urlencode(fields).encode()
         if headers is None:
             headers = {}
-        follow_redirects = urlopen_kw.pop("retries", 0) > 0
+        if retries > 0:
+            follow_redirects = True
         if urlopen_kw:
-            raise NotImplementedError(f"unknown arguments: {urlopen_kw.keys()!r}")
+            raise NotImplementedError(f"unknown arguments: {list(urlopen_kw.keys())!r}")
 
         response = super().request(
             method,
@@ -203,14 +231,15 @@ class HttpTransport(_http_rs.HttpTransport):
             headers=headers,
             body=body,
             follow_redirects=follow_redirects,
-            report_activity=self._report_activity,
+            report_activity=report_activity or self._report_activity,
         )
 
         code = response.status
         if not follow_redirects and code in (301, 302, 303, 307, 308):
+            redirected_to = response.redirected_to or url
             raise RedirectRequested(
                 url,
-                response.redirected_to,
+                redirected_to,
                 is_permanent=(code in (301, 308)),
             )
         return response
@@ -221,23 +250,14 @@ class HttpTransport(_http_rs.HttpTransport):
     # overridden to avoid pulling a response body just to check
     # existence.
 
-    def has(self, relpath):
+    def has(self, relpath: str) -> bool:
         """Does the target location exist?"""
         response = self._head(relpath)
         return response.status == 200
 
-    def _post(self, body_bytes):
-        """POST `body_bytes` to .bzr/smart on this transport.
-
-        Returns ``(response_code, response_body_filelike)``. The Rust
-        pyclass returns raw bytes; breezy's smart-HTTP medium calls
-        ``.read(count)`` on the result, so we wrap the bytes in a
-        BytesIO for that specific caller.
-        """
-        from io import BytesIO
-
-        code, body = super()._post(".bzr/smart", body_bytes)
-        return code, BytesIO(body)
+    def _post(self, relpath: str, body: bytes) -> tuple[int, bytes]:
+        """POST `body` to `relpath` on this transport."""
+        return super()._post(relpath, body)
 
     # ------------------------------------------------------------------
     # Historical breezy-facing helpers. These were public-ish API on
@@ -245,7 +265,9 @@ class HttpTransport(_http_rs.HttpTransport):
     # of production code paths reach into them, so we keep them as
     # thin shims over the Rust readv / range-header logic.
 
-    def _get(self, relpath, offsets, tail_amount=0):
+    def _get(
+        self, relpath: str, offsets: list | None, tail_amount: int = 0
+    ) -> tuple[int, IO[bytes]]:
         """Range-GET ``relpath`` returning ``(code, seekable_bytes)``.
 
         `offsets` is either `None` (fetch the whole file) or a list of
@@ -261,8 +283,6 @@ class HttpTransport(_http_rs.HttpTransport):
         reconstitute the same sparse-file shape by dropping each
         range's data at its absolute offset in a BytesIO.
         """
-        from io import BytesIO
-
         if not offsets and not tail_amount:
             # Whole-file fetch.
             data = self._get_bytes_inner(relpath)
@@ -328,7 +348,7 @@ class HttpTransport(_http_rs.HttpTransport):
         out.seek(0)
         return 206, out
 
-    def _get_bytes_inner(self, relpath):
+    def _get_bytes_inner(self, relpath: str) -> bytes:
         """Fetch the entire body of `relpath` as bytes.
 
         Separate helper so ``_get`` can call it without going through
@@ -342,7 +362,7 @@ class HttpTransport(_http_rs.HttpTransport):
                 f.close()
 
     @staticmethod
-    def _range_header(ranges, tail_amount):
+    def _range_header(ranges: list, tail_amount: int) -> str:
         """Build an HTTP Range header value from coalesced offsets.
 
         Historical public-ish API — breezy's TestRangeHeader unit
@@ -365,7 +385,7 @@ class HttpTransport(_http_rs.HttpTransport):
     # RedirectRequested(source, target); breezy then calls this to
     # build a transport to retry the request against.
 
-    def _redirected_to(self, source, target):
+    def _redirected_to(self, source: str, target: str) -> "_mod_dromedary.AnyTransport":
         """Return a transport suitable to re-issue a redirected request.
 
         The redirect is only handled when the relpath involved wasn't
@@ -416,14 +436,14 @@ class HttpTransport(_http_rs.HttpTransport):
         return _mod_dromedary.get_transport_from_url(new_url)
 
 
-def _default_user_agent():
+def _default_user_agent() -> str:
     """Return the current User-Agent the client should use."""
     from dromedary.http import default_user_agent
 
     return default_user_agent()
 
 
-def _offset_from_base(parent_base, child_base):
+def _offset_from_base(parent_base: str, child_base: str) -> str | None:
     """Compute ``child_base`` relative to ``parent_base`` for clone().
 
     Used when ``_from_transport`` is supplied — breezy passes the
@@ -437,7 +457,14 @@ def _offset_from_base(parent_base, child_base):
     return child_base
 
 
-def _unsplit_url(scheme, user, password, host, port, path):
+def _unsplit_url(
+    scheme: str,
+    user: str | None,
+    password: str | None,
+    host: str,
+    port: int | None,
+    path: str,
+) -> str:
     """Build a URL from its components. Used by ``_redirected_to``."""
     from urllib.parse import quote
 
@@ -453,11 +480,11 @@ def _unsplit_url(scheme, user, password, host, port, path):
     return f"{scheme}://{netloc}{path}"
 
 
-def get_test_permutations():
+def get_test_permutations() -> list[tuple[type, type]]:
     """Return the permutations used by the per-transport test scenarios."""
     from dromedary.tests import http_server
 
-    permutations = [(HttpTransport, http_server.HttpServer)]
+    permutations: list[tuple[type, type]] = [(HttpTransport, http_server.HttpServer)]
     import importlib.util
 
     if importlib.util.find_spec("ssl") is not None:
@@ -466,7 +493,9 @@ def get_test_permutations():
         _ca_path = ssl_certs.build_path("ca.crt")
 
         class HTTPS_transport(HttpTransport):
-            def __new__(cls, base, _from_transport=None):
+            def __new__(
+                cls, base: str, _from_transport: "HttpTransport | None" = None
+            ) -> Self:
                 return super().__new__(
                     cls,
                     base,
@@ -474,7 +503,9 @@ def get_test_permutations():
                     ca_certs=_ca_path,
                 )
 
-            def __init__(self, base, _from_transport=None):
+            def __init__(
+                self, base: str, _from_transport: "HttpTransport | None" = None
+            ) -> None:
                 super().__init__(
                     base,
                     _from_transport=_from_transport,

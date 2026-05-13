@@ -20,12 +20,15 @@ This is a fairly thin wrapper on regular file IO.
 """
 
 import os
+from collections.abc import Callable
 
 from dromedary import errors, urlutils
 from dromedary.osutils import _win32_normpath, file_kind_from_stat_mode, pathjoin
 
 
-def file_stat(f, _lstat=os.lstat):
+def file_stat(
+    f: str, _lstat: Callable[[str], os.stat_result] = os.lstat
+) -> os.stat_result:
     """Get stat information for a file.
 
     Args:
@@ -44,7 +47,7 @@ def file_stat(f, _lstat=os.lstat):
         raise errors.NoSuchFile(f) from err
 
 
-def file_kind(f, _lstat=os.lstat):
+def file_kind(f: str, _lstat: Callable[[str], os.stat_result] = os.lstat) -> str:
     """Determine the kind of file (regular, directory, symlink, etc).
 
     Args:
@@ -64,7 +67,7 @@ from ._transport_rs.local import LocalTransport  # type:ignore
 class EmulatedWin32LocalTransport(LocalTransport):  # type:ignore
     """Special transport for testing Win32 [UNC] paths on non-windows."""
 
-    def __init__(self, base):
+    def __init__(self, base: str) -> None:
         """Initialize EmulatedWin32LocalTransport.
 
         Args:
@@ -77,7 +80,7 @@ class EmulatedWin32LocalTransport(LocalTransport):  # type:ignore
         # `__new__` call in `LocalTransport(base)`.
         self._local_base = urlutils._win32_local_path_from_url(base)
 
-    def abspath(self, relpath):
+    def abspath(self, relpath: str) -> str:
         """Return the absolute URL for a relative path.
 
         Args:
@@ -89,7 +92,7 @@ class EmulatedWin32LocalTransport(LocalTransport):  # type:ignore
         path = _win32_normpath(pathjoin(self._local_base, urlutils.unescape(relpath)))
         return urlutils._win32_local_path_to_url(path)
 
-    def clone(self, offset=None):
+    def clone(self, offset: str | None = None) -> "EmulatedWin32LocalTransport":
         """Return a new LocalTransport with root at self.base + offset
         Because the local filesystem does not require a connection,
         we can just return a new object.
@@ -106,7 +109,7 @@ class EmulatedWin32LocalTransport(LocalTransport):  # type:ignore
             return EmulatedWin32LocalTransport(abspath)
 
 
-def get_test_permutations():
+def get_test_permutations() -> list[tuple[type, type]]:
     """Return the permutations to be used in testing."""
     from dromedary.tests import test_server
 

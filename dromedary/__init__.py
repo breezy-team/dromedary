@@ -34,7 +34,7 @@ import sys
 from collections.abc import Callable, Iterable, Iterator
 from io import BytesIO
 from stat import S_ISDIR
-from typing import IO, Any, Generic, Literal, Protocol, TypeVar
+from typing import IO, Any, Generic, Literal, Protocol, TypeVar, Union
 
 from catalogus import registry
 
@@ -65,6 +65,10 @@ class Lock(Protocol):
 
 
 from . import _transport_rs
+
+# TODO: unify into a single base class once _transport_rs.Transport replaces
+# the pure-Python Transport.
+AnyTransport = Union["Transport", "_transport_rs.Transport"]
 
 # a dictionary of open file streams. Keys are absolute paths, values are
 # transport defined.
@@ -319,7 +323,7 @@ class LateReadError:
 class FileStream:
     """Base class for FileStreams."""
 
-    def __init__(self, transport: "Transport", relpath: str) -> None:
+    def __init__(self, transport: "AnyTransport", relpath: str) -> None:
         """Create a FileStream for relpath on transport."""
         self.transport = transport
         self.relpath = relpath
@@ -392,16 +396,7 @@ class FileFileStream(FileStream):
 
     def write(self, data: bytes) -> int:
         """Write bytes to the file."""
-
-        class F:
-            def __init__(self, f: IO[bytes]) -> None:
-                self.f = f
-
-            def write(self, b: bytes) -> int:
-                self.f.write(b)
-                return len(b)
-
-        osutils.pump_string_file(data, F(self.file_handle))
+        osutils.pump_string_file(data, self.file_handle)
         return len(data)
 
     def flush(self) -> None:

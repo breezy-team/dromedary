@@ -18,7 +18,7 @@ from version import version_string
 try:
     from setuptools_rust import Binding, RustExtension
 except ModuleNotFoundError:
-    RustExtension = None
+    RustExtension = None  # type: ignore[assignment,misc]
     rust_extensions = []
 else:
     rust_extensions = [

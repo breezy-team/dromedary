@@ -24,12 +24,7 @@ import stat
 import string
 import sys
 from collections.abc import Callable
-from typing import IO, Protocol
-
-
-class _Writable(Protocol):
-    def write(self, b: bytes) -> int: ...
-
+from typing import IO
 
 if sys.platform != "win32":
     import fcntl
@@ -77,7 +72,7 @@ def pumpfile(
 
 
 def pump_string_file(
-    string: bytes | str, to_file: _Writable, segment_size: int = 8192
+    string: bytes | str, to_file: IO[bytes], segment_size: int = 8192
 ) -> None:
     """Write a string to a file efficiently.
 

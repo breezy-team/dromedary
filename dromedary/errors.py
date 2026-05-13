@@ -309,7 +309,7 @@ class InvalidHttpRange(InvalidHttpResponse):
 
     _fmt = "Invalid http range %(range)r for %(path)s: %(msg)s"
 
-    def __init__(self, path: str, range: tuple[int, int], msg: str) -> None:
+    def __init__(self, path: str, range: str | tuple[int, int], msg: str) -> None:
         """Initialize with the path, requested range and message."""
         self.range = range
         InvalidHttpResponse.__init__(self, path, msg)
