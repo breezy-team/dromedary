@@ -16,7 +16,7 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::import_exception;
 use pyo3::prelude::*;
 #[cfg(unix)]
-use std::os::fd::{IntoRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 
@@ -181,12 +181,13 @@ fn spawn(argv: &[String], host: &str, port: Option<u16>) -> PyResult<SSHSubproce
         // Dup twice: once for child stdin, once for stdout. The child
         // inherits them via `Command::stdin` / `stdout`; the parent keeps
         // its half (`mine`) with CLOEXEC set.
-        let dup_in = nix::unistd::dup(&theirs)
+        let dup_in = nix::unistd::dup(theirs.as_raw_fd())
             .map_err(|e| PyRuntimeError::new_err(format!("dup failed: {e}")))?;
-        let dup_out = nix::unistd::dup(&theirs)
+        let dup_out = nix::unistd::dup(theirs.as_raw_fd())
             .map_err(|e| PyRuntimeError::new_err(format!("dup failed: {e}")))?;
-        cmd.stdin(Stdio::from(dup_in));
-        cmd.stdout(Stdio::from(dup_out));
+        // SAFETY: dup() returned a fresh fd we own.
+        cmd.stdin(Stdio::from(unsafe { OwnedFd::from_raw_fd(dup_in) }));
+        cmd.stdout(Stdio::from(unsafe { OwnedFd::from_raw_fd(dup_out) }));
         // `theirs` is closed in the parent when this `OwnedFd` drops.
         drop(theirs);
         // Ensure CLOEXEC on the parent's retained half on platforms where
