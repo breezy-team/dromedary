@@ -1,8 +1,14 @@
 """Type stubs for the _transport_rs compiled Rust extension."""
 
 import os
+import sys
 from collections.abc import Callable, Iterable, Iterator
-from typing import IO, Literal, Self
+from typing import IO, Literal
+
+if sys.version_info >= (3, 11):
+    from typing import Self
+else:
+    from typing_extensions import Self
 
 def coalesce_offsets(
     offsets: list[tuple[int, int]],

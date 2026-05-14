@@ -31,9 +31,15 @@ and redirect handling. This module subclasses it and layers:
   ``dromedary/tests/per_transport.py``
 """
 
+import sys
 from io import BytesIO
-from typing import IO, TYPE_CHECKING, Literal, Self
+from typing import IO, TYPE_CHECKING, Literal
 from urllib.parse import urlencode
+
+if sys.version_info >= (3, 11):
+    from typing import Self
+else:
+    from typing_extensions import Self
 
 import dromedary as _mod_dromedary
 from dromedary._transport_rs import http as _http_rs

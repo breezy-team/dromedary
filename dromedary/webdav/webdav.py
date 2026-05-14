@@ -32,10 +32,16 @@ bits:
   ``dromedary/tests/per_transport.py``
 """
 
+import sys
 from io import BytesIO
-from typing import IO, TYPE_CHECKING, Literal, Self
+from typing import IO, TYPE_CHECKING, Literal
 
 from dromedary.http import urllib
+
+if sys.version_info >= (3, 11):
+    from typing import Self
+else:
+    from typing_extensions import Self
 
 if TYPE_CHECKING:
     from dromedary import AppendBasedFileStream

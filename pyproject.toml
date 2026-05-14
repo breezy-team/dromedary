@@ -24,6 +24,7 @@ classifiers = [
 requires-python = ">=3.10,<3.15"
 dependencies = [
     "catalogus",
+    "typing_extensions; python_version < '3.11'",
 ]
 dynamic = ["version"]
 
