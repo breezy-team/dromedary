@@ -1,0 +1,60 @@
+---
+name: Breezy test suite
+
+"on": [push, pull_request]
+
+env:
+  PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
+
+jobs:
+  breezy:
+    name: Run breezy 3.4 tests against this dromedary
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out dromedary
+        uses: actions/checkout@v6
+        with:
+          path: dromedary
+      - name: Check out breezy 3.4
+        uses: actions/checkout@v6
+        with:
+          repository: breezy-team/breezy
+          ref: '3.4'
+          path: breezy
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install apt dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y quilt
+      - name: Install build tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -U "setuptools>=60" setuptools-gettext \
+            setuptools-rust cython
+      - name: Install dromedary from this checkout
+        working-directory: dromedary
+        run: |
+          pip install ".[dev,testing,paramiko]"
+      - name: Install breezy and its test dependencies
+        working-directory: breezy
+        run: |
+          pip install \
+            ".[dev,paramiko,doc,launchpad,git,fastimport,workspace]" \
+            pyinotify
+      - name: Build breezy extensions
+        working-directory: breezy
+        run: |
+          make extensions PYTHON=python
+      - name: Run breezy test suite
+        working-directory: breezy
+        env:
+          PYTHONHASHSEED: random
+          BRZ_PLUGIN_PATH: -site:-user
+          PYTHONPATH: .
+        run: |
+          ./brz selftest
