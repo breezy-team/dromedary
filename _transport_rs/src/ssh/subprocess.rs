@@ -181,9 +181,9 @@ fn spawn(argv: &[String], host: &str, port: Option<u16>) -> PyResult<SSHSubproce
         // Dup twice: once for child stdin, once for stdout. The child
         // inherits them via `Command::stdin` / `stdout`; the parent keeps
         // its half (`mine`) with CLOEXEC set.
-        let dup_in = nix::unistd::dup(theirs.as_raw_fd())
+        let dup_in = nix::unistd::dup(&theirs)
             .map_err(|e| PyRuntimeError::new_err(format!("dup failed: {e}")))?;
-        let dup_out = nix::unistd::dup(theirs.as_raw_fd())
+        let dup_out = nix::unistd::dup(&theirs)
             .map_err(|e| PyRuntimeError::new_err(format!("dup failed: {e}")))?;
         // SAFETY: dup() returned a fresh fd we own.
         cmd.stdin(Stdio::from(unsafe { OwnedFd::from_raw_fd(dup_in) }));

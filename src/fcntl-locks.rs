@@ -5,7 +5,6 @@ use nix::fcntl::{fcntl, FcntlArg};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 fn open(filename: &Path, options: &OpenOptions) -> std::result::Result<(PathBuf, File), LockError> {
@@ -73,7 +72,7 @@ impl WriteLock {
             l_len: 0,
             l_pid: 0,
         };
-        match fcntl(f.as_raw_fd(), FcntlArg::F_SETLK(&flock)) {
+        match fcntl(&f, FcntlArg::F_SETLK(&flock)) {
             Ok(_) => Ok(WriteLock { filename, f }),
             Err(e) => {
                 if e == nix::errno::Errno::EAGAIN || e == nix::errno::Errno::EACCES {
@@ -84,7 +83,7 @@ impl WriteLock {
                         l_len: 0,
                         l_pid: 0,
                     };
-                    let _ = fcntl(f.as_raw_fd(), FcntlArg::F_SETLK(&flock));
+                    let _ = fcntl(&f, FcntlArg::F_SETLK(&flock));
                 }
                 // we should be more precise about whats a locking
                 // error and whats a random-other error
@@ -104,7 +103,7 @@ impl Lock for WriteLock {
             l_len: 0,
             l_pid: 0,
         };
-        let _ = fcntl(self.f.as_raw_fd(), FcntlArg::F_SETLK(&flock));
+        let _ = fcntl(&self.f, FcntlArg::F_SETLK(&flock));
         Ok(())
     }
 }
@@ -153,7 +152,7 @@ impl ReadLock {
             l_len: 0,
             l_pid: 0,
         };
-        match fcntl(f.as_raw_fd(), FcntlArg::F_SETLK(&flock)) {
+        match fcntl(&f, FcntlArg::F_SETLK(&flock)) {
             Ok(_) => {}
             Err(_e) => {
                 // we should be more precise about whats a locking
@@ -202,7 +201,7 @@ impl Lock for ReadLock {
             l_len: 0,
             l_pid: 0,
         };
-        let _ = fcntl(self.f.as_raw_fd(), FcntlArg::F_SETLK(&flock));
+        let _ = fcntl(&self.f, FcntlArg::F_SETLK(&flock));
 
         Ok(())
     }
@@ -265,7 +264,7 @@ impl TemporaryWriteLock {
             l_pid: 0,
         };
 
-        match fcntl(f.as_raw_fd(), FcntlArg::F_SETLK(&flock)) {
+        match fcntl(&f, FcntlArg::F_SETLK(&flock)) {
             Ok(_) => Ok(()),
             Err(_) => {
                 return Err((read_lock, LockError::Contention(filename)));
@@ -292,7 +291,7 @@ impl TemporaryWriteLock {
             l_len: 0,
             l_pid: 0,
         };
-        match fcntl(self.f.as_raw_fd(), FcntlArg::F_SETLK(&flock)) {
+        match fcntl(&self.f, FcntlArg::F_SETLK(&flock)) {
             Ok(_) => {}
             Err(e) => {
                 debug!(
