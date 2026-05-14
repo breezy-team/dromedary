@@ -32,6 +32,8 @@ import random
 import stat
 import sys
 import time
+from collections.abc import Callable, Generator, Iterator
+from typing import IO, Literal, NoReturn, Protocol, cast
 
 from dromedary import (
     ConnectedTransport,
@@ -52,6 +54,7 @@ from dromedary.errors import (
     TransportNotPossible,
 )
 from dromedary.osutils import fancy_rename, pumpfile
+from dromedary.ssh import SFTPClientProtocol
 
 logger = logging.getLogger("dromedary.sftp")
 debug_logger = logging.getLogger("dromedary.sftp")
@@ -59,6 +62,24 @@ debug_logger = logging.getLogger("dromedary.sftp")
 from ._transport_rs import sftp as _sftp_rs
 
 SFTPError = _sftp_rs.SFTPError
+
+
+class _BogusLock:
+    """No-op read lock for SFTP (shared reads don't need locking)."""
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+
+    def unlock(self) -> None:
+        pass
+
+    def __exit__(
+        self, exc_type: object, exc_val: object, exc_tb: object
+    ) -> Literal[False]:
+        return False
+
+    def __enter__(self) -> None:
+        pass
 
 
 class ParamikoNotPresent(DependencyNotPresent):
@@ -69,37 +90,24 @@ class ParamikoNotPresent(DependencyNotPresent):
 
     _fmt = "Unable to import paramiko (required for sftp support): %(error)s"
 
-    def __init__(self, error):
-        """Initialize with paramiko import error.
-
-        Args:
-            error: The import error that occurred when trying to import paramiko.
-        """
+    def __init__(self, error: "Exception | str") -> None:
+        """Initialize with the import error that prevented loading paramiko."""
         DependencyNotPresent.__init__(self, "paramiko", error)
 
 
-class WriteStream:
-    """Simple write stream wrapper for SFTP file objects."""
+class _SFTPFile(Protocol):
+    """Paramiko SFTPFile-like object: IO[bytes] extended with readv, stat, prefetch."""
 
-    def __init__(self, f):
-        """Initialize write stream.
-
-        Args:
-            f: SFTP file object to wrap.
-        """
-        self.f = f
-
-    def write(self, data):
-        """Write data to the stream.
-
-        Args:
-            data: Bytes to write.
-
-        Returns:
-            int: Number of bytes written.
-        """
-        self.f.write(data)
-        return len(data)
+    def read(self, size: int = -1) -> bytes: ...
+    def write(self, data: bytes) -> int: ...
+    def close(self) -> None: ...
+    def tell(self) -> int: ...
+    def seek(self, offset: int, whence: int = 0) -> int: ...
+    def __enter__(self) -> "IO[bytes]": ...
+    def __exit__(self, exc_type: object, exc_val: object, exc_tb: object) -> None: ...
+    def stat(self) -> "_sftp_rs.SFTPAttributes": ...
+    def prefetch(self, file_size: int) -> None: ...
+    def readv(self, chunks: list[tuple[int, int]]) -> Iterator[bytes]: ...
 
 
 class SFTPLock:
@@ -112,7 +120,7 @@ class SFTPLock:
 
     __slots__ = ["lock_file", "lock_path", "path", "transport"]
 
-    def __init__(self, path, transport):
+    def __init__(self, path: str, transport: "SFTPTransport") -> None:
         """Initialize SFTP lock.
 
         Args:
@@ -133,7 +141,7 @@ class SFTPLock:
         except FileExists as err:
             raise LockContention(self.path) from err
 
-    def unlock(self):
+    def unlock(self) -> None:
         """Release the lock by closing and deleting the lock file."""
         if not self.lock_file:
             return
@@ -149,7 +157,12 @@ class SFTPLock:
 class _SFTPReadvHelper:
     """A class to help with managing the state of a readv request."""
 
-    def __init__(self, original_offsets, relpath, _report_activity):
+    def __init__(
+        self,
+        original_offsets: list[tuple[int, int]],
+        relpath: str,
+        _report_activity: Callable[[int, Literal["read", "write"]], None],
+    ) -> None:
         """Create a new readv helper.
 
         :param original_offsets: The original requests given by the caller of
@@ -162,7 +175,7 @@ class _SFTPReadvHelper:
         self.relpath = relpath
         self._report_activity = _report_activity
 
-    def _get_requests(self):
+    def _get_requests(self) -> list[tuple[int, int]]:
         """Break up the offsets into individual requests over sftp.
 
         The SFTP spec only requires implementers to support 32kB requests. We
@@ -195,7 +208,9 @@ class _SFTPReadvHelper:
         )
         return requests
 
-    def request_and_yield_offsets(self, fp):
+    def request_and_yield_offsets(
+        self, fp: _SFTPFile
+    ) -> Generator[tuple[int, bytes], None, None]:
         """Request the data from the remote machine, yielding the results.
 
         :param fp: A Paramiko SFTPFile object that supports readv.
@@ -208,21 +223,22 @@ class _SFTPReadvHelper:
         # paramiko .readv() yields strings that are in the order of the requests
         # So we track the current request to know where the next data is
         # being returned from.
-        input_start = None
-        last_end = None
-        buffered_data = []
+        input_start: int | None = None
+        last_end: int | None = None
+        buffered_data: list[bytes] = []
         buffered_len = 0
 
         # This is used to buffer chunks which we couldn't process yet
         # It is (start, end, data) tuples.
-        data_chunks = []
+        data_chunks: list[tuple[int, bytes]] = []
         # Create an 'unlimited' data stream, so we stop based on requests,
         # rather than just because the data stream ended. This lets us detect
         # short readv.
         data_stream = itertools.chain(fp.readv(requests), itertools.repeat(None))
         for (start, length), data in zip(requests, data_stream, strict=False):
-            if data is None and cur_coalesced is not None:
-                raise errors.ShortReadvError(self.relpath, start, length, len(data))
+            if data is None and cur_coalesced is not None:  # type: ignore[name-defined]
+                raise errors.ShortReadvError(self.relpath, start, length, 0)
+            assert data is not None
             if len(data) != length:
                 raise errors.ShortReadvError(self.relpath, start, length, len(data))
             self._report_activity(length, "read")
@@ -243,6 +259,7 @@ class _SFTPReadvHelper:
                     # We haven't consumed the buffer so far, so put it into
                     # data_chunks, and continue.
                     buffered = b"".join(buffered_data)
+                    assert input_start is not None
                     data_chunks.append((input_start, buffered))
                 input_start = start
                 buffered_data = [data]
@@ -253,7 +270,7 @@ class _SFTPReadvHelper:
                 # into a single string. We also have the nice property that
                 # when there is only one string ''.join([x]) == x, so there is
                 # no data copying.
-                buffered = b"".join(buffered_data)
+                buffered = b"".join(buffered_data)  # type: ignore[arg-type]
                 # Clean out buffered data so that we keep memory
                 # consumption low
                 del buffered_data[:]
@@ -295,6 +312,7 @@ class _SFTPReadvHelper:
         if buffered_len:
             buffered = b"".join(buffered_data)
             del buffered_data[:]
+            assert input_start is not None
             data_chunks.append((input_start, buffered))
         if data_chunks:
             debug_logger.debug(
@@ -323,7 +341,7 @@ class _SFTPReadvHelper:
                 else:
                     # We are missing the page where the data should be found,
                     # something is wrong
-                    data = ""
+                    data = b""
                 if len(data) != cur_size:
                     raise AssertionError(
                         "We must have miscalulated."
@@ -337,7 +355,9 @@ class _SFTPReadvHelper:
                     return
 
 
-class SFTPTransport(ConnectedTransport):
+class SFTPTransport(
+    ConnectedTransport[SFTPClientProtocol, tuple[str | None, str | None]]
+):
     """Transport implementation for SFTP access."""
 
     # TODO: jam 20060717 Conceivably these could be configurable, either
@@ -350,10 +370,10 @@ class SFTPTransport(ConnectedTransport):
     # 8KiB had good performance for both local and remote network operations
     _bytes_to_read_before_seek = 8192
 
-    def _pump(self, infile, outfile):
-        return pumpfile(infile, WriteStream(outfile))
+    def _pump(self, infile: IO[bytes], outfile: IO[bytes]) -> int:
+        return pumpfile(infile, outfile)
 
-    def _remote_path(self, relpath):
+    def _remote_path(self, relpath: str) -> str:
         """Return the path to be passed along the sftp protocol for relpath.
 
         :param relpath: is a urlencoded string.
@@ -371,7 +391,9 @@ class SFTPTransport(ConnectedTransport):
             remote_path = ""
         return remote_path
 
-    def _create_connection(self, credentials=None):
+    def _create_connection(
+        self, credentials: str | None = None
+    ) -> tuple[SFTPClientProtocol, tuple[str | None, str | None]]:
         """Create a new connection with the provided credentials.
 
         :param credentials: The credentials needed to establish the connection.
@@ -398,13 +420,13 @@ class SFTPTransport(ConnectedTransport):
         )
         return connection, (user, password)
 
-    def disconnect(self):
+    def disconnect(self) -> None:
         """Disconnect the current SFTP connection."""
         connection = self._get_connection()
         if connection is not None:
             connection.close()
 
-    def _get_sftp(self):
+    def _get_sftp(self) -> SFTPClientProtocol:
         """Ensures that a connection is established."""
         connection = self._get_connection()
         if connection is None:
@@ -413,7 +435,7 @@ class SFTPTransport(ConnectedTransport):
             self._set_connection(connection, credentials)
         return connection
 
-    def has(self, relpath):
+    def has(self, relpath: str) -> bool:
         """Does the target location exist?"""
         try:
             self._get_sftp().stat(self._remote_path(relpath))
@@ -423,24 +445,24 @@ class SFTPTransport(ConnectedTransport):
         except NoSuchFile:
             return False
 
-    def get(self, relpath):
+    def get(self, relpath: str) -> IO[bytes]:
         """Get the file at the given relative path.
 
         :param relpath: The relative path to the file
         """
         try:
             path = self._remote_path(relpath)
-            f = self._get_sftp().file(path, mode="rb")
+            f = cast("_SFTPFile", self._get_sftp().file(path, mode="rb"))
             size = f.stat().st_size
-            if getattr(f, "prefetch", None) is not None:
+            if getattr(f, "prefetch", None) is not None and size is not None:
                 f.prefetch(size)
-            return f
+            return cast("IO[bytes]", f)
         except (OSError, SFTPError) as e:
             self._translate_io_exception(
                 e, path, ": error retrieving", failure_exc=ReadError
             )
 
-    def get_bytes(self, relpath):
+    def get_bytes(self, relpath: str) -> bytes:
         """Get the contents of a file as a byte string.
 
         Args:
@@ -455,26 +477,28 @@ class SFTPTransport(ConnectedTransport):
             self._report_activity(len(bytes), "read")
             return bytes
 
-    def _readv(self, relpath, offsets):
+    def _readv(
+        self, relpath: str, offsets: list[tuple[int, int]]
+    ) -> Iterator[tuple[int, bytes]]:
         """See Transport.readv()."""
         # We overload the default readv() because we want to use a file
         # that does not have prefetch enabled.
         # Also, if we have a new paramiko, it implements an async readv()
         if not offsets:
-            return
+            return iter([])
 
         try:
             path = self._remote_path(relpath)
-            fp = self._get_sftp().file(path, mode="rb")
+            fp = cast("_SFTPFile", self._get_sftp().file(path, mode="rb"))
             readv = getattr(fp, "readv", None)
             if readv:
                 return self._sftp_readv(fp, offsets, relpath)
             debug_logger.debug("seek and read %s offsets", len(offsets))
-            return self._seek_and_read(fp, offsets, relpath)
+            return self._seek_and_read(cast("IO[bytes]", fp), offsets, relpath)
         except (OSError, SFTPError) as e:
             self._translate_io_exception(e, path, ": error retrieving")
 
-    def recommended_page_size(self):
+    def recommended_page_size(self) -> int:
         """See Transport.recommended_page_size().
 
         For SFTP we suggest a large page size to reduce the overhead
@@ -482,7 +506,9 @@ class SFTPTransport(ConnectedTransport):
         """
         return 64 * 1024
 
-    def _sftp_readv(self, fp, offsets, relpath):
+    def _sftp_readv(
+        self, fp: _SFTPFile, offsets: list[tuple[int, int]], relpath: str
+    ) -> Generator[tuple[int, bytes], None, None]:
         """Use the readv() member of fp to do async readv.
 
         Then read them using paramiko.readv(). paramiko.readv()
@@ -492,7 +518,7 @@ class SFTPTransport(ConnectedTransport):
         helper = _SFTPReadvHelper(offsets, relpath, self._report_activity)
         return helper.request_and_yield_offsets(fp)
 
-    def put_file(self, relpath, f, mode=None):
+    def put_file(self, relpath: str, f: IO[bytes], mode: int | None = None) -> int:
         """Copy the file-like object into the location.
 
         :param relpath: Location to put the contents, relative to base.
@@ -502,7 +528,7 @@ class SFTPTransport(ConnectedTransport):
         final_path = self._remote_path(relpath)
         return self._put(final_path, f, mode=mode)
 
-    def _put(self, abspath, f, mode=None):
+    def _put(self, abspath: str, f: IO[bytes], mode: int | None = None) -> int:
         """Helper function so both put() and copy_abspaths can reuse the code."""
         tmp_abspath = "%s.tmp.%.9f.%d.%d" % (
             abspath,
@@ -556,15 +582,20 @@ class SFTPTransport(ConnectedTransport):
             raise
 
     def _put_non_atomic_helper(
-        self, relpath, writer, mode=None, create_parent_dir=False, dir_mode=None
-    ):
+        self,
+        relpath: str,
+        writer: Callable[[IO[bytes]], None],
+        mode: int | None = None,
+        create_parent_dir: bool = False,
+        dir_mode: int | None = None,
+    ) -> None:
         abspath = self._remote_path(relpath)
 
         # TODO: jam 20060816 paramiko doesn't publicly expose a way to
         #       set the file mode at create time. If it does, use it.
         #       But for now, we just chmod later anyway.
 
-        def _open_and_write_file():
+        def _open_and_write_file() -> None:
             """Try to open the target file, raise error on failure."""
             fout = None
             try:
@@ -599,8 +630,13 @@ class SFTPTransport(ConnectedTransport):
             _open_and_write_file()
 
     def put_file_non_atomic(
-        self, relpath, f, mode=None, create_parent_dir=False, dir_mode=None
-    ):
+        self,
+        relpath: str,
+        f: IO[bytes],
+        mode: int | None = None,
+        create_parent_dir: bool = False,
+        dir_mode: int | None = None,
+    ) -> None:
         """Copy the file-like object into the target location.
 
         This function is not strictly safe to use. It is only meant to
@@ -617,7 +653,7 @@ class SFTPTransport(ConnectedTransport):
                         create it, and then try again.
         """
 
-        def writer(fout):
+        def writer(fout: IO[bytes]) -> None:
             self._pump(f, fout)
 
         self._put_non_atomic_helper(
@@ -632,10 +668,10 @@ class SFTPTransport(ConnectedTransport):
         self,
         relpath: str,
         raw_bytes: bytes,
-        mode=None,
-        create_parent_dir=False,
-        dir_mode=None,
-    ):
+        mode: int | None = None,
+        create_parent_dir: bool = False,
+        dir_mode: int | None = None,
+    ) -> None:
         """Write bytes to a file non-atomically.
 
         This is not safe if the target already exists as it will truncate it.
@@ -653,7 +689,7 @@ class SFTPTransport(ConnectedTransport):
         if not isinstance(raw_bytes, bytes):
             raise TypeError(f"raw_bytes must be a plain string, not {type(raw_bytes)}")
 
-        def writer(fout):
+        def writer(fout: IO[bytes]) -> None:
             fout.write(raw_bytes)
 
         self._put_non_atomic_helper(
@@ -664,7 +700,7 @@ class SFTPTransport(ConnectedTransport):
             dir_mode=dir_mode,
         )
 
-    def iter_files_recursive(self):
+    def iter_files_recursive(self) -> Iterator[str]:
         """Walk the relative paths of all files in this transport."""
         # progress is handled by list_dir
         queue = list(self.list_dir("."))
@@ -677,7 +713,7 @@ class SFTPTransport(ConnectedTransport):
             else:
                 yield relpath
 
-    def _mkdir(self, abspath, mode=None):
+    def _mkdir(self, abspath: str, mode: int | None = None) -> None:
         local_mode = 511 if mode is None else mode
         try:
             self._report_activity(len(abspath), "write")
@@ -690,6 +726,7 @@ class SFTPTransport(ConnectedTransport):
                 # the sgid bit is set, report a warning to the user
                 # with the umask fix.
                 stat = self._get_sftp().lstat(abspath)
+                assert stat.st_mode is not None
                 mode = mode & 0o777  # can't set special bits anyway
                 if mode != stat.st_mode & 0o777:
                     if stat.st_mode & 0o6000:
@@ -705,11 +742,13 @@ class SFTPTransport(ConnectedTransport):
                 e, abspath, ": unable to mkdir", failure_exc=FileExists
             )
 
-    def mkdir(self, relpath, mode=None):
+    def mkdir(self, relpath: str, mode: int | None = None) -> None:
         """Create a directory at the given path."""
         self._mkdir(self._remote_path(relpath), mode=mode)
 
-    def open_write_stream(self, relpath, mode=None):
+    def open_write_stream(
+        self, relpath: str, mode: int | None = None
+    ) -> FileFileStream:
         """See Transport.open_write_stream."""
         # initialise the file to zero-length
         # this is three round trips, but we don't use this
@@ -721,15 +760,22 @@ class SFTPTransport(ConnectedTransport):
         # TODO: jam 20060816 paramiko doesn't publicly expose a way to
         #       set the file mode at create time. If it does, use it.
         #       But for now, we just chmod later anyway.
-        handle = None
+        handle: IO[bytes] | None = None
         try:
             handle = self._get_sftp().file(abspath, mode="wb")
         except (SFTPError, OSError) as e:
             self._translate_io_exception(e, abspath, ": unable to open")
+        assert handle is not None
         _file_streams[self.abspath(relpath)] = handle
         return FileFileStream(self, relpath, handle)
 
-    def _translate_io_exception(self, e, path, more_info="", failure_exc=PathError):
+    def _translate_io_exception(
+        self,
+        e: "OSError | SFTPError",
+        path: str,
+        more_info: str = "",
+        failure_exc: type[PathError] = PathError,
+    ) -> NoReturn:
         """Translate a paramiko or IOError into a friendlier exception.
 
         :param e: The original exception
@@ -743,7 +789,7 @@ class SFTPTransport(ConnectedTransport):
                            to raise in these cases.
         """
         # paramiko seems to generate detailless errors.
-        self._translate_error(e, path, raise_generic=False)
+        self._translate_error(e, path, raise_generic=False)  # type: ignore[arg-type]
         if getattr(e, "args", None) is not None:
             if e.args == ("No such file or directory",) or e.args == ("No such file",):
                 raise NoSuchFile(path, str(e) + more_info)
@@ -765,11 +811,12 @@ class SFTPTransport(ConnectedTransport):
             if e.args == ("Operation unsupported",):
                 raise TransportNotPossible()
             logger.debug("Raising exception with args %s", e.args)
-        if getattr(e, "errno", None) is not None:
-            logger.debug("Raising exception with errno %s", e.errno)
+        errno_val = getattr(e, "errno", None)
+        if errno_val is not None:
+            logger.debug("Raising exception with errno %s", errno_val)
         raise e
 
-    def append_file(self, relpath, f, mode=None):
+    def append_file(self, relpath: str, f: IO[bytes], mode: int | None = None) -> int:
         """Append the text in the file-like object into the final
         location.
         """
@@ -784,7 +831,7 @@ class SFTPTransport(ConnectedTransport):
         except (OSError, SFTPError) as e:
             self._translate_io_exception(e, relpath, ": unable to append")
 
-    def rename(self, rel_from, rel_to):
+    def rename(self, rel_from: str, rel_to: str) -> None:
         """Rename without special overwriting."""
         try:
             self._get_sftp().rename(
@@ -795,7 +842,7 @@ class SFTPTransport(ConnectedTransport):
                 e, rel_from, f": unable to rename to {rel_to!r}"
             )
 
-    def _rename_and_overwrite(self, abs_from, abs_to):
+    def _rename_and_overwrite(self, abs_from: str, abs_to: str) -> None:
         """Do a fancy rename on the remote server.
 
         Using the implementation provided by osutils.
@@ -810,13 +857,13 @@ class SFTPTransport(ConnectedTransport):
                 e, abs_from, f": unable to rename to {abs_to!r}"
             )
 
-    def move(self, rel_from, rel_to):
+    def move(self, rel_from: str, rel_to: str) -> None:
         """Move the item at rel_from to the location at rel_to."""
         path_from = self._remote_path(rel_from)
         path_to = self._remote_path(rel_to)
         self._rename_and_overwrite(path_from, path_to)
 
-    def delete(self, relpath):
+    def delete(self, relpath: str) -> None:
         """Delete the item at relpath."""
         path = self._remote_path(relpath)
         try:
@@ -824,16 +871,16 @@ class SFTPTransport(ConnectedTransport):
         except (OSError, SFTPError) as e:
             self._translate_io_exception(e, path, ": unable to delete")
 
-    def external_url(self):
+    def external_url(self) -> str:
         """See dromedary.Transport.external_url."""
         # the external path for SFTP is the base
         return self.base
 
-    def listable(self):
+    def listable(self) -> bool:
         """Return True if this store supports listing."""
         return True
 
-    def list_dir(self, relpath):
+    def list_dir(self, relpath: str) -> list[str]:
         """Return a list of all files at the given location."""
         # does anything actually use this?
         # -- Unknown
@@ -847,7 +894,7 @@ class SFTPTransport(ConnectedTransport):
             self._translate_io_exception(e, path, ": failed to list_dir")
         return [urlutils.escape(entry) for entry in entries]
 
-    def rmdir(self, relpath):
+    def rmdir(self, relpath: str) -> None:
         """See Transport.rmdir."""
         path = self._remote_path(relpath)
         try:
@@ -855,15 +902,15 @@ class SFTPTransport(ConnectedTransport):
         except (OSError, SFTPError) as e:
             self._translate_io_exception(e, path, ": failed to rmdir")
 
-    def stat(self, relpath):
+    def stat(self, relpath: str) -> os.stat_result:
         """Return the stat information for a file."""
         path = self._remote_path(relpath)
         try:
-            return self._get_sftp().lstat(path)
+            return cast("os.stat_result", self._get_sftp().lstat(path))
         except (OSError, SFTPError) as e:
             self._translate_io_exception(e, path, ": unable to stat")
 
-    def readlink(self, relpath):
+    def readlink(self, relpath: str) -> str:
         """See Transport.readlink."""
         path = self._remote_path(relpath)
         try:
@@ -871,7 +918,7 @@ class SFTPTransport(ConnectedTransport):
         except (OSError, SFTPError) as e:
             self._translate_io_exception(e, path, ": unable to readlink")
 
-    def symlink(self, source, link_name):
+    def symlink(self, source: str, link_name: str) -> None:
         """See Transport.symlink."""
         try:
             conn = self._get_sftp()
@@ -881,28 +928,14 @@ class SFTPTransport(ConnectedTransport):
                 e, link_name, f": unable to create symlink to {source!r}"
             )
 
-    def lock_read(self, relpath):
+    def lock_read(self, relpath: str) -> _BogusLock:
         """Lock the given file for shared (read) access.
         :return: A lock object, which has an unlock() member function.
         """
-
         # FIXME: there should be something clever i can do here...
-        class BogusLock:
-            def __init__(self, path):
-                self.path = path
+        return _BogusLock(relpath)
 
-            def unlock(self):
-                pass
-
-            def __exit__(self, exc_type, exc_val, exc_tb):
-                return False
-
-            def __enter__(self):
-                pass
-
-        return BogusLock(relpath)
-
-    def lock_write(self, relpath):
+    def lock_write(self, relpath: str) -> SFTPLock:
         """Lock the given file for exclusive (write) access.
         WARNING: many transports do not support this, so trying avoid using it.
 
@@ -914,7 +947,7 @@ class SFTPTransport(ConnectedTransport):
         # that we have taken the lock.
         return SFTPLock(relpath, self)
 
-    def _sftp_open_exclusive(self, abspath, mode=None):
+    def _sftp_open_exclusive(self, abspath: str, mode: int | None = None) -> IO[bytes]:
         """Open a remote path exclusively.
 
         SFTP supports O_EXCL (SFTP_FLAG_EXCL), which fails if
@@ -946,11 +979,11 @@ class SFTPTransport(ConnectedTransport):
                 e, abspath, ": unable to open", failure_exc=FileExists
             )
 
-    def _can_roundtrip_unix_modebits(self):
+    def _can_roundtrip_unix_modebits(self) -> bool:
         return sys.platform != "win32"
 
 
-def get_test_permutations():
+def get_test_permutations() -> list[tuple[type, type]]:
     """Return the permutations to be used in testing."""
     import importlib.util
 

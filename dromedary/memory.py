@@ -34,26 +34,26 @@ class MemoryTransport(_RustMemoryTransport):
 class MemoryServer(Server):
     """Server for the MemoryTransport for testing with."""
 
-    def start_server(self):
+    def start_server(self) -> None:
         """Start the memory server by initializing storage and registering transport."""
         self._store = MemoryStoreHandle()
         self._scheme = f"memory+{id(self)}:///"
 
-        def memory_factory(url):
+        def memory_factory(url: str) -> MemoryTransport:
             return MemoryTransport(url, _shared_store=self._store)
 
         self._memory_factory = memory_factory
         register_transport(self._scheme, self._memory_factory)
 
-    def stop_server(self):
+    def stop_server(self) -> None:
         """Stop the server and unregister the transport."""
         unregister_transport(self._scheme, self._memory_factory)
 
-    def get_url(self):
+    def get_url(self) -> str:
         """See dromedary.Server.get_url."""
         return self._scheme
 
-    def get_bogus_url(self):
+    def get_bogus_url(self) -> str:
         """Get a URL for a non-existent location.
 
         Raises:
@@ -62,7 +62,7 @@ class MemoryServer(Server):
         raise NotImplementedError
 
 
-def get_test_permutations():
+def get_test_permutations() -> list[tuple[type, type]]:
     """Return the permutations to be used in testing."""
     return [
         (MemoryTransport, MemoryServer),

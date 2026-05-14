@@ -27,21 +27,28 @@ import getpass
 import logging
 import os
 from binascii import hexlify
+from typing import cast
 
 import paramiko
 
 from dromedary import _bedding, _config, _ui
 from dromedary.errors import TransportError
 from dromedary.osutils import pathjoin
-from dromedary.ssh import SSHConnection, SSHVendor
+from dromedary.ssh import SFTPClientProtocol, SSHConnection, SSHVendor
 
 logger = logging.getLogger("dromedary.ssh.paramiko")
 
-SYSTEM_HOSTKEYS: dict[str, dict[str, str]] = {}
-BRZ_HOSTKEYS: dict[str, dict[str, str]] = {}
+SYSTEM_HOSTKEYS: paramiko.HostKeys = paramiko.HostKeys()
+BRZ_HOSTKEYS: paramiko.HostKeys = paramiko.HostKeys()
 
 
-def _paramiko_auth(username, password, host, port, paramiko_transport):
+def _paramiko_auth(
+    username: str | None,
+    password: str | None,
+    host: str,
+    port: int | None,
+    paramiko_transport: paramiko.Transport,
+) -> None:
     """Authenticate to an SSH server using paramiko.
 
     Attempts authentication in the following order:
@@ -141,7 +148,12 @@ def _paramiko_auth(username, password, host, port, paramiko_transport):
         )
 
 
-def _try_pkey_auth(paramiko_transport, pkey_class, username, filename):
+def _try_pkey_auth(
+    paramiko_transport: paramiko.Transport,
+    pkey_class: "type[paramiko.PKey]",
+    username: str,
+    filename: str,
+) -> bool:
     """Attempt public key authentication with a private key file.
 
     Args:
@@ -179,16 +191,11 @@ def _try_pkey_auth(paramiko_transport, pkey_class, username, filename):
     return False
 
 
-def _ssh_host_keys_config_dir():
-    """Get the path to the SSH host keys configuration directory.
-
-    Returns:
-        str: Path to the directory where SSH host keys are stored
-    """
+def _ssh_host_keys_config_dir() -> str:
     return pathjoin(_bedding.config_dir(), "ssh_host_keys")
 
 
-def load_host_keys():
+def load_host_keys() -> None:
     """Load system host keys (probably doesn't work on windows) and any
     "discovered" keys from previous sessions.
     """
@@ -207,7 +214,7 @@ def load_host_keys():
         save_host_keys()
 
 
-def save_host_keys():
+def save_host_keys() -> None:
     """Save "discovered" host keys in $(config)/ssh_host_keys/."""
     global SYSTEM_HOSTKEYS, BRZ_HOSTKEYS
     bzr_hostkey_path = _ssh_host_keys_config_dir()
@@ -226,7 +233,7 @@ def save_host_keys():
 class ParamikoVendor(SSHVendor):
     """Vendor that uses paramiko."""
 
-    def _hexify(self, s):
+    def _hexify(self, s: bytes) -> str:
         """Convert a byte string to uppercase hexadecimal representation.
 
         Args:
@@ -235,9 +242,11 @@ class ParamikoVendor(SSHVendor):
         Returns:
             str: Uppercase hexadecimal representation of the input
         """
-        return hexlify(s).upper()
+        return hexlify(s).upper().decode("ascii")
 
-    def _connect(self, username, password, host, port):
+    def _connect(
+        self, username: str | None, password: str | None, host: str, port: int | None
+    ) -> paramiko.Transport:
         """Establish a low-level SSH connection using paramiko.
 
         Handles host key verification by checking against system known_hosts
@@ -291,7 +300,7 @@ class ParamikoVendor(SSHVendor):
             if add is not None:  # paramiko >= 1.X.X
                 BRZ_HOSTKEYS.add(host, keytype, server_key)
             else:
-                BRZ_HOSTKEYS.setdefault(host, {})[keytype] = server_key
+                BRZ_HOSTKEYS.setdefault(host, {})[keytype] = server_key  # type: ignore[arg-type]
             our_server_key = server_key
             our_server_key_hex = self._hexify(our_server_key.get_fingerprint())
             save_host_keys()
@@ -306,7 +315,9 @@ class ParamikoVendor(SSHVendor):
         _paramiko_auth(username, password, host, port, t)
         return t
 
-    def connect_sftp(self, username, password, host, port):
+    def connect_sftp(
+        self, username: str, password: str | None, host: str, port: int | None
+    ) -> SFTPClientProtocol:
         """Connect to an SFTP server using paramiko.
 
         Args:
@@ -323,13 +334,22 @@ class ParamikoVendor(SSHVendor):
         """
         t = self._connect(username, password, host, port)
         try:
-            return t.open_sftp_client()
+            sftp = t.open_sftp_client()
+            assert sftp is not None
+            return cast("SFTPClientProtocol", sftp)
         except paramiko.SSHException as e:
             self._raise_connection_error(
                 host, port=port, orig_error=e, msg="Unable to start sftp client"
             )
 
-    def connect_ssh(self, username, password, host, port, command):
+    def connect_ssh(
+        self,
+        username: str,
+        password: str | None,
+        host: str,
+        port: int | None,
+        command: list[str],
+    ) -> "_ParamikoSSHConnection":
         """Connect to SSH server and execute a command.
 
         Args:
@@ -360,15 +380,10 @@ class ParamikoVendor(SSHVendor):
 class _ParamikoSSHConnection(SSHConnection):
     """An SSH connection via paramiko."""
 
-    def __init__(self, channel):
-        """Initialize a paramiko SSH connection wrapper.
-
-        Args:
-            channel: Paramiko Channel object for the SSH session
-        """
+    def __init__(self, channel: paramiko.Channel) -> None:
         self.channel = channel
 
-    def get_sock_or_pipes(self):
+    def get_sock_or_pipes(self) -> tuple[str, paramiko.Channel]:
         """Get socket or pipe information for the SSH connection.
 
         Returns:
@@ -377,13 +392,8 @@ class _ParamikoSSHConnection(SSHConnection):
         """
         return ("socket", self.channel)
 
-    def close(self):
-        """Close the SSH connection channel.
-
-        Returns:
-            The result of closing the paramiko channel
-        """
-        return self.channel.close()
+    def close(self) -> None:
+        self.channel.close()
 
 
 paramiko_vendor = ParamikoVendor()

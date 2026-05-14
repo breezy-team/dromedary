@@ -21,7 +21,7 @@ from dromedary._transport_rs.brokenrename import BrokenRenameTransportDecorator
 __all__ = ["BrokenRenameTransportDecorator", "get_test_permutations"]
 
 
-def get_test_permutations():
+def get_test_permutations() -> list[tuple[type, type]]:
     """Return the permutations to be used in testing."""
     from dromedary.tests import test_server
 

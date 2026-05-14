@@ -139,8 +139,9 @@ class TestTransport(tests.TestCase):
     def test_local_abspath_non_local_transport(self):
         # the base implementation should throw
         t = memory.MemoryTransport()
-        e = self.assertRaises(errors.NotLocalUrl, t.local_abspath, "t")
-        self.assertEqual("memory:///t is not a local path.", str(e))
+        with self.assertRaises(errors.NotLocalUrl) as cm:
+            t.local_abspath("t")
+        self.assertEqual("memory:///t is not a local path.", str(cm.exception))
 
 
 class TestCoalesceOffsets(tests.TestCase):

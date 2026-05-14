@@ -21,7 +21,7 @@ from dromedary._transport_rs.readonly import ReadonlyTransportDecorator
 __all__ = ["ReadonlyTransportDecorator", "get_test_permutations"]
 
 
-def get_test_permutations():
+def get_test_permutations() -> list[tuple[type, type]]:
     """Return the permutations to be used in testing."""
     from dromedary.tests import test_server
 

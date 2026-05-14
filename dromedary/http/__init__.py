@@ -30,6 +30,8 @@ Rust state.
 
 DEBUG = 0
 
+from collections.abc import Callable
+
 from dromedary.version import version_string as dromedary_version
 
 from .._transport_rs import http as _http_rs
@@ -39,7 +41,7 @@ from .._transport_rs import http as _http_rs
 _http_rs.set_user_agent(f"Dromedary/{dromedary_version}")
 
 
-def set_user_agent(prefix):
+def set_user_agent(prefix: str) -> None:
     """Set the User-Agent prefix for HTTP requests.
 
     Args:
@@ -48,12 +50,14 @@ def set_user_agent(prefix):
     _http_rs.set_user_agent(prefix)
 
 
-def default_user_agent():
+def default_user_agent() -> str:
     """Get the default User-Agent string for HTTP requests."""
     return _http_rs.default_user_agent()
 
 
-def set_credential_lookup(func):
+def set_credential_lookup(
+    func: Callable[..., tuple[str | None, str | None]] | None,
+) -> None:
     """Set the function used to look up HTTP credentials.
 
     Args:
@@ -64,12 +68,12 @@ def set_credential_lookup(func):
     _http_rs.set_credential_lookup(func)
 
 
-def get_credential_lookup():
+def get_credential_lookup() -> Callable[..., tuple[str | None, str | None]] | None:
     """Return the currently-registered credential-lookup callable, or None."""
     return _http_rs.get_credential_lookup()
 
 
-def set_negotiate_provider(func):
+def set_negotiate_provider(func: Callable[[str], str | None] | None) -> None:
     """Register a Negotiate / Kerberos initial-token provider.
 
     The callable is invoked as ``func(host)`` and should return a
@@ -81,12 +85,14 @@ def set_negotiate_provider(func):
     _http_rs.set_negotiate_provider(func)
 
 
-def get_negotiate_provider():
+def get_negotiate_provider() -> Callable[[str], str | None] | None:
     """Return the currently-registered Negotiate provider, or None."""
     return _http_rs.get_negotiate_provider()
 
 
-def set_token_provider(func):
+def set_token_provider(
+    func: Callable[..., tuple[str | None, str | None]] | None,
+) -> None:
     """Register a preemptive bearer-token provider.
 
     The callable is invoked as
@@ -101,12 +107,12 @@ def set_token_provider(func):
     _http_rs.set_token_provider(func)
 
 
-def get_token_provider():
+def get_token_provider() -> Callable[..., tuple[str | None, str | None]] | None:
     """Return the currently-registered token provider, or None."""
     return _http_rs.get_token_provider()
 
 
-def set_auth_header_trace(func):
+def set_auth_header_trace(func: Callable[[str], None] | None) -> None:
     """Register a callback invoked when auth credentials are sent.
 
     The Rust HTTP client calls ``func(header_name)`` just before
@@ -121,7 +127,7 @@ def set_auth_header_trace(func):
     _http_rs.set_auth_header_trace(func)
 
 
-def _default_kerberos_provider(host):
+def _default_kerberos_provider(host: str) -> str | None:
     """Default Negotiate provider using the Python `kerberos` module.
 
     Matches the behaviour of breezy's old NegotiateAuthHandler: if
@@ -148,7 +154,13 @@ def _default_kerberos_provider(host):
 _http_rs.set_negotiate_provider(_default_kerberos_provider)
 
 
-def get_credentials(protocol, host, port=None, path=None, realm=None):
+def get_credentials(
+    protocol: str,
+    host: str,
+    port: int | None = None,
+    path: str | None = None,
+    realm: str | None = None,
+) -> tuple[str | None, str | None]:
     """Look up stored credentials for an HTTP connection."""
     return _http_rs.get_credentials(protocol, host, port=port, path=path, realm=realm)
 
@@ -158,7 +170,7 @@ def get_credentials(protocol, host, port=None, path=None, realm=None):
 _ssl_ca_certs_known_locations = list(_http_rs.SSL_CA_CERTS_KNOWN_LOCATIONS)
 
 
-def default_ca_certs():
+def default_ca_certs() -> str:
     """Get the default path to CA certificates for SSL verification.
 
     On Windows and macOS this returns the path to a PEM tempfile
@@ -169,7 +181,7 @@ def default_ca_certs():
     return _http_rs.default_ca_certs()
 
 
-def default_cert_reqs():
+def default_cert_reqs() -> int:
     """Get the default certificate verification requirement.
 
     Returns an integer matching ``ssl.CERT_NONE`` (0) or

@@ -22,7 +22,7 @@ PLink}SubprocessVendor`. These are the implementations registered for the
 equivalents have been removed).
 """
 
-from dromedary.ssh import SFTPClient, SSHConnection, SSHVendor
+from dromedary.ssh import SFTPClient, SFTPClientProtocol, SSHConnection, SSHVendor
 
 from .._transport_rs import ssh as _ssh_rs
 
@@ -30,35 +30,47 @@ from .._transport_rs import ssh as _ssh_rs
 class _RustSubprocessSSHConnection(SSHConnection):
     """SSHConnection wrapping a Rust `SSHSubprocessConnection`."""
 
-    def __init__(self, inner):
+    def __init__(self, inner: _ssh_rs.SSHSubprocessConnection) -> None:
         self._inner = inner
 
-    def close(self):
+    def close(self) -> None:
         return self._inner.close()
 
 
 class _RustSubprocessVendor(SSHVendor):
     """Shared adapter logic for the three Rust subprocess vendors."""
 
-    def __init__(self, rust_vendor):
+    def __init__(
+        self,
+        rust_vendor: "_ssh_rs.OpenSSHSubprocessVendor | _ssh_rs.LSHSubprocessVendor | _ssh_rs.PLinkSubprocessVendor",
+    ) -> None:
         self._vendor = rust_vendor
 
     @property
-    def executable_path(self):
+    def executable_path(self) -> str | None:
         return self._vendor.executable_path
 
     @executable_path.setter
-    def executable_path(self, value):
+    def executable_path(self, value: str | None) -> None:
         # `SSHVendorManager._get_vendor_from_path` assigns this when
         # `BRZ_SSH=/path/to/ssh` is set, so the override has to reach the
         # Rust vendor's argv builder.
         self._vendor.executable_path = value
 
-    def connect_sftp(self, username, password, host, port):
+    def connect_sftp(
+        self, username: str, password: str | None, host: str, port: int | None
+    ) -> SFTPClientProtocol:
         fd = self._vendor.spawn_sftp(username, host, port)
         return SFTPClient(fd)
 
-    def connect_ssh(self, username, password, host, port, command):
+    def connect_ssh(
+        self,
+        username: str,
+        password: str | None,
+        host: str,
+        port: int | None,
+        command: list[str],
+    ) -> _RustSubprocessSSHConnection:
         inner = self._vendor.connect_ssh(username, host, command, port)
         return _RustSubprocessSSHConnection(inner)
 

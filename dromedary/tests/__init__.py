@@ -25,7 +25,7 @@ import unittest
 
 
 class TestNotApplicable(
-    unittest.TestCase.skipException
+    unittest.TestCase.skipException  # type: ignore[misc]
     if hasattr(unittest.TestCase, "skipException")
     else unittest.SkipTest
 ):
@@ -103,16 +103,6 @@ class _AssertHelpersMixin:
             if msg is None:
                 msg = f"{s!r} does not end with {suffix!r}"
             raise AssertionError(msg)
-
-    def assertRaises(self, exc_type, callable=None, *args, **kwargs):
-        if callable is not None:
-            try:
-                callable(*args, **kwargs)
-            except exc_type as e:
-                return e
-            else:
-                raise AssertionError(f"{exc_type.__name__} not raised")
-        return super().assertRaises(exc_type)
 
     def assertLength(self, expected, container):
         if len(container) != expected:

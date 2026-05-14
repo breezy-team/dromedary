@@ -31,10 +31,10 @@ import errno
 import logging
 import os
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator
 from io import BytesIO
 from stat import S_ISDIR
-from typing import Any, TypeVar
+from typing import IO, Any, Generic, Literal, Protocol, TypeVar, Union
 
 from catalogus import registry
 
@@ -43,23 +43,44 @@ from . import _hooks, _ui, errors, osutils, urlutils
 # Set up logging
 logger = logging.getLogger("dromedary")
 
-# Import the Rust extension
-try:
-    from . import _transport_rs
-except ImportError:
-    _transport_rs = None
+T = TypeVar("T")
+ConnT = TypeVar("ConnT")
+CredT = TypeVar("CredT")
+
+
+class ProgressBar(Protocol):
+    """Minimal interface for a progress bar."""
+
+    def update(self, msg: str, current: int, total: int) -> None:
+        """Update progress display."""
+        ...
+
+
+class Lock(Protocol):
+    """Minimal interface for a transport lock."""
+
+    def unlock(self) -> None:
+        """Release the lock."""
+        ...
+
+
+from . import _transport_rs
+
+# TODO: unify into a single base class once _transport_rs.Transport replaces
+# the pure-Python Transport.
+AnyTransport = Union["Transport", "_transport_rs.Transport"]
 
 # a dictionary of open file streams. Keys are absolute paths, values are
 # transport defined.
 _file_streams: dict[str, Any] = {}
 
 
-def _get_protocol_handlers():
+def _get_protocol_handlers() -> "TransportListRegistry":
     """Return a dictionary of {urlprefix: [factory]}."""
     return transport_list_registry
 
 
-def _set_protocol_handlers(new_handlers):
+def _set_protocol_handlers(new_handlers: "TransportListRegistry") -> None:
     """Replace the current protocol handlers dictionary.
 
     WARNING this will remove all build in protocols. Use with care.
@@ -68,12 +89,12 @@ def _set_protocol_handlers(new_handlers):
     transport_list_registry = new_handlers
 
 
-def _clear_protocol_handlers():
+def _clear_protocol_handlers() -> None:
     global transport_list_registry
     transport_list_registry = TransportListRegistry()
 
 
-def _get_transport_modules():
+def _get_transport_modules() -> list[str]:
     """Return a list of the modules providing transports."""
     modules = set()
     for _prefix, factory_list in transport_list_registry.items():
@@ -102,7 +123,9 @@ class TransportListRegistry(registry.Registry):
     protocol which was supported by both the urllib and pycurl providers)
     """
 
-    def register_transport_provider(self, key, obj):
+    def register_transport_provider(
+        self, key: str, obj: type | Callable[[str], "Transport"]
+    ) -> None:
         """Register a transport provider object for a protocol.
 
         Args:
@@ -111,7 +134,9 @@ class TransportListRegistry(registry.Registry):
         """
         self.get(key).insert(0, registry._ObjectGetter(obj))
 
-    def register_lazy_transport_provider(self, key, module_name, member_name):
+    def register_lazy_transport_provider(
+        self, key: str, module_name: str, member_name: str
+    ) -> None:
         """Register a transport provider with lazy loading.
 
         Args:
@@ -121,7 +146,7 @@ class TransportListRegistry(registry.Registry):
         """
         self.get(key).insert(0, registry._LazyObjectGetter(module_name, member_name))
 
-    def register_transport(self, key, help=None):
+    def register_transport(self, key: str, help: str | None = None) -> None:
         """Register a transport protocol.
 
         Args:
@@ -134,7 +159,12 @@ class TransportListRegistry(registry.Registry):
 transport_list_registry = TransportListRegistry()
 
 
-def register_transport_proto(prefix, help=None, info=None, register_netloc=False):
+def register_transport_proto(
+    prefix: str,
+    help: str | None = None,
+    info: str | None = None,
+    register_netloc: bool = False,
+) -> None:
     """Register a transport protocol prefix.
 
     Args:
@@ -150,7 +180,7 @@ def register_transport_proto(prefix, help=None, info=None, register_netloc=False
         register_urlparse_netloc_protocol(prefix[:-3])
 
 
-def register_lazy_transport(prefix, module, classname):
+def register_lazy_transport(prefix: str, module: str, classname: str) -> None:
     """Register a transport with lazy class loading.
 
     Args:
@@ -163,7 +193,7 @@ def register_lazy_transport(prefix, module, classname):
     transport_list_registry.register_lazy_transport_provider(prefix, module, classname)
 
 
-def register_transport(prefix, klass):
+def register_transport(prefix: str, klass: type | Callable[[str], "Transport"]) -> None:
     """Register a transport class for a protocol prefix.
 
     Args:
@@ -175,13 +205,13 @@ def register_transport(prefix, klass):
     transport_list_registry.register_transport_provider(prefix, klass)
 
 
-def register_urlparse_netloc_protocol(protocol):
+def register_urlparse_netloc_protocol(protocol: str) -> None:
     """Ensure that protocol is setup to be used with urlparse netloc parsing."""
     if protocol not in urlutils.urlparse.uses_netloc:
         urlutils.urlparse.uses_netloc.append(protocol)
 
 
-def _unregister_urlparse_netloc_protocol(protocol):
+def _unregister_urlparse_netloc_protocol(protocol: str) -> None:
     """Remove protocol from urlparse netloc parsing.
 
     Except for tests, you should never use that function. Using it with 'http',
@@ -191,7 +221,9 @@ def _unregister_urlparse_netloc_protocol(protocol):
         urlutils.urlparse.uses_netloc.remove(protocol)
 
 
-def unregister_transport(scheme, factory):
+def unregister_transport(
+    scheme: str, factory: type | Callable[[str], "Transport"]
+) -> None:
     """Unregister a transport."""
     l = transport_list_registry.get(scheme)
     for i in l:
@@ -208,26 +240,28 @@ class _CoalescedOffset:
 
     __slots__ = ["length", "ranges", "start"]
 
-    def __init__(self, start, length, ranges):
+    def __init__(self, start: int, length: int, ranges: list[tuple[int, int]]) -> None:
         self.start = start
         self.length = length
         self.ranges = ranges
 
-    def __lt__(self, other):
+    def __lt__(self, other: "_CoalescedOffset") -> bool:
         return (self.start, self.length, self.ranges) < (
             other.start,
             other.length,
             other.ranges,
         )
 
-    def __eq__(self, other):
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, _CoalescedOffset):
+            return NotImplemented  # type: ignore[return-value]
         return (self.start, self.length, self.ranges) == (
             other.start,
             other.length,
             other.ranges,
         )
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return "{}({!r}, {!r}, {!r})".format(
             self.__class__.__name__, self.start, self.length, self.ranges
         )
@@ -239,7 +273,7 @@ class LateReadError:
     When read() is called, errors.ReadError is raised.
     """
 
-    def __init__(self, path):
+    def __init__(self, path: str) -> None:
         """Initialize LateReadError.
 
         Args:
@@ -247,14 +281,16 @@ class LateReadError:
         """
         self._path = path
 
-    def close(self):
+    def close(self) -> None:
         """A no-op - do nothing."""
 
-    def __enter__(self):
+    def __enter__(self) -> "LateReadError":
         """Context manager entry."""
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(
+        self, exc_type: object, exc_val: object, exc_tb: object
+    ) -> Literal[False]:
         """Context manager exit."""
         # If there was an error raised, prefer the original one
         try:
@@ -264,48 +300,49 @@ class LateReadError:
                 raise
         return False
 
-    def _fail(self):
+    def _fail(self) -> None:
         """Raise ReadError."""
         raise errors.ReadError(self._path)
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[bytes]:
         """Iterator protocol - raises ReadError."""
         self._fail()
+        return iter([])
 
-    def read(self, count=-1):
-        """Read method - raises ReadError.
-
-        Args:
-            count: Number of bytes to read (ignored).
-        """
+    def read(self, count: int = -1) -> bytes:
+        """Read method - raises ReadError."""
         self._fail()
+        return b""
 
-    def readlines(self):
+    def readlines(self) -> list[bytes]:
         """Read lines method - raises ReadError."""
         self._fail()
+        return []
 
 
 class FileStream:
     """Base class for FileStreams."""
 
-    def __init__(self, transport, relpath):
+    def __init__(self, transport: "AnyTransport", relpath: str) -> None:
         """Create a FileStream for relpath on transport."""
         self.transport = transport
         self.relpath = relpath
 
-    def _close(self):
+    def _close(self) -> None:
         """A hook point for subclasses that need to take action on close."""
 
-    def __enter__(self):
+    def __enter__(self) -> "FileStream":
         """Context manager entry."""
         return self
 
-    def __exit__(self, exc_type, exc_value, exc_tb):
+    def __exit__(
+        self, exc_type: object, exc_value: object, exc_tb: object
+    ) -> Literal[False]:
         """Context manager exit."""
         self.close()
         return False
 
-    def close(self, want_fdatasync=False):
+    def close(self, want_fdatasync: bool = False) -> None:
         """Close the file stream.
 
         Args:
@@ -317,7 +354,7 @@ class FileStream:
         self._close()
         del _file_streams[self.transport.abspath(self.relpath)]
 
-    def fdatasync(self):
+    def fdatasync(self) -> None:
         """Force data out to physical disk if possible.
 
         :raises errors.TransportNotPossible: If this transport has no way to
@@ -332,7 +369,9 @@ class FileFileStream(FileStream):
     This version uses a file like object to perform writes.
     """
 
-    def __init__(self, transport, relpath, file_handle):
+    def __init__(
+        self, transport: "Transport", relpath: str, file_handle: IO[bytes]
+    ) -> None:
         """Initialize FileFileStream.
 
         Args:
@@ -343,10 +382,10 @@ class FileFileStream(FileStream):
         FileStream.__init__(self, transport, relpath)
         self.file_handle = file_handle
 
-    def _close(self):
+    def _close(self) -> None:
         self.file_handle.close()
 
-    def fdatasync(self):
+    def fdatasync(self) -> None:
         """Force data out to physical disk if possible."""
         self.file_handle.flush()
         try:
@@ -355,28 +394,12 @@ class FileFileStream(FileStream):
             raise errors.TransportNotPossible() from err
         osutils.fdatasync(fileno)
 
-    def write(self, bytes):
-        """Write bytes to the file.
+    def write(self, data: bytes) -> int:
+        """Write bytes to the file."""
+        osutils.pump_string_file(data, self.file_handle)
+        return len(data)
 
-        Args:
-            bytes: Data to write.
-
-        Returns:
-            Number of bytes written.
-        """
-
-        class F:
-            def __init__(self, f):
-                self.f = f
-
-            def write(self, b):
-                self.f.write(b)
-                return len(b)
-
-        osutils.pump_string_file(bytes, F(self.file_handle))
-        return len(bytes)
-
-    def flush(self):
+    def flush(self) -> None:
         """Flush any buffered data."""
         self.file_handle.flush()
 
@@ -387,19 +410,12 @@ class AppendBasedFileStream(FileStream):
     This version uses append on a transport to perform writes.
     """
 
-    def write(self, bytes):
-        """Write bytes by appending to the file.
+    def write(self, data: bytes) -> int:
+        """Write bytes by appending to the file."""
+        self.transport.append_bytes(self.relpath, data)
+        return len(data)
 
-        Args:
-            bytes: Data to write.
-
-        Returns:
-            Number of bytes written.
-        """
-        self.transport.append_bytes(self.relpath, bytes)
-        return len(bytes)
-
-    def flush(self):
+    def flush(self) -> None:
         """Flush any buffered data (no-op for append-based streams)."""
         pass
 
@@ -407,7 +423,7 @@ class AppendBasedFileStream(FileStream):
 class TransportHooks(_hooks.Hooks):
     """Mapping of hook names to registered callbacks for transport hooks."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize TransportHooks."""
         super().__init__()
         self.add_hook(
@@ -441,7 +457,7 @@ class Transport:
 
     base: str
 
-    def __init__(self, base):
+    def __init__(self, base: str) -> None:
         """Initialize a Transport.
 
         Args:
@@ -453,7 +469,9 @@ class Transport:
             base
         )
 
-    def _translate_error(self, e, path, raise_generic=True):
+    def _translate_error(
+        self, e: OSError, path: str, raise_generic: bool = True
+    ) -> None:
         """Translate an IOError or OSError into an appropriate bzr error.
 
         This handles things like ENOENT, ENOTDIR, EEXIST, and EACCESS
@@ -483,14 +501,14 @@ class Transport:
         if raise_generic:
             raise errors.TransportError(msg="Transport operation failed", orig_error=e)
 
-    def clone(self, offset=None):
+    def clone(self, offset: str | None = None) -> "Transport":
         """Return a new Transport object, cloned from the current location,
         using a subdirectory or parent directory. This allows connections
         to be pooled, rather than a new one needed for each subdir.
         """
         raise NotImplementedError(self.clone)
 
-    def create_prefix(self, mode=None):
+    def create_prefix(self, mode: int | None = None) -> None:
         """Create all the directories leading down to self.base."""
         cur_transport = self
         needed = [cur_transport]
@@ -515,7 +533,7 @@ class Transport:
             cur_transport = needed.pop()
             cur_transport.ensure_base(mode=mode)
 
-    def ensure_base(self, mode=None):
+    def ensure_base(self, mode: int | None = None) -> bool:
         """Ensure that the directory this transport references exists.
 
         This will create a directory if it doesn't exist.
@@ -535,7 +553,7 @@ class Transport:
         else:
             return True
 
-    def external_url(self):
+    def external_url(self) -> str:
         """Return a URL for self that can be given to an external process.
 
         There is no guarantee that the URL can be accessed from a different
@@ -557,11 +575,11 @@ class Transport:
         """
         raise NotImplementedError(self.external_url)
 
-    def get_segment_parameters(self):
+    def get_segment_parameters(self) -> dict[str, str]:
         """Return the segment parameters for the top segment of the URL."""
         return self._segment_parameters
 
-    def set_segment_parameter(self, name, value):
+    def set_segment_parameter(self, name: str, value: str | None) -> None:
         """Set a segment parameter.
 
         Args:
@@ -577,23 +595,23 @@ class Transport:
             self._raw_base, self._segment_parameters
         )
 
-    def _pump(self, from_file, to_file):
+    def _pump(self, from_file: IO[bytes], to_file: IO[bytes]) -> int:
         """Most children will need to copy from one file-like
         object or string to another one.
         This just gives them something easy to call.
         """
         return osutils.pumpfile(from_file, to_file)
 
-    def _get_total(self, multi):
+    def _get_total(self, multi: object) -> int | None:
         """Try to figure out how many entries are in multi,
         but if not possible, return None.
         """
         try:
-            return len(multi)
+            return len(multi)  # type: ignore[arg-type]
         except TypeError:  # We can't tell how many, because relpaths is a generator
             return None
 
-    def _report_activity(self, bytes, direction):
+    def _report_activity(self, bytes: int, direction: Literal["read", "write"]) -> None:
         """Notify that this transport has activity.
 
         Implementations should call this from all methods that actually do IO.
@@ -606,7 +624,9 @@ class Transport:
         """
         _ui.report_transport_activity(self, bytes, direction)
 
-    def _update_pb(self, pb, msg, count, total):
+    def _update_pb(
+        self, pb: ProgressBar | None, msg: str, count: int, total: int | None
+    ) -> None:
         """Update the progress bar based on the current count
         and total available, total may be None if it was
         not possible to determine.
@@ -618,7 +638,14 @@ class Transport:
         else:
             pb.update(msg, count, total)
 
-    def _iterate_over(self, multi, func, pb, msg, expand=True):
+    def _iterate_over(
+        self,
+        multi: Iterable,
+        func: Callable[..., Any],
+        pb: ProgressBar | None,
+        msg: str,
+        expand: bool = True,
+    ) -> tuple[Any, ...]:
         """Iterate over all entries in multi, passing them to func,
         and update the progress bar as you go along.
 
@@ -636,7 +663,7 @@ class Transport:
                 result.append(func(entry))
         return tuple(result)
 
-    def abspath(self, relpath):
+    def abspath(self, relpath: str) -> str:
         """Return the full url to the given relative path.
 
         :param relpath: a string of a relative path
@@ -645,7 +672,7 @@ class Transport:
         # interface ?
         raise NotImplementedError(self.abspath)
 
-    def recommended_page_size(self):
+    def recommended_page_size(self) -> int:
         """Return the recommended page size for this transport.
 
         This is potentially different for every path in a given namespace.
@@ -657,7 +684,7 @@ class Transport:
         """
         return 4 * 1024
 
-    def relpath(self, abspath):
+    def relpath(self, abspath: str) -> str:
         """Return the local path portion from a given absolute path.
 
         This default implementation is not suitable for filesystems with
@@ -672,7 +699,7 @@ class Transport:
         pl = len(self.base)
         return abspath[pl:].strip("/")
 
-    def local_abspath(self, relpath):
+    def local_abspath(self, relpath: str) -> str:
         """Return the absolute path on the local filesystem.
 
         This function will only be defined for Transports which have a
@@ -683,22 +710,20 @@ class Transport:
         """
         raise errors.NotLocalUrl(self.abspath(relpath))
 
-    def has(self, relpath):
+    def has(self, relpath: str) -> bool:
         """Does the file relpath exist?
 
         Note that some transports MAY allow querying on directories, but this
         is not part of the protocol.  In other words, the results of
         t.has("a_directory_name") are undefined.
-
-        :rtype: bool
         """
         raise NotImplementedError(self.has)
 
-    def has_any(self, relpaths):
+    def has_any(self, relpaths: Iterable[str]) -> bool:
         """Return True if any of the paths exist."""
         return any(self.has(relpath) for relpath in relpaths)
 
-    def iter_files_recursive(self):
+    def iter_files_recursive(self) -> Iterator[str]:
         """Iter the relative paths of files in the transports sub-tree.
 
         *NOTE*: This only lists *files*, not subdirectories!
@@ -713,7 +738,7 @@ class Transport:
             "to trigger this error)."
         )
 
-    def get(self, relpath):
+    def get(self, relpath: str) -> IO[bytes]:
         """Get the file at the given relative path.
 
         This may fail in a number of ways:
@@ -732,7 +757,7 @@ class Transport:
         """
         raise NotImplementedError(self.get)
 
-    def get_bytes(self, relpath):
+    def get_bytes(self, relpath: str) -> bytes:
         """Get a raw string of the bytes for a file at the given location.
 
         :param relpath: The relative path to the file
@@ -743,7 +768,13 @@ class Transport:
         finally:
             f.close()
 
-    def readv(self, relpath, offsets, adjust_for_latency=False, upper_limit=None):
+    def readv(
+        self,
+        relpath: str,
+        offsets: list[tuple[int, int]],
+        adjust_for_latency: bool = False,
+        upper_limit: int | None = None,
+    ) -> Iterator[tuple[int, bytes]]:
         """Get parts of the file at the given relative path.
 
         Args:
@@ -778,7 +809,9 @@ class Transport:
             offsets = self._sort_expand_and_combine(offsets, upper_limit)
         return self._readv(relpath, offsets)
 
-    def _readv(self, relpath, offsets):
+    def _readv(
+        self, relpath: str, offsets: list[tuple[int, int]]
+    ) -> Iterator[tuple[int, bytes]]:
         """Get parts of the file at the given relative path.
 
         :param relpath: The path to read.
@@ -787,11 +820,11 @@ class Transport:
         """
         if not offsets:
             return
+        yield from self._seek_and_read(self.get(relpath), offsets, relpath)
 
-        fp = self.get(relpath)
-        return self._seek_and_read(fp, offsets, relpath)
-
-    def _seek_and_read(self, fp, offsets, relpath="<unknown>"):
+    def _seek_and_read(
+        self, fp: IO[bytes], offsets: list[tuple[int, int]], relpath: str = "<unknown>"
+    ) -> Iterator[tuple[int, bytes]]:
         """An implementation of readv that uses fp.seek and fp.read.
 
         This uses _coalesce_offsets to issue larger reads and fewer seeks.
@@ -813,7 +846,9 @@ class Transport:
         finally:
             fp.close()
 
-    def _sort_expand_and_combine(self, offsets, upper_limit):
+    def _sort_expand_and_combine(
+        self, offsets: list[tuple[int, int]], upper_limit: int | None
+    ) -> list[tuple[int, int]]:
         """Helper for readv.
 
         :param offsets: A readv vector - (offset, length) tuples.
@@ -827,7 +862,12 @@ class Transport:
         )
 
     @staticmethod
-    def _coalesce_offsets(offsets, limit=None, fudge_factor=None, max_size=None):
+    def _coalesce_offsets(
+        offsets: list[tuple[int, int]],
+        limit: int | None = None,
+        fudge_factor: int | None = None,
+        max_size: int | None = None,
+    ) -> list["_CoalescedOffset"]:
         """Yield coalesced offsets.
 
         With a long list of neighboring requests, combine them
@@ -863,7 +903,7 @@ class Transport:
             )
         ]
 
-    def put_bytes(self, relpath: str, raw_bytes: bytes, mode=None):
+    def put_bytes(self, relpath: str, raw_bytes: bytes, mode: int | None = None) -> int:
         """Atomically put the supplied bytes into the given location.
 
         :param relpath: The location to put the contents, relative to the
@@ -878,12 +918,12 @@ class Transport:
 
     def put_bytes_non_atomic(
         self,
-        relpath,
+        relpath: str,
         raw_bytes: bytes,
-        mode=None,
-        create_parent_dir=False,
-        dir_mode=None,
-    ):
+        mode: int | None = None,
+        create_parent_dir: bool = False,
+        dir_mode: int | None = None,
+    ) -> None:
         """Copy the string into the target location.
 
         This function is not strictly safe to use. See
@@ -909,7 +949,7 @@ class Transport:
             dir_mode=dir_mode,
         )
 
-    def put_file(self, relpath, f, mode=None):
+    def put_file(self, relpath: str, f: IO[bytes], mode: int | None = None) -> int:
         """Copy the file-like object into the location.
 
         :param relpath: Location to put the contents, relative to base.
@@ -921,8 +961,13 @@ class Transport:
         raise NotImplementedError(self.put_file)
 
     def put_file_non_atomic(
-        self, relpath, f, mode=None, create_parent_dir=False, dir_mode=None
-    ):
+        self,
+        relpath: str,
+        f: IO[bytes],
+        mode: int | None = None,
+        create_parent_dir: bool = False,
+        dir_mode: int | None = None,
+    ) -> int | None:
         """Copy the file-like object into the target location.
 
         This function is not strictly safe to use. It is only meant to
@@ -949,12 +994,13 @@ class Transport:
             if parent_dir:
                 self.mkdir(parent_dir, mode=dir_mode)
                 return self.put_file(relpath, f, mode=mode)
+        return None
 
-    def mkdir(self, relpath, mode=None):
+    def mkdir(self, relpath: str, mode: int | None = None) -> None:
         """Create a directory at the given path."""
         raise NotImplementedError(self.mkdir)
 
-    def open_write_stream(self, relpath, mode=None):
+    def open_write_stream(self, relpath: str, mode: int | None = None) -> FileStream:
         """Open a writable file stream at relpath.
 
         A file stream is a file like object with a write() method that accepts
@@ -972,7 +1018,7 @@ class Transport:
         """
         raise NotImplementedError(self.open_write_stream)
 
-    def append_file(self, relpath, f, mode=None):
+    def append_file(self, relpath: str, f: IO[bytes], mode: int | None = None) -> int:
         """Append bytes from a file-like object to a file at relpath.
 
         The file is created if it does not already exist.
@@ -985,7 +1031,7 @@ class Transport:
         """
         raise NotImplementedError(self.append_file)
 
-    def append_bytes(self, relpath, data, mode=None):
+    def append_bytes(self, relpath: str, data: bytes, mode: int | None = None) -> int:
         """Append bytes to a file at relpath.
 
         The file is created if it does not already exist.
@@ -1001,7 +1047,7 @@ class Transport:
             raise TypeError(f"bytes must be a plain string, not {type(data)}")
         return self.append_file(relpath, BytesIO(data), mode=mode)
 
-    def copy(self, rel_from, rel_to):
+    def copy(self, rel_from: str, rel_to: str) -> None:
         """Copy the item at rel_from to the location at rel_to.
 
         Override this for efficiency if a specific transport can do it
@@ -1010,7 +1056,13 @@ class Transport:
         with self.get(rel_from) as f:
             self.put_file(rel_to, f)
 
-    def copy_to(self, relpaths, other, mode=None, pb=None):
+    def copy_to(
+        self,
+        relpaths: Iterable[str],
+        other: "Transport",
+        mode: int | None = None,
+        pb: ProgressBar | None = None,
+    ) -> int:
         """Copy a set of entries from self into another Transport.
 
         :param relpaths: A list/generator of entries to be copied.
@@ -1020,14 +1072,14 @@ class Transport:
         """
 
         # The dummy implementation just does a simple get + put
-        def copy_entry(path):
+        def copy_entry(path: str) -> None:
             other.put_file(path, self.get(path), mode=mode)
 
         return len(
             self._iterate_over(relpaths, copy_entry, pb, "copy_to", expand=False)
         )
 
-    def copy_tree(self, from_relpath, to_relpath):
+    def copy_tree(self, from_relpath: str, to_relpath: str) -> None:
         """Copy a subtree from one relpath to another.
 
         If a faster implementation is available, specific transports should
@@ -1042,7 +1094,7 @@ class Transport:
         target.mkdir(".", stat.st_mode & 0o777)
         source.copy_tree_to_transport(target)
 
-    def copy_tree_to_transport(self, to_transport):
+    def copy_tree_to_transport(self, to_transport: "Transport") -> None:
         """Copy a subtree from one transport to another.
 
         self.base is used as the source tree root, and to_transport.base
@@ -1064,7 +1116,7 @@ class Transport:
                     files.append(path)
         self.copy_to(files, to_transport)
 
-    def rename(self, rel_from, rel_to):
+    def rename(self, rel_from: str, rel_to: str) -> None:
         """Rename a file or directory.
 
         This *must* fail if the destination is a nonempty directory - it must
@@ -1083,7 +1135,7 @@ class Transport:
         # transports may need to override this
         raise NotImplementedError(self.rename)
 
-    def move(self, rel_from, rel_to):
+    def move(self, rel_from: str, rel_to: str) -> None:
         """Move the item at rel_from to the location at rel_to.
 
         The destination is deleted if possible, even if it's a non-empty
@@ -1099,11 +1151,11 @@ class Transport:
             self.copy(rel_from, rel_to)
             self.delete(rel_from)
 
-    def delete(self, relpath):
+    def delete(self, relpath: str) -> None:
         """Delete the item at relpath."""
         raise NotImplementedError(self.delete)
 
-    def delete_tree(self, relpath):
+    def delete_tree(self, relpath: str) -> None:
         """Delete an entire tree. This may require a listable transport."""
         subtree = self.clone(relpath)
         files = []
@@ -1127,11 +1179,11 @@ class Transport:
             subtree.rmdir(dir)
         self.rmdir(relpath)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         """Return string representation of the transport."""
         return f"<{self.__module__}.{self.__class__.__name__} url={self.base}>"
 
-    def stat(self, relpath):
+    def stat(self, relpath: str) -> os.stat_result:
         """Return the stat information for a file.
         WARNING: This may not be implementable for all protocols, so use
         sparingly.
@@ -1143,29 +1195,29 @@ class Transport:
         """
         raise NotImplementedError(self.stat)
 
-    def rmdir(self, relpath):
+    def rmdir(self, relpath: str) -> None:
         """Remove a directory at the given path."""
         raise NotImplementedError
 
-    def readlink(self, relpath):
+    def readlink(self, relpath: str) -> str:
         """Return a string representing the path to which the symbolic link points."""
         raise errors.TransportNotPossible(
             f"Dereferencing symlinks is not supported on {self}"
         )
 
-    def hardlink(self, source, link_name):
+    def hardlink(self, source: str, link_name: str) -> None:
         """Create a hardlink pointing to source named link_name."""
         raise errors.TransportNotPossible(f"Hard links are not supported on {self}")
 
-    def symlink(self, source, link_name):
+    def symlink(self, source: str, link_name: str) -> None:
         """Create a symlink pointing to source named link_name."""
         raise errors.TransportNotPossible(f"Symlinks are not supported on {self}")
 
-    def listable(self):
+    def listable(self) -> bool:
         """Return True if this store supports listing."""
         raise NotImplementedError(self.listable)
 
-    def list_dir(self, relpath):
+    def list_dir(self, relpath: str) -> list[str]:
         """Return a list of all files at the given location.
         WARNING: many transports do not support this, so trying avoid using
         it if at all possible.
@@ -1177,7 +1229,7 @@ class Transport:
             "to trigger this error).".format(self)
         )
 
-    def lock_read(self, relpath):
+    def lock_read(self, relpath: str) -> Lock:
         """Lock the given file for shared (read) access.
 
         WARNING: many transports do not support this, so trying avoid using it.
@@ -1190,7 +1242,7 @@ class Transport:
         """
         raise errors.TransportNotPossible(f"transport locks not supported on {self}")
 
-    def lock_write(self, relpath):
+    def lock_write(self, relpath: str) -> Lock:
         """Lock the given file for exclusive (write) access.
 
         WARNING: many transports do not support this, so trying avoid using it.
@@ -1203,11 +1255,11 @@ class Transport:
         """
         raise errors.TransportNotPossible(f"transport locks not supported on {self}")
 
-    def is_readonly(self):
+    def is_readonly(self) -> bool:
         """Return true if this connection cannot be written to."""
         return False
 
-    def _can_roundtrip_unix_modebits(self):
+    def _can_roundtrip_unix_modebits(self) -> bool:
         """Return true if this transport can store and retrieve unix modebits.
 
         (For example, 0700 to make a directory owner-private.)
@@ -1224,13 +1276,13 @@ class Transport:
         # several questions about the transport.
         return False
 
-    def _reuse_for(self, other_base):
+    def _reuse_for(self, other_base: str) -> "Transport | None":
         # This is really needed for ConnectedTransport only, but it's easier to
         # have Transport refuses to be reused than testing that the reuse
         # should be asked to ConnectedTransport only.
         return None
 
-    def disconnect(self):
+    def disconnect(self) -> None:
         """Disconnect the transport.
 
         This is primarily for ConnectedTransport subclasses, but is implemented
@@ -1241,7 +1293,7 @@ class Transport:
         # asked to ConnectedTransport only.
         pass
 
-    def _redirected_to(self, source, target):
+    def _redirected_to(self, source: str, target: str) -> "Transport":
         """Returns a transport suitable to re-issue a redirected request.
 
         :param source: The source url as returned by the server.
@@ -1260,10 +1312,15 @@ class Transport:
         )
 
 
-class _SharedConnection:
+class _SharedConnection(Generic[ConnT, CredT]):
     """A connection shared between several transports."""
 
-    def __init__(self, connection=None, credentials=None, base=None):
+    def __init__(
+        self,
+        connection: ConnT | None = None,
+        credentials: CredT | None = None,
+        base: str | None = None,
+    ) -> None:
         """Constructor.
 
         :param connection: An opaque object specific to each transport.
@@ -1276,7 +1333,7 @@ class _SharedConnection:
         self.base = base
 
 
-class ConnectedTransport(Transport):
+class ConnectedTransport(Transport, Generic[ConnT, CredT]):
     """A transport connected to a remote server.
 
     This class provide the basis to implement transports that need to connect
@@ -1286,7 +1343,11 @@ class ConnectedTransport(Transport):
     them and share the underlying, protocol specific, connection.
     """
 
-    def __init__(self, base, _from_transport=None):
+    def __init__(
+        self,
+        base: str,
+        _from_transport: "ConnectedTransport[ConnT, CredT] | None" = None,
+    ) -> None:
         """Constructor.
 
         The caller should ensure that _from_transport points at the same host
@@ -1313,36 +1374,37 @@ class ConnectedTransport(Transport):
         base = str(self._parsed_url)
 
         super().__init__(base)
+        self._shared_connection: _SharedConnection[ConnT, CredT]
         if _from_transport is None:
             self._shared_connection = _SharedConnection()
         else:
             self._shared_connection = _from_transport._shared_connection
 
     @property
-    def _user(self):
+    def _user(self) -> str | None:
         return self._parsed_url.user
 
     @property
-    def _password(self):
+    def _password(self) -> str | None:
         return self._parsed_url.password
 
     @property
-    def _host(self):
+    def _host(self) -> str:
         return self._parsed_url.host
 
     @property
-    def _port(self):
+    def _port(self) -> int | None:
         return self._parsed_url.port
 
     @property
-    def _path(self):
+    def _path(self) -> str:
         return self._parsed_url.path
 
     @property
-    def _scheme(self):
+    def _scheme(self) -> str:
         return self._parsed_url.scheme
 
-    def clone(self, offset=None):
+    def clone(self, offset: str | None = None) -> "ConnectedTransport[ConnT, CredT]":
         """Return a new transport with root at self.base + offset.
 
         We leave the daughter classes take advantage of the hint
@@ -1354,11 +1416,18 @@ class ConnectedTransport(Transport):
             return self.__class__(self.abspath(offset), _from_transport=self)
 
     @staticmethod
-    def _split_url(url):
+    def _split_url(url: str) -> "urlutils.URL":
         return urlutils.URL.from_string(url)
 
     @staticmethod
-    def _unsplit_url(scheme, user, password, host, port, path):
+    def _unsplit_url(
+        scheme: str,
+        user: str | None,
+        password: str | None,
+        host: str,
+        port: int | None,
+        path: str,
+    ) -> str:
         """Build the full URL for the given already URL encoded path.
 
         user, password, host and path will be quoted if they contain reserved
@@ -1385,7 +1454,7 @@ class ConnectedTransport(Transport):
         path = urlutils.escape(path)
         return urlutils.urlparse.urlunparse((scheme, netloc, path, None, None, None))
 
-    def relpath(self, abspath):
+    def relpath(self, abspath: str) -> str:
         """Return the local path portion from a given absolute path."""
         parsed_url = self._split_url(abspath)
         error = []
@@ -1408,7 +1477,7 @@ class ConnectedTransport(Transport):
         pl = len(self._parsed_url.path)
         return parsed_url.path[pl:].strip("/")
 
-    def abspath(self, relpath):
+    def abspath(self, relpath: str) -> str:
         """Return the full url to the given relative path.
 
         Args:
@@ -1418,7 +1487,7 @@ class ConnectedTransport(Transport):
         """
         return str(self._parsed_url.clone(relpath))
 
-    def _remote_path(self, relpath):
+    def _remote_path(self, relpath: str) -> str:
         """Return the absolute path part of the url to the given relative path.
 
         This is the path that the remote server expect to receive in the
@@ -1432,7 +1501,7 @@ class ConnectedTransport(Transport):
         """
         return self._parsed_url.clone(relpath).path
 
-    def _get_shared_connection(self):
+    def _get_shared_connection(self) -> "_SharedConnection[ConnT, CredT]":
         """Get the object shared amongst cloned transports.
 
         This should be used only by classes that needs to extend the sharing
@@ -1442,7 +1511,9 @@ class ConnectedTransport(Transport):
         """
         return self._shared_connection
 
-    def _set_connection(self, connection, credentials=None):
+    def _set_connection(
+        self, connection: ConnT, credentials: CredT | None = None
+    ) -> None:
         """Record a newly created connection with its associated credentials.
 
         Note: To ensure that connection is still shared after a temporary
@@ -1461,15 +1532,15 @@ class ConnectedTransport(Transport):
         for hook in self.hooks["post_connect"]:
             hook(self)
 
-    def _get_connection(self):
+    def _get_connection(self) -> ConnT | None:
         """Returns the transport specific connection object."""
         return self._shared_connection.connection
 
-    def _get_credentials(self):
+    def _get_credentials(self) -> CredT | None:
         """Returns the credentials used to establish the connection."""
         return self._shared_connection.credentials
 
-    def _update_credentials(self, credentials):
+    def _update_credentials(self, credentials: CredT) -> None:
         """Update the credentials of the current connection.
 
         Some protocols can renegociate the credentials within a connection,
@@ -1481,7 +1552,7 @@ class ConnectedTransport(Transport):
         # the credentials not creating a new connection.
         self._shared_connection.credentials = credentials
 
-    def _reuse_for(self, other_base):
+    def _reuse_for(self, other_base: str) -> "ConnectedTransport[ConnT, CredT] | None":
         """Returns a transport sharing the same connection if possible.
 
         Note: we share the connection if the expected credentials are the
@@ -1526,7 +1597,7 @@ class ConnectedTransport(Transport):
             transport = self.__class__(other_base, _from_transport=self)
         return transport
 
-    def disconnect(self):
+    def disconnect(self) -> None:
         """Disconnect the transport.
 
         If and when required the transport willl reconnect automatically.
@@ -1534,7 +1605,9 @@ class ConnectedTransport(Transport):
         raise NotImplementedError(self.disconnect)
 
 
-def get_transport_from_path(path, possible_transports=None):
+def get_transport_from_path(
+    path: str, possible_transports: list[Transport] | None = None
+) -> Transport:
     """Open a transport for a local path.
 
     :param path: Local path as byte or unicode string
@@ -1543,7 +1616,9 @@ def get_transport_from_path(path, possible_transports=None):
     return get_transport_from_url(urlutils.local_path_to_url(path), possible_transports)
 
 
-def get_transport_from_url(url, possible_transports=None):
+def get_transport_from_url(
+    url: str, possible_transports: list[Transport] | None = None
+) -> Transport:
     """Open a transport to access a URL.
 
     Args:
@@ -1582,7 +1657,9 @@ def get_transport_from_url(url, possible_transports=None):
     raise errors.UnsupportedProtocol(url, last_err)
 
 
-def _try_transport_factories(base, factory_list):
+def _try_transport_factories(
+    base: str, factory_list: list
+) -> tuple[Transport | None, Exception | None]:
     last_err = None
     for factory in factory_list:
         try:
@@ -1594,9 +1671,6 @@ def _try_transport_factories(base, factory_list):
             last_err = e
             continue
     return None, last_err
-
-
-T = TypeVar("T")
 
 
 def do_catching_redirections(
@@ -1653,14 +1727,14 @@ class Server:
     The Server interface provides a server for a given transport type.
     """
 
-    def start_server(self):
+    def start_server(self) -> None:
         """Setup the server to service requests."""
 
-    def stop_server(self):
+    def stop_server(self) -> None:
         """Remove the server and cleanup any resources it owns."""
 
 
-def open_file(url):
+def open_file(url: str) -> IO[bytes]:
     """Open a file from a URL.
 
     :param url: URL to open
@@ -1671,13 +1745,15 @@ def open_file(url):
     return open_file_via_transport(filename, transport)
 
 
-def open_file_via_transport(filename, transport):
+def open_file_via_transport(filename: str, transport: Transport) -> IO[bytes]:
     """Open a file using the transport, follow redirects as necessary."""
 
-    def open_file(transport):
+    def open_file(transport: Transport) -> IO[bytes]:
         return transport.get(filename)
 
-    def follow_redirection(transport, e, redirection_notice):
+    def follow_redirection(
+        transport: Transport, e: errors.RedirectRequested, redirection_notice: str
+    ) -> Transport:
         logger.debug("%s", redirection_notice)
         base, _filename = urlutils.split(e.target)
         redirected_transport = get_transport_from_url(base)

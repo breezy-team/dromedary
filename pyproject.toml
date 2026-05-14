@@ -24,6 +24,7 @@ classifiers = [
 requires-python = ">=3.10,<3.15"
 dependencies = [
     "catalogus",
+    "typing_extensions; python_version < '3.11'",
 ]
 dynamic = ["version"]
 
@@ -115,7 +116,10 @@ ignore = [
     "S106",
     "S110",
     "S317",
+    "D102",
+    "D107",
     "D104",
+    "S101",
     "RUF012",
     "RUF005",
     "RUF015",

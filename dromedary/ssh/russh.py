@@ -22,7 +22,7 @@ subprocess vendors. Once the migration is complete this module is what
 `default_key` points at.
 """
 
-from dromedary.ssh import SSHConnection, SSHVendor
+from dromedary.ssh import SFTPClientProtocol, SSHConnection, SSHVendor
 
 from .._transport_rs import ssh as _ssh_rs
 
@@ -30,31 +30,40 @@ from .._transport_rs import ssh as _ssh_rs
 class _RusshSSHConnection(SSHConnection):
     """SSHConnection wrapping a `RusshSSHConnection` from the Rust layer."""
 
-    def __init__(self, inner):
+    def __init__(self, inner: _ssh_rs.RusshSSHConnection) -> None:
         self._inner = inner
 
-    def send(self, data):
+    def send(self, data: bytes) -> int:
         return self._inner.send(data)
 
-    def recv(self, count):
+    def recv(self, count: int) -> bytes:
         return self._inner.recv(count)
 
-    def close(self):
+    def close(self) -> None:
         return self._inner.close()
 
 
 class RusshVendor(SSHVendor):
     """SSH vendor using the pure-Rust russh library."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Construct a russh-backed SSH vendor."""
         self._vendor = _ssh_rs.RusshVendor()
 
-    def connect_sftp(self, username, password, host, port):
+    def connect_sftp(
+        self, username: str, password: str | None, host: str, port: int | None
+    ) -> SFTPClientProtocol:
         """Open an SFTP session; returns an `_transport_rs.sftp.SFTPClient`."""
         return self._vendor.connect_sftp(username, password, host, port)
 
-    def connect_ssh(self, username, password, host, port, command):
+    def connect_ssh(
+        self,
+        username: str,
+        password: str | None,
+        host: str,
+        port: int | None,
+        command: list[str],
+    ) -> _RusshSSHConnection:
         """Execute `command` on the remote host over SSH."""
         inner = self._vendor.connect_ssh(username, password, host, command, port)
         return _RusshSSHConnection(inner)

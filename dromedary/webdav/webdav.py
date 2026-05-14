@@ -32,9 +32,19 @@ bits:
   ``dromedary/tests/per_transport.py``
 """
 
+import sys
 from io import BytesIO
+from typing import IO, TYPE_CHECKING, Literal
 
 from dromedary.http import urllib
+
+if sys.version_info >= (3, 11):
+    from typing import Self
+else:
+    from typing_extensions import Self
+
+if TYPE_CHECKING:
+    from dromedary import AppendBasedFileStream
 
 from .._transport_rs import webdav as _webdav_rs
 
@@ -42,7 +52,12 @@ from .._transport_rs import webdav as _webdav_rs
 class HttpDavTransport(_webdav_rs.HttpDavTransport):
     """HTTP(S) transport with WebDAV write verbs."""
 
-    def __new__(cls, base, _from_transport=None, ca_certs=None):
+    def __new__(
+        cls,
+        base: str,
+        _from_transport: "HttpDavTransport | None" = None,
+        ca_certs: str | None = None,
+    ) -> Self:
         """Build the Rust transport.
 
         Mirrors :meth:`dromedary.http.urllib.HttpTransport.__new__`:
@@ -56,7 +71,7 @@ class HttpDavTransport(_webdav_rs.HttpDavTransport):
         When ``_from_transport`` is supplied we construct a fresh
         Rust instance at ``base`` and then graft the source's
         HttpClient / auth cache / range hint onto it via
-        ``_rust_replace_inner_from``.
+        ``_clone_from``.
         """
         self = super().__new__(
             cls,
@@ -69,10 +84,15 @@ class HttpDavTransport(_webdav_rs.HttpDavTransport):
             # Compute the offset so the grafted state targets the
             # right base URL, then swap in the shared state.
             offset = urllib._offset_from_base(_from_transport.base, base)
-            self._rust_replace_inner_from(_from_transport, offset)
+            self._clone_from(_from_transport, offset)
         return self
 
-    def __init__(self, base, _from_transport=None, ca_certs=None):
+    def __init__(
+        self,
+        base: str,
+        _from_transport: "HttpDavTransport | None" = None,
+        ca_certs: str | None = None,
+    ) -> None:
         """Initialise Python-side state and TLS-configured inner client.
 
         Rust ``__new__`` populated the base-URL state with a minimal
@@ -100,11 +120,11 @@ class HttpDavTransport(_webdav_rs.HttpDavTransport):
                 disable_verification=disable_verification,
                 user_agent=urllib._default_user_agent(),
             )
-            # ``offset=None`` lets ``_rust_replace_inner_from`` share
+            # ``offset=None`` lets ``_clone_from`` share
             # ``fresh``'s inner directly, preserving raw_base and
             # segment parameters that ``clone_concrete(None)`` would
             # otherwise strip.
-            self._rust_replace_inner_from(fresh, None)
+            self._clone_from(fresh, None)
         # Wire an activity callback into the Rust transport so
         # internal get/has/post/readv calls feed breezy's progress
         # UI too, not just the explicit ``.request()`` path. Same
@@ -113,7 +133,7 @@ class HttpDavTransport(_webdav_rs.HttpDavTransport):
 
         wself = weakref.ref(self)
 
-        def _forward(byte_count, direction):
+        def _forward(byte_count: int, direction: Literal["read", "write"]) -> None:
             t = wself()
             if t is None:
                 return
@@ -121,7 +141,7 @@ class HttpDavTransport(_webdav_rs.HttpDavTransport):
 
         self._set_activity_callback(_forward)
 
-    def clone(self, offset=None):
+    def clone(self, offset: str | None = None) -> "HttpDavTransport":
         """Return a new transport sharing this transport's HttpClient.
 
         Uses ``urlutils.URL.clone`` path-combine semantics rather
@@ -136,17 +156,19 @@ class HttpDavTransport(_webdav_rs.HttpDavTransport):
             new_base = str(URL.from_string(self.base).clone(offset))
         return type(self)(new_base, _from_transport=self)
 
-    def _report_activity(self, byte_count, direction):
+    def _report_activity(
+        self, byte_count: int, direction: Literal["read", "write"]
+    ) -> None:
         """Feed byte-count progress into dromedary's UI hook."""
-        from dromedary import ui as _ui
+        from dromedary import _ui
 
         _ui.report_transport_activity(self, byte_count, direction)
 
-    def is_readonly(self):
+    def is_readonly(self) -> bool:
         """WebDAV supports writes."""
         return False
 
-    def listable(self):
+    def listable(self) -> bool:
         """WebDAV exposes directory listings via PROPFIND."""
         return True
 
@@ -155,15 +177,15 @@ class HttpDavTransport(_webdav_rs.HttpDavTransport):
     # bytes-out APIs; the Python Transport contract wants file-likes
     # for get / put_file and int offsets for append_file.
 
-    def get(self, relpath):
+    def get(self, relpath: str) -> IO[bytes]:
         """Return a file-like of ``relpath``'s contents."""
         return BytesIO(self._get_bytes(relpath))
 
-    def get_bytes(self, relpath):
+    def get_bytes(self, relpath: str) -> bytes:
         """Return ``relpath``'s contents as bytes."""
         return self._get_bytes(relpath)
 
-    def put_file(self, relpath, f, mode=None):
+    def put_file(self, relpath: str, f: IO[bytes], mode: int | None = None) -> int:
         """Store the contents of `f` at `relpath`. Returns the length."""
         data = f.read()
         self.put_bytes(relpath, data)
@@ -171,20 +193,24 @@ class HttpDavTransport(_webdav_rs.HttpDavTransport):
 
     def put_file_non_atomic(
         self,
-        relpath,
-        f,
-        mode=None,
-        create_parent_dir=False,
-        dir_mode=None,
-    ):
+        relpath: str,
+        f: IO[bytes],
+        mode: int | None = None,
+        create_parent_dir: bool | None = False,
+        dir_mode: int | None = None,
+    ) -> None:
         """Non-atomic version of put_file (skips the temp-file dance)."""
-        self.put_bytes_non_atomic(relpath, f.read(), create_parent_dir)
+        self.put_bytes_non_atomic(
+            relpath, f.read(), create_parent_dir=create_parent_dir
+        )
 
-    def append_file(self, relpath, f, mode=None):
+    def append_file(self, relpath: str, f: IO[bytes], mode: int | None = None) -> int:
         """Append `f.read()` to `relpath`. Returns the old length."""
         return self.append_bytes(relpath, f.read())
 
-    def open_write_stream(self, relpath, mode=None):
+    def open_write_stream(
+        self, relpath: str, mode: int | None = None
+    ) -> "AppendBasedFileStream":
         """Open a writable stream at ``relpath``.
 
         WebDAV has no native append/stream verbs, so we back the
@@ -209,7 +235,7 @@ class HttpDavTransport(_webdav_rs.HttpDavTransport):
         return handle
 
 
-def get_test_permutations():
+def get_test_permutations() -> list[tuple[type, type]]:
     """Return the permutations to be used in testing."""
     from .tests import dav_server
 
