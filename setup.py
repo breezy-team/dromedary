@@ -23,8 +23,6 @@ from setuptools import setup
 rust_features = []
 if os.environ.get("DROMEDARY_GIO"):
     rust_features.append("gio")
-if os.environ.get("DROMEDARY_VENDORED_TLS"):
-    rust_features.append("vendored-tls")
 
 rust_extensions = [
     RustExtension(

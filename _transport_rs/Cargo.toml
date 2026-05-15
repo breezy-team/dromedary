@@ -24,10 +24,6 @@ russh = ["dep:russh", "dep:tokio"]
 # WebDAV bindings. Forwards to dromedary/webdav which pulls in
 # quick-xml for parsing multi-status PROPFIND responses.
 webdav = ["dromedary/webdav"]
-# Forward to dromedary/vendored-tls — statically links OpenSSL into
-# the native-tls backend for Python wheel builds. See the parent
-# crate's feature for details.
-vendored-tls = ["dromedary/vendored-tls"]
 # TODO: add `libssh2` and `ssh2-rs` features when those backends are implemented.
 
 [target.'cfg(unix)'.dependencies]
