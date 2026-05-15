@@ -50,7 +50,10 @@ base64 = "0.22"
 # reqwest is hyper-based and accepts arbitrary methods. `blocking`
 # keeps our sync API shape; `native-tls` uses the platform TLS
 # library (OpenSSL on Linux, SChannel on Windows, Secure Transport
-# on macOS), which matches Python's `ssl` module behaviour.
+# on macOS), which matches Python's `ssl` module behaviour. Linkage
+# to the OpenSSL backend on Linux is controlled by the `vendored-tls`
+# crate feature — off by default (system OpenSSL), on for Python wheel
+# builds (statically-linked OpenSSL).
 reqwest = { version = "0.13", default-features = false, features = ["native-tls", "gzip", "blocking"] }
 # Lightweight dep used only for typed error classification — we
 # downcast reqwest's error chain to `hyper::Error` so we can
@@ -77,6 +80,11 @@ webdav = ["dep:quick-xml"]
 # SFTP transport. Caller supplies the SSH byte-stream channel — no
 # SSH-library dep is added here so embedders pick their own backend.
 sftp = ["dep:sftp"]
+# Statically link a vendored OpenSSL into the native-tls backend (Linux
+# only — Windows/macOS native-tls uses SChannel/Secure Transport and
+# this is a no-op). Intended for Python wheel builds in cibuildwheel
+# manylinux/musllinux images where openssl-devel isn't reliably present.
+vendored-tls = ["reqwest/native-tls-vendored"]
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["fs", "uio"] }
