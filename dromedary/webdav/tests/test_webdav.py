@@ -65,6 +65,7 @@ class HatterHttpServer(http_server.HttpServer):
 class TestDAVErrors(tests.TestCase):
     def setUp(self):
         super().setUp()
+        tests.isolate_proxy_env(self)
         self._transport = webdav.HttpDavTransport
         self.server = HatterHttpServer()
         self.server.start_server()

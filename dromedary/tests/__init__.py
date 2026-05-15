@@ -35,6 +35,37 @@ class TestNotApplicable(
 TestSkipped = unittest.SkipTest
 
 
+_PROXY_ENV_VARS = (
+    "http_proxy",
+    "HTTP_PROXY",
+    "https_proxy",
+    "HTTPS_PROXY",
+    "all_proxy",
+    "ALL_PROXY",
+    "no_proxy",
+    "NO_PROXY",
+)
+
+
+def isolate_proxy_env(test_case):
+    """Clear proxy env vars for the duration of a test.
+
+    Some build environments (notably Debian's pybuild, which sets
+    ``http_proxy=http://127.0.0.1:9/`` as a canary to detect tests that
+    accidentally hit the network) leave proxy variables in the
+    environment. The dromedary HTTP client honours those variables,
+    which routes tests that drive a local HTTPServer through a
+    non-existent proxy and makes them fail with ECONNREFUSED.
+
+    Call this from ``setUp`` to drop the proxy variables; the original
+    values are restored via ``addCleanup``.
+    """
+    for name in _PROXY_ENV_VARS:
+        original = os.environ.pop(name, None)
+        if original is not None:
+            test_case.addCleanup(os.environ.__setitem__, name, original)
+
+
 def _iter_test_cases(suite_or_case):
     """Yield individual TestCase leaves from a TestSuite or TestCase."""
     if isinstance(suite_or_case, unittest.TestCase):

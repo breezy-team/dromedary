@@ -27,6 +27,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from dromedary import http
 from dromedary._transport_rs.http import HttpClient
 from dromedary.http import ca_bundle
+from dromedary.tests import isolate_proxy_env
 
 
 class TestGetCaPath(unittest.TestCase):
@@ -194,6 +195,7 @@ class TestTokenProviderEndToEnd(unittest.TestCase):
     """
 
     def setUp(self):
+        isolate_proxy_env(self)
         self._original_token = http.get_token_provider()
         self.addCleanup(http.set_token_provider, self._original_token)
 
