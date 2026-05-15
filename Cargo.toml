@@ -48,9 +48,10 @@ base64 = "0.22"
 # reqwest replaces ureq: ureq-proto (transitive) hardcodes a method
 # whitelist that rejects WebDAV verbs (MKCOL, MOVE, COPY, PROPFIND).
 # reqwest is hyper-based and accepts arbitrary methods. `blocking`
-# keeps our sync API shape; `rustls-tls-native-roots` wires rustls
-# with the platform's native trust store.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "gzip", "blocking"] }
+# keeps our sync API shape; `native-tls` uses the platform TLS
+# library (OpenSSL on Linux, SChannel on Windows, Secure Transport
+# on macOS), which matches Python's `ssl` module behaviour.
+reqwest = { version = "0.13", default-features = false, features = ["native-tls", "gzip", "blocking"] }
 # Lightweight dep used only for typed error classification — we
 # downcast reqwest's error chain to `hyper::Error` so we can
 # distinguish protocol-level parse failures (bad HTTP version, bad
