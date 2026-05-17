@@ -1564,15 +1564,12 @@ fn build_client(config: &HttpClientConfig, proxy: Option<Proxy>) -> Result<Clien
             .danger_accept_invalid_certs(true)
             .danger_accept_invalid_hostnames(true);
     } else if let Some(path) = &config.ca_certs_path {
-        for cert in root_certs_from_pem_file(path)? {
-            builder = builder.add_root_certificate(cert);
-        }
-        // Don't also trust the platform native store when the caller
-        // passed an explicit bundle — `reqwest` defaults that on with
-        // `rustls-tls-native-roots`, but the Python test suite sets
-        // a fake CA and expects only that bundle to match (tests
-        // against https with a self-signed cert fail otherwise).
-        builder = builder.tls_built_in_native_certs(false);
+        // The Python test suite sets a fake CA and expects only that
+        // bundle to match — `tls_certs_only` adds the supplied certs
+        // and excludes the platform trust store in one call (replacing
+        // the 0.12-era `add_root_certificate` + `tls_built_in_native_certs(false)`
+        // pair).
+        builder = builder.tls_certs_only(root_certs_from_pem_file(path)?);
     }
     // If no CA bundle was supplied and verification wasn't
     // disabled, fall through and let reqwest's
