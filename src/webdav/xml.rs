@@ -134,6 +134,10 @@ fn parse_responses(body: &[u8], url: &str) -> Result<Vec<DavEntry>> {
         path: url.to_string(),
         msg: format!("Malformed xml response: {}", e),
     };
+    let text_err = |msg: String| Error::InvalidHttpResponse {
+        path: url.to_string(),
+        msg: format!("Malformed xml response: {}", msg),
+    };
 
     loop {
         match reader.read_event_into(&mut buf).map_err(parse_err)? {
@@ -173,7 +177,10 @@ fn parse_responses(body: &[u8], url: &str) -> Result<Vec<DavEntry>> {
             }
             Event::Text(t) => {
                 if acc.is_some() {
-                    let s = t.unescape().map_err(parse_err)?;
+                    let raw = std::str::from_utf8(&t)
+                        .map_err(|e| text_err(format!("non-UTF-8 text: {}", e)))?;
+                    let s =
+                        quick_xml::escape::unescape(raw).map_err(|e| text_err(e.to_string()))?;
                     chars.push_str(&s);
                 }
             }
