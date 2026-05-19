@@ -635,7 +635,6 @@ impl DigestAlgorithm {
 /// exact bit-mixing is not security-critical beyond collision
 /// resistance.
 pub fn new_cnonce(nonce: &str, nonce_count: u64) -> String {
-    use rand::Rng;
     use sha1::{Digest, Sha1};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -647,9 +646,8 @@ pub fn new_cnonce(nonce: &str, nonce_count: u64) -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ\
                            abcdefghijklmnopqrstuvwxyz\
                            0123456789";
-    let mut rng = rand::thread_rng();
     let rand_suffix: String = (0..8)
-        .map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char)
+        .map(|_| CHARS[rand::random_range(0..CHARS.len())] as char)
         .collect();
 
     let raw = format!("{}:{}:{}:{}", nonce, nonce_count, ts, rand_suffix);

@@ -586,11 +586,13 @@ async fn try_agent_auth(
     session: &mut russh::client::Handle<VerifyingHandler>,
     user: &str,
 ) -> Result<bool, AuthError> {
-    // `connect_pageant` in russh 0.54 returns the client directly (no
-    // `Result`); a missing/unreachable Pageant surfaces later when we
-    // actually request identities, where it's already handled as a silent
-    // no-op below.
-    let agent = russh::keys::agent::client::AgentClient::connect_pageant().await;
+    let agent = match russh::keys::agent::client::AgentClient::connect_pageant().await {
+        Ok(a) => a,
+        Err(e) => {
+            log::debug!("Pageant unavailable: {e}");
+            return Ok(false);
+        }
+    };
     try_agent_auth_with(session, user, agent).await
 }
 
@@ -610,7 +612,8 @@ where
         }
     };
 
-    for key in identities {
+    for identity in identities {
+        let key = identity.public_key().into_owned();
         log::debug!(
             "Trying SSH agent key {} ({})",
             key.fingerprint(Default::default()),
