@@ -106,8 +106,10 @@ pub struct HttpTransport {
 
 impl HttpTransport {
     /// Build a new transport over `base`. The URL must use an
-    /// `http` or `https` scheme (optionally with a `+impl` suffix
-    /// like `http+urllib://`, which we ignore beyond logging).
+    /// `http` or `https` scheme, optionally with a qualifier on
+    /// either side of a `+`: an implementation suffix like
+    /// `http+urllib://`, or a caller-supplied prefix like
+    /// `git+http://`. The qualifier is dropped beyond logging.
     pub fn new(base: &str, client: Arc<HttpClient>) -> Result<Self> {
         let (unqualified_scheme, normalised_base, segment_parameters) = normalise_http_url(base)?;
         Ok(Self {
@@ -560,12 +562,18 @@ fn normalise_http_url(
         .find("://")
         .ok_or_else(|| Error::UrlError(url::ParseError::RelativeUrlWithoutBase))?;
     let raw_scheme = &trimmed[..scheme_end];
-    // Strip any `+impl` suffix: `http+urllib` → `http`.
-    let unqualified = raw_scheme
-        .split_once('+')
-        .map(|(s, _)| s)
-        .unwrap_or(raw_scheme)
-        .to_string();
+    // Reduce a compound scheme to its plain `http`/`https` component,
+    // accepting the qualifier on either side of the `+`:
+    //   `http+urllib` → `http`  (implementation suffix)
+    //   `git+http`    → `http`  (caller-supplied prefix)
+    // Either form lets a higher layer route its own URL scheme through
+    // the HTTP transport without this layer knowing anything about it.
+    let unqualified = match raw_scheme.split_once('+') {
+        Some((before, _)) if before == "http" || before == "https" => before,
+        Some((_, after)) if after == "http" || after == "https" => after,
+        _ => raw_scheme,
+    }
+    .to_string();
     if unqualified != "http" && unqualified != "https" {
         return Err(Error::UrlError(url::ParseError::RelativeUrlWithoutBase));
     }
@@ -1387,6 +1395,16 @@ mod tests {
         // The unqualified scheme drops the +urllib qualifier so
         // external_url and remote_url emit the canonical form.
         assert_eq!(scheme, "http");
+    }
+
+    #[test]
+    fn normalise_http_url_strips_caller_prefix() {
+        // A `<prefix>+http` scheme reduces to plain http so a higher
+        // layer can route its own scheme through the HTTP transport.
+        let (scheme, _url, _params) = normalise_http_url("git+http://example.com/").unwrap();
+        assert_eq!(scheme, "http");
+        let (scheme, _url, _params) = normalise_http_url("git+https://example.com/").unwrap();
+        assert_eq!(scheme, "https");
     }
 
     #[test]
