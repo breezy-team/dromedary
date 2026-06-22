@@ -12,11 +12,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out dromedary
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           path: dromedary
       - name: Check out breezy 3.4
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: breezy-team/breezy
           ref: '3.4'
