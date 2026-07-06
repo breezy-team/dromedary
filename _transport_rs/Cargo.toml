@@ -13,7 +13,7 @@ pyo3-filelike = { workspace = true }
 sftp = ">=0.2.3, <0.4"
 url = { workspace = true }
 log = { workspace = true }
-russh = { version = "0.60", optional = true }
+russh = { version = "0.62", optional = true }
 tokio = { version = "1", features = ["rt", "io-util", "net", "sync", "macros"], optional = true }
 lazy_static = "1"
 
