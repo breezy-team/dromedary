@@ -295,10 +295,46 @@ pub fn split_segment_parameters_raw(url: &str) -> (&str, Vec<&str>) {
     // operates on urls not url+segments, and Transport classes
     // should not be blindly adding slashes in the first place.
     let lurl = strip_trailing_slash(url);
-    let segment_start = lurl.rfind('/').map_or_else(|| 0, |i| i + 1);
-    if !lurl[segment_start..].contains(',') {
-        return (url, vec![]);
-    }
+
+    // The ",key=value[,key=value...]" suffix is appended directly after the
+    // last real path component, with no extra '/' in between. So the marker
+    // comma is usually right after the final '/' in the URL - but a
+    // parameter *value* may itself contain an unescaped '/' (e.g. a VCS ref
+    // like "bump-versions/main"), which pushes the marker earlier. Try the
+    // final path component first and, if it has no comma, keep walking back
+    // past earlier '/' boundaries looking for one.
+    //
+    // A comma found in an earlier component is ambiguous: it might be the
+    // real marker (case above), or just a literal comma that happens to be
+    // part of an unrelated, earlier directory name - e.g. "/some,dir/path",
+    // where "path" (the true final component) has no comma at all and the
+    // whole string should be left unparsed. `join_segment_parameters_raw`
+    // never lets a subsegment contain a comma, so a real marker's first
+    // subsegment always looks like "key=value" - it contains '='. The true
+    // final component's own comma is trusted unconditionally (matches
+    // existing behaviour for a bare marker like "foo,tip"); a comma found
+    // by walking back past an earlier '/' boundary is only trusted when the
+    // text right after it looks like a real marker.
+    let mut boundary = lurl.len();
+    let mut is_final_component = true;
+    let segment_start = loop {
+        let component_start = lurl[..boundary].rfind('/').map_or(0, |i| i + 1);
+        if let Some(comma_pos) = lurl[component_start..].find(',') {
+            let marker_piece = lurl[component_start + comma_pos + 1..]
+                .split(',')
+                .next()
+                .unwrap_or("");
+            if is_final_component || marker_piece.contains('=') {
+                break component_start;
+            }
+        }
+        if component_start == 0 {
+            return (url, vec![]);
+        }
+        is_final_component = false;
+        boundary = component_start - 1;
+    };
+
     let mut iter = lurl[segment_start..].split(',');
     let first = iter.next().unwrap();
     (

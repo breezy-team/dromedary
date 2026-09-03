@@ -560,14 +560,22 @@ class TestUrlToPath(TestCase):
         self.assertEqual("", strip_segment_parameters(",key1=val1"))
         self.assertEqual("foo/", strip_segment_parameters("foo/,key1=val1"))
         self.assertEqual("foo", strip_segment_parameters("foo,key1=val1"))
+        # A segment parameter value may itself contain '/', which used to
+        # make the marker comma unfindable and the whole string was left
+        # untouched instead of being split.
         self.assertEqual(
-            "foo/base,la=bla/other/elements",
+            "foo/base",
             strip_segment_parameters("foo/base,la=bla/other/elements"),
         )
         self.assertEqual(
             "foo/base,la=bla/other/elements",
             strip_segment_parameters("foo/base,la=bla/other/elements,a=b"),
         )
+        # A literal comma in an earlier, unrelated path component must not
+        # be mistaken for a segment-parameter marker: "path" (the true
+        # final component here) has no comma at all, so the whole string
+        # is left completely unparsed.
+        self.assertEqual("/some,dir/path", strip_segment_parameters("/some,dir/path"))
         # TODO: Check full URLs as well as relative references
 
     def test_split_segment_parameters_raw(self):
@@ -599,13 +607,36 @@ class TestUrlToPath(TestCase):
         self.assertEqual(
             ("foo", ["key1=val1"]), split_segment_parameters_raw("foo,key1=val1")
         )
+        # A segment parameter value may itself contain unescaped '/'
+        # characters (e.g. a VCS ref such as "bump-versions/main"). The
+        # marker comma is still found by walking back through path
+        # components until one containing ',' turns up.
         self.assertEqual(
-            ("foo/base,la=bla/other/elements", []),
+            ("foo/base", ["la=bla/other/elements"]),
             split_segment_parameters_raw("foo/base,la=bla/other/elements"),
         )
         self.assertEqual(
             ("foo/base,la=bla/other/elements", ["a=b"]),
             split_segment_parameters_raw("foo/base,la=bla/other/elements,a=b"),
+        )
+        self.assertEqual(
+            ("http://example/repo", ["branch=bump-versions/main"]),
+            split_segment_parameters_raw(
+                "http://example/repo,branch=bump-versions/main"
+            ),
+        )
+        self.assertEqual(
+            ("http://example/repo", ["branch=a/b/c/d"]),
+            split_segment_parameters_raw("http://example/repo,branch=a/b/c/d"),
+        )
+        # A literal comma in an earlier, unrelated path component (not
+        # followed by "key=value" syntax) must not be mistaken for a
+        # segment-parameter marker. "path" (the true final component) has
+        # no comma at all, so this is left completely unparsed - matching
+        # pre-existing behaviour for a comma-free path.
+        self.assertEqual(
+            ("/some,dir/path", []),
+            split_segment_parameters_raw("/some,dir/path"),
         )
         # TODO: Check full URLs as well as relative references
 
@@ -639,12 +670,38 @@ class TestUrlToPath(TestCase):
             ("foo/", {"key1": "val1"}), split_segment_parameters("foo/,key1=val1")
         )
         self.assertEqual(
-            ("foo/base,key1=val1/other/elements", {}),
+            ("foo/base", {"key1": "val1/other/elements"}),
             split_segment_parameters("foo/base,key1=val1/other/elements"),
         )
         self.assertEqual(
             ("foo/base,key1=val1/other/elements", {"key2": "val2"}),
             split_segment_parameters("foo/base,key1=val1/other/elements,key2=val2"),
+        )
+        # janitor names branches "{campaign}/{role}" (e.g.
+        # "bump-versions/main"), so a segment parameter value routinely
+        # contains '/'. join_segment_parameters/split_segment_parameters
+        # must round-trip that instead of silently dropping the parameter.
+        self.assertEqual(
+            ("http://example/repo", {"branch": "bump-versions/main"}),
+            split_segment_parameters("http://example/repo,branch=bump-versions/main"),
+        )
+        self.assertEqual(
+            ("http://example/repo", {"branch": "a/b/c/d"}),
+            split_segment_parameters("http://example/repo,branch=a/b/c/d"),
+        )
+        self.assertEqual(
+            "http://example/repo,branch=bump-versions/main",
+            urlutils.join_segment_parameters(
+                "http://example/repo", {"branch": "bump-versions/main"}
+            ),
+        )
+        self.assertEqual(
+            ("http://example/repo", {"branch": "bump-versions/main"}),
+            split_segment_parameters(
+                urlutils.join_segment_parameters(
+                    "http://example/repo", {"branch": "bump-versions/main"}
+                )
+            ),
         )
         self.assertRaises(
             urlutils.InvalidURL, split_segment_parameters, "foo/base,key1"
