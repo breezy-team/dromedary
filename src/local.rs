@@ -241,7 +241,7 @@ impl Transport for LocalTransport {
     fn set_segment_parameter(&mut self, key: &str, value: Option<&str>) -> Result<()> {
         let (raw, mut params) = crate::urlutils::split_segment_parameters(self.base.as_str())?;
         if let Some(value) = value {
-            params.insert(key, value);
+            params.insert(key, value.to_string());
         } else {
             params.remove(key);
         }
@@ -252,8 +252,8 @@ impl Transport for LocalTransport {
     fn get_segment_parameters(&self) -> Result<HashMap<String, String>> {
         let (_, params) = crate::urlutils::split_segment_parameters(self.base.as_str())?;
         Ok(params
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
             .collect())
     }
 

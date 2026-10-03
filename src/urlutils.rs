@@ -309,12 +309,16 @@ pub fn split_segment_parameters_raw(url: &str) -> (&str, Vec<&str>) {
 
 /// Split the segment parameters of the last segment of a URL.
 ///
+/// The parameter values are returned unescaped.
+///
 /// Args:
 ///   url: A relative or absolute URL
 /// Returns: (url, segment_parameters)
 pub fn split_segment_parameters(
     url: &str,
-) -> Result<(&str, std::collections::HashMap<&str, &str>)> {
+) -> Result<(&str, std::collections::HashMap<&str, String>)> {
+    use percent_encoding::percent_decode_str;
+
     let (base_url, subsegments) = split_segment_parameters_raw(url);
     let parameters = subsegments
         .iter()
@@ -322,9 +326,16 @@ pub fn split_segment_parameters(
             subsegment
                 .split_once('=')
                 .ok_or_else(|| Error::SubsegmentMissesEquals(subsegment.to_string()))
-                .map(|(key, value)| (key.trim(), value.trim()))
+                .map(|(key, value)| {
+                    (
+                        key.trim(),
+                        percent_decode_str(value.trim())
+                            .decode_utf8_lossy()
+                            .into_owned(),
+                    )
+                })
         })
-        .collect::<Result<HashMap<&str, &str>>>()?;
+        .collect::<Result<HashMap<&str, String>>>()?;
     Ok((base_url, parameters))
 }
 
@@ -364,13 +375,20 @@ pub fn join_segment_parameters_raw(base: &str, subsegments: &[&str]) -> Result<S
 ///
 /// The parameters of the last segment in the URL will be updated; if a
 /// parameter with the same key already exists it will be overwritten.
+/// The parameter values are escaped, so they should be passed in unescaped.
 ///
 /// Args:
 ///   url: A URL, as string
-///    parameters: Dictionary of parameters, keys and values as bytestrings
-pub fn join_segment_parameters(url: &str, parameters: &HashMap<&str, &str>) -> Result<String> {
+///    parameters: Dictionary of parameters, keys and values as strings
+pub fn join_segment_parameters<V: AsRef<str>>(
+    url: &str,
+    parameters: &HashMap<&str, V>,
+) -> Result<String> {
     let (base, existing_parameters) = split_segment_parameters(url)?;
-    let mut new_parameters = existing_parameters.clone();
+    let mut new_parameters: HashMap<&str, &str> = existing_parameters
+        .iter()
+        .map(|(key, value)| (*key, value.as_str()))
+        .collect();
 
     for (key, value) in parameters {
         if key.contains('=') {
@@ -380,7 +398,7 @@ pub fn join_segment_parameters(url: &str, parameters: &HashMap<&str, &str>) -> R
             ));
         }
 
-        new_parameters.insert(key, value);
+        new_parameters.insert(key, value.as_ref());
     }
 
     let mut items: Vec<_> = new_parameters.iter().collect();
@@ -388,7 +406,7 @@ pub fn join_segment_parameters(url: &str, parameters: &HashMap<&str, &str>) -> R
 
     let sorted_parameters: Vec<_> = items
         .iter()
-        .map(|(key, value)| format!("{}={}", key, value))
+        .map(|(key, value)| format!("{}={}", key, escape(value.as_bytes(), Some(""))))
         .collect();
 
     join_segment_parameters_raw(
@@ -931,6 +949,120 @@ pub fn parse_url(url: &str) -> Result<ParsedUrl> {
         port,
         quoted_path: path,
     })
+}
+
+#[cfg(test)]
+mod segment_parameters_tests {
+    use super::*;
+
+    #[test]
+    fn join_escapes_values() {
+        for (value, expected) in [
+            ("val1", "/somedir/path,branch=val1"),
+            ("foo/bar", "/somedir/path,branch=foo%2Fbar"),
+            ("brr,brr", "/somedir/path,branch=brr%2Cbrr"),
+            ("foo%2Fbar", "/somedir/path,branch=foo%252Fbar"),
+            ("foo=bar", "/somedir/path,branch=foo%3Dbar"),
+            ("\u{e5}", "/somedir/path,branch=%C3%A5"),
+        ] {
+            let parameters = HashMap::from([("branch", value)]);
+            assert_eq!(
+                join_segment_parameters("/somedir/path", &parameters).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn join_keeps_existing() {
+        let parameters = HashMap::from([("key1", "val1".to_string())]);
+        assert_eq!(
+            join_segment_parameters("/somedir/path,branch=foo%2Fbar", &parameters).unwrap(),
+            "/somedir/path,branch=foo%2Fbar,key1=val1"
+        );
+    }
+
+    #[test]
+    fn split_unescapes_values() {
+        for (url, expected) in [
+            ("/somedir/path,branch=tip", "tip"),
+            ("/somedir/path,branch=heads%2Ftip", "heads/tip"),
+            ("/somedir/path,branch=heads%2F=tip", "heads/=tip"),
+            ("/somedir/path,branch=foo%252Fbar", "foo%2Fbar"),
+            ("/somedir/path,branch=%C3%A5", "\u{e5}"),
+        ] {
+            let (base, parameters) = split_segment_parameters(url).unwrap();
+            assert_eq!(base, "/somedir/path");
+            assert_eq!(
+                parameters,
+                HashMap::from([("branch", expected.to_string())])
+            );
+        }
+    }
+
+    #[test]
+    fn split_invalid_utf8_is_replaced() {
+        let (_, parameters) = split_segment_parameters("/somedir/path,branch=caf%E5").unwrap();
+        assert_eq!(parameters["branch"], "caf\u{fffd}");
+    }
+
+    #[test]
+    fn split_invalid_escape_is_kept() {
+        let (_, parameters) = split_segment_parameters("/somedir/path,branch=foo%zz").unwrap();
+        assert_eq!(parameters["branch"], "foo%zz");
+        let (_, parameters) = split_segment_parameters("/somedir/path,branch=100%").unwrap();
+        assert_eq!(parameters["branch"], "100%");
+    }
+
+    #[test]
+    fn empty_value() {
+        let parameters = HashMap::from([("branch", "")]);
+        let url = join_segment_parameters("/somedir/path", &parameters).unwrap();
+        assert_eq!(url, "/somedir/path,branch=");
+        let (_, parameters) = split_segment_parameters(&url).unwrap();
+        assert_eq!(parameters["branch"], "");
+    }
+
+    #[test]
+    fn surrounding_space() {
+        // Unescaped surrounding whitespace is trimmed before unescaping.
+        let (_, parameters) = split_segment_parameters("/somedir/path,branch= tip ").unwrap();
+        assert_eq!(parameters["branch"], "tip");
+        let (_, parameters) = split_segment_parameters("/somedir/path,branch=%20tip%20").unwrap();
+        assert_eq!(parameters["branch"], " tip ");
+        let parameters = HashMap::from([("branch", " tip ")]);
+        assert_eq!(
+            join_segment_parameters("/somedir/path", &parameters).unwrap(),
+            "/somedir/path,branch=%20tip%20"
+        );
+    }
+
+    #[test]
+    fn join_normalises_existing() {
+        let parameters = HashMap::from([("key1", "val1")]);
+        assert_eq!(
+            join_segment_parameters("/somedir/path,branch=foo%2fbar", &parameters).unwrap(),
+            "/somedir/path,branch=foo%2Fbar,key1=val1"
+        );
+    }
+
+    #[test]
+    fn roundtrip() {
+        for value in [
+            "tip",
+            "foo/bar",
+            "foo,bar",
+            "foo=bar",
+            "foo%2Fbar",
+            "\u{e5} b",
+        ] {
+            let parameters = HashMap::from([("branch", value)]);
+            let url = join_segment_parameters("/somedir/path", &parameters).unwrap();
+            let (base, parameters) = split_segment_parameters(&url).unwrap();
+            assert_eq!(base, "/somedir/path");
+            assert_eq!(parameters, HashMap::from([("branch", value.to_string())]));
+        }
+    }
 }
 
 #[cfg(test)]
