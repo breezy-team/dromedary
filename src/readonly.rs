@@ -191,8 +191,8 @@ mod tests {
     fn reads_pass_through() {
         let t = ro();
         assert_eq!(t.get_bytes("hello").unwrap(), b"world");
-        assert_eq!(t.has("hello").unwrap(), true);
-        assert_eq!(t.has("missing").unwrap(), false);
+        assert!(t.has("hello").unwrap());
+        assert!(!t.has("missing").unwrap());
     }
 
     #[test]
@@ -235,7 +235,7 @@ mod tests {
     #[test]
     fn lock_read_passes_but_lock_write_rejected() {
         let t = ro();
-        let _l = t.lock_read("hello").ok().expect("read lock");
+        let _l = t.lock_read("hello").expect("read lock");
         match t.lock_write("hello") {
             Err(Error::TransportNotPossible(_)) => {}
             Err(other) => panic!("expected TransportNotPossible, got {:?}", other),

@@ -95,7 +95,7 @@ mod tests {
     fn ok_rename_still_works() {
         let t = wrap();
         t.rename("a", "c").unwrap();
-        assert_eq!(t.has("a").unwrap(), false);
+        assert!(!t.has("a").unwrap());
         assert_eq!(t.get_bytes("c").unwrap(), b"A");
     }
 

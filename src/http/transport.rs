@@ -18,6 +18,7 @@ use url::Url;
 use crate::http::client::{HttpClient, HttpResponse, RequestOptions};
 use crate::http::response::{handle_response, InFile, RangeFile, ResponseError, ResponseKind};
 use crate::lock::BogusLock;
+use crate::readv::CoalescedRange;
 use crate::{Error, Permissions, ReadStream, Result, Stat, Transport, UrlFragment};
 
 /// Range-request support hint. The client starts at `Multi`
@@ -560,7 +561,7 @@ fn normalise_http_url(
     let trimmed = base.trim();
     let scheme_end = trimmed
         .find("://")
-        .ok_or_else(|| Error::UrlError(url::ParseError::RelativeUrlWithoutBase))?;
+        .ok_or(Error::UrlError(url::ParseError::RelativeUrlWithoutBase))?;
     let raw_scheme = &trimmed[..scheme_end];
     // Reduce a compound scheme to its plain `http`/`https` component,
     // accepting the qualifier on either side of the `+`:
@@ -1258,9 +1259,9 @@ impl HttpTransport {
     fn readv_one_pass(
         &self,
         relpath: &UrlFragment,
-        coalesced: &[(usize, usize, Vec<(usize, usize)>)],
+        coalesced: &[CoalescedRange],
         offsets_order: &[(usize, usize)],
-    ) -> std::result::Result<Vec<Result<(u64, Vec<u8>)>>, ReadvPassError> {
+    ) -> std::result::Result<Vec<crate::ReadvItem>, ReadvPassError> {
         let tuning = self.readv_tuning();
         let max_get_ranges = tuning.max_get_ranges.max(1);
         let get_max_size = tuning.get_max_size; // 0 = unlimited
@@ -1270,11 +1271,11 @@ impl HttpTransport {
         // `RangeHint::None` collapses everything into one full-file
         // GET; `Single` is one chunk per request; `Multi` packs as
         // much as the caps allow.
-        let batches: Vec<&[(usize, usize, Vec<(usize, usize)>)]> = match hint {
+        let batches: Vec<&[CoalescedRange]> = match hint {
             RangeHint::None => vec![coalesced],
             RangeHint::Single => coalesced.chunks(1).collect::<Vec<_>>(),
             RangeHint::Multi => {
-                let mut batches: Vec<&[(usize, usize, Vec<(usize, usize)>)]> = Vec::new();
+                let mut batches: Vec<&[CoalescedRange]> = Vec::new();
                 let mut start = 0;
                 let mut acc_bytes = 0usize;
                 let mut acc_ranges = 0usize;
@@ -1371,6 +1372,291 @@ impl HttpTransport {
 
         Ok(results)
     }
+}
+
+/// Internal control flow between `readv_eager` and `readv_one_pass`.
+enum ReadvPassError {
+    /// Server misbehaved; step the range hint down and try again
+    /// with the given remaining offsets. `cause` is the underlying
+    /// error (if any) that triggered the retry — surfaced to the
+    /// caller once the degradation ladder runs out, so the final
+    /// error is specific rather than a generic "server misbehaved".
+    Retry {
+        remaining: Vec<(usize, usize)>,
+        cause: Option<Error>,
+    },
+    /// Hard error — surface to the caller.
+    Hard(Error),
+}
+
+/// Lazy `readv` iterator that issues one HTTP GET per batch on
+/// demand. Breezy's `test_*_leave_pipe_clean` tests pull the
+/// first yield, check how many GETs the server saw, then stop —
+/// so an eager implementation that drains all batches up-front
+/// fails those assertions even though the data it returns is
+/// correct.
+///
+/// On a retry-worthy error we fall back to the eager path, which
+/// runs the whole degrade-and-retry loop. The eager fallback
+/// includes any batches we haven't touched yet plus the one that
+/// failed.
+struct LazyReadv {
+    transport: HttpTransport,
+    relpath: String,
+    /// The caller's offsets in yield order. Populated with
+    /// `(offset, size)` pairs; we pop the head each time we yield.
+    pending: std::collections::VecDeque<(usize, usize)>,
+    /// Pre-fetched `(offset, size) -> data` map from the most
+    /// recent batch, read in-order out of the HTTP response.
+    yielded: std::collections::VecDeque<Result<(u64, Vec<u8>)>>,
+    /// Coalesced batches we haven't fetched yet, computed once at
+    /// iterator construction from the sorted+coalesced plan.
+    batches: std::collections::VecDeque<Vec<CoalescedRange>>,
+    /// Set once we've fallen back to the eager path — all
+    /// subsequent yields come from `yielded` and we stop issuing
+    /// new GETs.
+    exhausted: bool,
+    /// A retry-worthy failure from an earlier batch that we
+    /// haven't acted on yet — deferred so callers can consume
+    /// the ranges we *did* manage to parse from the partial
+    /// response before we start issuing fresh GETs. The error is
+    /// discharged the next time `fetch_next_batch` runs and
+    /// `yielded` has drained.
+    deferred_fallback: Option<Error>,
+}
+
+impl LazyReadv {
+    fn new(transport: HttpTransport, relpath: String, offsets: Vec<(u64, usize)>) -> Self {
+        let offsets_usize: Vec<(usize, usize)> =
+            offsets.iter().map(|(o, s)| (*o as usize, *s)).collect();
+        let sorted: Vec<(usize, usize)> = {
+            let mut v = offsets_usize.clone();
+            v.sort();
+            v
+        };
+        let tuning = transport.readv_tuning();
+        let opt = |v: usize| if v == 0 { None } else { Some(v) };
+        let coalesced = match crate::readv::coalesce_offsets(
+            &sorted,
+            opt(tuning.max_readv_combine),
+            Some(tuning.bytes_to_read_before_seek),
+            opt(tuning.get_max_size),
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                // Can't coalesce — degenerate to the eager path's
+                // error shape for uniformity with existing tests.
+                let mut yielded = std::collections::VecDeque::new();
+                yielded.push_back(Err(Error::InvalidHttpResponse {
+                    path: relpath.clone(),
+                    msg: format!("overlapping ranges: {}", e),
+                }));
+                return Self {
+                    transport,
+                    relpath,
+                    pending: offsets_usize.into(),
+                    yielded,
+                    batches: std::collections::VecDeque::new(),
+                    exhausted: true,
+                    deferred_fallback: None,
+                };
+            }
+        };
+        let batches = compute_batches(&coalesced, &tuning, &transport.range_hint.lock().unwrap());
+        Self {
+            transport,
+            relpath,
+            pending: offsets_usize.into(),
+            yielded: std::collections::VecDeque::new(),
+            batches,
+            exhausted: false,
+            deferred_fallback: None,
+        }
+    }
+
+    /// Issue the next batch's GET and push its sub-ranges into
+    /// `yielded` in the order the caller originally asked for
+    /// them (reordering within the batch using pending's head).
+    fn fetch_next_batch(&mut self) -> bool {
+        // Discharge any pending fallback before issuing a fresh GET:
+        // an earlier batch left partial results and a deferred
+        // error, and now the caller's asking for more offsets than
+        // that partial could satisfy. Running the fallback here
+        // (rather than inline with the failed read) means we yield
+        // the partial ranges first, then only replay the eager
+        // path for the offsets that actually went unsatisfied.
+        if let Some(err) = self.deferred_fallback.take() {
+            self.run_eager_fallback(Some(err));
+            return true;
+        }
+        let Some(batch) = self.batches.pop_front() else {
+            return false;
+        };
+        let flat: Vec<(usize, usize)> = batch
+            .iter()
+            .map(|(start, length, _)| (*start, *length))
+            .collect();
+        let range_header = self.transport.attempted_range_header(&flat, 0);
+        let mut rf = match self.transport._get(&self.relpath, range_header.as_deref()) {
+            Ok((_code, rf)) => rf,
+            Err(e) => {
+                // Fall back to the eager/degrade loop — hand it
+                // the remaining offsets (the current batch's plus
+                // anything we hadn't started yet, reconstructed
+                // from `pending`).
+                self.run_eager_fallback(Some(e));
+                return true;
+            }
+        };
+        // Pull each sub-range's bytes from the response and route
+        // them to either `yielded` (for the next caller request)
+        // or a per-batch data_map for out-of-order reassembly. We
+        // drain `pending` incrementally — if reading later in the
+        // batch fails (e.g. a truncated multipart body), earlier
+        // ranges we already decoded are still yielded before the
+        // fallback kicks in, matching
+        // `test_readv_with_short_reads`'s expectation that partial
+        // progress survives a cut-short response.
+        let mut data_map: std::collections::HashMap<(usize, usize), Vec<u8>> =
+            std::collections::HashMap::new();
+        let flush_available =
+            |data_map: &mut std::collections::HashMap<(usize, usize), Vec<u8>>,
+             pending: &mut std::collections::VecDeque<(usize, usize)>,
+             yielded: &mut std::collections::VecDeque<Result<(u64, Vec<u8>)>>| {
+                while let Some(&(off, size)) = pending.front() {
+                    if let Some(data) = data_map.remove(&(off, size)) {
+                        pending.pop_front();
+                        yielded.push_back(Ok((off as u64, data)));
+                    } else {
+                        break;
+                    }
+                }
+            };
+        for (coal_start, _coal_length, ranges) in &batch {
+            for (sub_offset, sub_size) in ranges {
+                let abs_start = coal_start + sub_offset;
+                match rf.read_at(abs_start as u64, *sub_size) {
+                    Ok(d) => {
+                        data_map.insert((abs_start, *sub_size), d);
+                        flush_available(&mut data_map, &mut self.pending, &mut self.yielded);
+                    }
+                    Err(e) => {
+                        flush_available(&mut data_map, &mut self.pending, &mut self.yielded);
+                        // If we yielded anything this batch, defer
+                        // the fallback — the caller asked for one
+                        // range at a time via next(), so don't
+                        // burn a fresh GET until they actually
+                        // reach a range we couldn't satisfy. If we
+                        // have nothing to show, fall back now so
+                        // the caller sees results rather than an
+                        // infinite empty-batch loop.
+                        if self.yielded.is_empty() {
+                            self.run_eager_fallback(Some(e));
+                        } else {
+                            self.deferred_fallback = Some(e);
+                        }
+                        return true;
+                    }
+                }
+            }
+        }
+        flush_available(&mut data_map, &mut self.pending, &mut self.yielded);
+        true
+    }
+
+    /// Fall back to the eager readv path for any remaining offsets
+    /// plus the current failure. Matches the previous behaviour for
+    /// the retry-worthy error categories — those need the full
+    /// degrade-and-retry loop which is too invasive to replicate
+    /// here. Invoked both synchronously when we have no partial
+    /// results, and as the `deferred_fallback` discharge in
+    /// `fetch_next_batch`. Degrades the range hint based on the
+    /// failure shape before handing off so the eager path doesn't
+    /// replay the same doomed request.
+    fn run_eager_fallback(&mut self, cause: Option<Error>) {
+        let remaining: Vec<(u64, usize)> =
+            self.pending.iter().map(|(o, s)| (*o as u64, *s)).collect();
+        self.pending.clear();
+        self.batches.clear();
+        self.exhausted = true;
+        match &cause {
+            Some(Error::InvalidHttpRange { .. }) => {
+                self.transport.jump_range_hint_to_none();
+            }
+            Some(Error::InvalidHttpResponse { .. }) | Some(Error::ShortReadvError(_, _, _, _)) => {
+                self.transport.degrade_range_hint();
+            }
+            _ => {}
+        }
+        let results = self.transport.readv_eager(&self.relpath, remaining);
+        for r in results {
+            self.yielded.push_back(r);
+        }
+    }
+}
+
+impl Iterator for LazyReadv {
+    type Item = Result<(u64, Vec<u8>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(next) = self.yielded.pop_front() {
+                return Some(next);
+            }
+            if self.exhausted {
+                return None;
+            }
+            if !self.fetch_next_batch() {
+                // No more batches left; whatever is in `yielded`
+                // got yielded on prior iterations.
+                return None;
+            }
+        }
+    }
+}
+
+/// Carve a coalesced offset list into batches honouring the per-
+/// request caps (max_get_ranges, get_max_size) and the current
+/// range hint. Shared between `readv_one_pass` and `LazyReadv`.
+fn compute_batches(
+    coalesced: &[CoalescedRange],
+    tuning: &ReadvTuning,
+    hint: &RangeHint,
+) -> std::collections::VecDeque<Vec<CoalescedRange>> {
+    let max_get_ranges = tuning.max_get_ranges.max(1);
+    let get_max_size = tuning.get_max_size;
+    let mut batches: std::collections::VecDeque<Vec<CoalescedRange>> =
+        std::collections::VecDeque::new();
+    match hint {
+        RangeHint::None => {
+            batches.push_back(coalesced.to_vec());
+        }
+        RangeHint::Single => {
+            for coal in coalesced {
+                batches.push_back(vec![coal.clone()]);
+            }
+        }
+        RangeHint::Multi => {
+            let mut current: Vec<CoalescedRange> = Vec::new();
+            let mut acc_bytes = 0usize;
+            for coal in coalesced {
+                let length = coal.1;
+                let would_exceed_size =
+                    get_max_size > 0 && acc_bytes + length > get_max_size && !current.is_empty();
+                let would_exceed_ranges = current.len() >= max_get_ranges;
+                if would_exceed_size || would_exceed_ranges {
+                    batches.push_back(std::mem::take(&mut current));
+                    acc_bytes = 0;
+                }
+                current.push(coal.clone());
+                acc_bytes += length;
+            }
+            if !current.is_empty() {
+                batches.push_back(current);
+            }
+        }
+    }
+    batches
 }
 
 #[cfg(test)]
@@ -1597,7 +1883,7 @@ mod tests {
         );
         // Setting value=None removes the parameter.
         t.set_segment_parameter("arm", None).unwrap();
-        assert!(t.get_segment_parameters().unwrap().get("arm").is_none());
+        assert!(!t.get_segment_parameters().unwrap().contains_key("arm"));
         // Removing a nonexistent parameter is a no-op, not an error.
         t.set_segment_parameter("nonexistent", None).unwrap();
     }
@@ -1764,289 +2050,4 @@ mod tests {
             crate::ReuseMatch::None
         );
     }
-}
-
-/// Internal control flow between `readv_eager` and `readv_one_pass`.
-enum ReadvPassError {
-    /// Server misbehaved; step the range hint down and try again
-    /// with the given remaining offsets. `cause` is the underlying
-    /// error (if any) that triggered the retry — surfaced to the
-    /// caller once the degradation ladder runs out, so the final
-    /// error is specific rather than a generic "server misbehaved".
-    Retry {
-        remaining: Vec<(usize, usize)>,
-        cause: Option<Error>,
-    },
-    /// Hard error — surface to the caller.
-    Hard(Error),
-}
-
-/// Lazy `readv` iterator that issues one HTTP GET per batch on
-/// demand. Breezy's `test_*_leave_pipe_clean` tests pull the
-/// first yield, check how many GETs the server saw, then stop —
-/// so an eager implementation that drains all batches up-front
-/// fails those assertions even though the data it returns is
-/// correct.
-///
-/// On a retry-worthy error we fall back to the eager path, which
-/// runs the whole degrade-and-retry loop. The eager fallback
-/// includes any batches we haven't touched yet plus the one that
-/// failed.
-struct LazyReadv {
-    transport: HttpTransport,
-    relpath: String,
-    /// The caller's offsets in yield order. Populated with
-    /// `(offset, size)` pairs; we pop the head each time we yield.
-    pending: std::collections::VecDeque<(usize, usize)>,
-    /// Pre-fetched `(offset, size) -> data` map from the most
-    /// recent batch, read in-order out of the HTTP response.
-    yielded: std::collections::VecDeque<Result<(u64, Vec<u8>)>>,
-    /// Coalesced batches we haven't fetched yet, computed once at
-    /// iterator construction from the sorted+coalesced plan.
-    batches: std::collections::VecDeque<Vec<(usize, usize, Vec<(usize, usize)>)>>,
-    /// Set once we've fallen back to the eager path — all
-    /// subsequent yields come from `yielded` and we stop issuing
-    /// new GETs.
-    exhausted: bool,
-    /// A retry-worthy failure from an earlier batch that we
-    /// haven't acted on yet — deferred so callers can consume
-    /// the ranges we *did* manage to parse from the partial
-    /// response before we start issuing fresh GETs. The error is
-    /// discharged the next time `fetch_next_batch` runs and
-    /// `yielded` has drained.
-    deferred_fallback: Option<Error>,
-}
-
-impl LazyReadv {
-    fn new(transport: HttpTransport, relpath: String, offsets: Vec<(u64, usize)>) -> Self {
-        let offsets_usize: Vec<(usize, usize)> =
-            offsets.iter().map(|(o, s)| (*o as usize, *s)).collect();
-        let sorted: Vec<(usize, usize)> = {
-            let mut v = offsets_usize.clone();
-            v.sort();
-            v
-        };
-        let tuning = transport.readv_tuning();
-        let opt = |v: usize| if v == 0 { None } else { Some(v) };
-        let coalesced = match crate::readv::coalesce_offsets(
-            &sorted,
-            opt(tuning.max_readv_combine),
-            Some(tuning.bytes_to_read_before_seek),
-            opt(tuning.get_max_size),
-        ) {
-            Ok(c) => c,
-            Err(e) => {
-                // Can't coalesce — degenerate to the eager path's
-                // error shape for uniformity with existing tests.
-                let mut yielded = std::collections::VecDeque::new();
-                yielded.push_back(Err(Error::InvalidHttpResponse {
-                    path: relpath.clone(),
-                    msg: format!("overlapping ranges: {}", e),
-                }));
-                return Self {
-                    transport,
-                    relpath,
-                    pending: offsets_usize.into(),
-                    yielded,
-                    batches: std::collections::VecDeque::new(),
-                    exhausted: true,
-                    deferred_fallback: None,
-                };
-            }
-        };
-        let batches = compute_batches(&coalesced, &tuning, &transport.range_hint.lock().unwrap());
-        Self {
-            transport,
-            relpath,
-            pending: offsets_usize.into(),
-            yielded: std::collections::VecDeque::new(),
-            batches,
-            exhausted: false,
-            deferred_fallback: None,
-        }
-    }
-
-    /// Issue the next batch's GET and push its sub-ranges into
-    /// `yielded` in the order the caller originally asked for
-    /// them (reordering within the batch using pending's head).
-    fn fetch_next_batch(&mut self) -> bool {
-        // Discharge any pending fallback before issuing a fresh GET:
-        // an earlier batch left partial results and a deferred
-        // error, and now the caller's asking for more offsets than
-        // that partial could satisfy. Running the fallback here
-        // (rather than inline with the failed read) means we yield
-        // the partial ranges first, then only replay the eager
-        // path for the offsets that actually went unsatisfied.
-        if let Some(err) = self.deferred_fallback.take() {
-            self.run_eager_fallback(Some(err));
-            return true;
-        }
-        let Some(batch) = self.batches.pop_front() else {
-            return false;
-        };
-        let flat: Vec<(usize, usize)> = batch
-            .iter()
-            .map(|(start, length, _)| (*start, *length))
-            .collect();
-        let range_header = self.transport.attempted_range_header(&flat, 0);
-        let mut rf = match self.transport._get(&self.relpath, range_header.as_deref()) {
-            Ok((_code, rf)) => rf,
-            Err(e) => {
-                // Fall back to the eager/degrade loop — hand it
-                // the remaining offsets (the current batch's plus
-                // anything we hadn't started yet, reconstructed
-                // from `pending`).
-                self.run_eager_fallback(Some(e));
-                return true;
-            }
-        };
-        // Pull each sub-range's bytes from the response and route
-        // them to either `yielded` (for the next caller request)
-        // or a per-batch data_map for out-of-order reassembly. We
-        // drain `pending` incrementally — if reading later in the
-        // batch fails (e.g. a truncated multipart body), earlier
-        // ranges we already decoded are still yielded before the
-        // fallback kicks in, matching
-        // `test_readv_with_short_reads`'s expectation that partial
-        // progress survives a cut-short response.
-        let mut data_map: std::collections::HashMap<(usize, usize), Vec<u8>> =
-            std::collections::HashMap::new();
-        let flush_available =
-            |data_map: &mut std::collections::HashMap<(usize, usize), Vec<u8>>,
-             pending: &mut std::collections::VecDeque<(usize, usize)>,
-             yielded: &mut std::collections::VecDeque<Result<(u64, Vec<u8>)>>| {
-                while let Some(&(off, size)) = pending.front() {
-                    if let Some(data) = data_map.remove(&(off, size)) {
-                        pending.pop_front();
-                        yielded.push_back(Ok((off as u64, data)));
-                    } else {
-                        break;
-                    }
-                }
-            };
-        for (coal_start, _coal_length, ranges) in &batch {
-            for (sub_offset, sub_size) in ranges {
-                let abs_start = coal_start + sub_offset;
-                match rf.read_at(abs_start as u64, *sub_size) {
-                    Ok(d) => {
-                        data_map.insert((abs_start, *sub_size), d);
-                        flush_available(&mut data_map, &mut self.pending, &mut self.yielded);
-                    }
-                    Err(e) => {
-                        flush_available(&mut data_map, &mut self.pending, &mut self.yielded);
-                        // If we yielded anything this batch, defer
-                        // the fallback — the caller asked for one
-                        // range at a time via next(), so don't
-                        // burn a fresh GET until they actually
-                        // reach a range we couldn't satisfy. If we
-                        // have nothing to show, fall back now so
-                        // the caller sees results rather than an
-                        // infinite empty-batch loop.
-                        if self.yielded.is_empty() {
-                            self.run_eager_fallback(Some(e));
-                        } else {
-                            self.deferred_fallback = Some(e);
-                        }
-                        return true;
-                    }
-                }
-            }
-        }
-        flush_available(&mut data_map, &mut self.pending, &mut self.yielded);
-        true
-    }
-
-    /// Fall back to the eager readv path for any remaining offsets
-    /// plus the current failure. Matches the previous behaviour for
-    /// the retry-worthy error categories — those need the full
-    /// degrade-and-retry loop which is too invasive to replicate
-    /// here. Invoked both synchronously when we have no partial
-    /// results, and as the `deferred_fallback` discharge in
-    /// `fetch_next_batch`. Degrades the range hint based on the
-    /// failure shape before handing off so the eager path doesn't
-    /// replay the same doomed request.
-    fn run_eager_fallback(&mut self, cause: Option<Error>) {
-        let remaining: Vec<(u64, usize)> =
-            self.pending.iter().map(|(o, s)| (*o as u64, *s)).collect();
-        self.pending.clear();
-        self.batches.clear();
-        self.exhausted = true;
-        match &cause {
-            Some(Error::InvalidHttpRange { .. }) => {
-                self.transport.jump_range_hint_to_none();
-            }
-            Some(Error::InvalidHttpResponse { .. }) | Some(Error::ShortReadvError(_, _, _, _)) => {
-                self.transport.degrade_range_hint();
-            }
-            _ => {}
-        }
-        let results = self.transport.readv_eager(&self.relpath, remaining);
-        for r in results {
-            self.yielded.push_back(r);
-        }
-    }
-}
-
-impl Iterator for LazyReadv {
-    type Item = Result<(u64, Vec<u8>)>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if let Some(next) = self.yielded.pop_front() {
-                return Some(next);
-            }
-            if self.exhausted {
-                return None;
-            }
-            if !self.fetch_next_batch() {
-                // No more batches left; whatever is in `yielded`
-                // got yielded on prior iterations.
-                return None;
-            }
-        }
-    }
-}
-
-/// Carve a coalesced offset list into batches honouring the per-
-/// request caps (max_get_ranges, get_max_size) and the current
-/// range hint. Shared between `readv_one_pass` and `LazyReadv`.
-fn compute_batches(
-    coalesced: &[(usize, usize, Vec<(usize, usize)>)],
-    tuning: &ReadvTuning,
-    hint: &RangeHint,
-) -> std::collections::VecDeque<Vec<(usize, usize, Vec<(usize, usize)>)>> {
-    let max_get_ranges = tuning.max_get_ranges.max(1);
-    let get_max_size = tuning.get_max_size;
-    let mut batches: std::collections::VecDeque<Vec<(usize, usize, Vec<(usize, usize)>)>> =
-        std::collections::VecDeque::new();
-    match hint {
-        RangeHint::None => {
-            batches.push_back(coalesced.to_vec());
-        }
-        RangeHint::Single => {
-            for coal in coalesced {
-                batches.push_back(vec![coal.clone()]);
-            }
-        }
-        RangeHint::Multi => {
-            let mut current: Vec<(usize, usize, Vec<(usize, usize)>)> = Vec::new();
-            let mut acc_bytes = 0usize;
-            for coal in coalesced {
-                let length = coal.1;
-                let would_exceed_size =
-                    get_max_size > 0 && acc_bytes + length > get_max_size && !current.is_empty();
-                let would_exceed_ranges = current.len() >= max_get_ranges;
-                if would_exceed_size || would_exceed_ranges {
-                    batches.push_back(std::mem::take(&mut current));
-                    acc_bytes = 0;
-                }
-                current.push(coal.clone());
-                acc_bytes += length;
-            }
-            if !current.is_empty() {
-                batches.push_back(current);
-            }
-        }
-    }
-    batches
 }

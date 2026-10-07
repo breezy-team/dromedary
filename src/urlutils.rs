@@ -670,7 +670,7 @@ pub mod win32 {
             Ok(format!(
                 "file:///{}:{}",
                 drive,
-                super::escape(trimmed[2..].as_bytes(), Some("/~"))
+                super::escape(&trimmed.as_bytes()[2..], Some("/~"))
             ))
         }
     }
@@ -796,9 +796,9 @@ pub fn derive_to_location(from_location: &str) -> String {
         let basename = &from_location[separator_index + 1..];
         basename.trim_end_matches("/\\").to_string()
     } else if let Some(separator_index) = from_location.find(':') {
-        return from_location[separator_index + 1..].to_string();
+        from_location[separator_index + 1..].to_string()
     } else {
-        return from_location.to_string();
+        from_location.to_string()
     }
 }
 

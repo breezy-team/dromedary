@@ -20,7 +20,7 @@ impl FakeVfatTransport {
     }
 
     fn squash_name(name: &str) -> Result<String> {
-        if name.contains(|c: char| matches!(c, '?' | '*' | ':' | ';' | '<' | '>')) {
+        if name.contains(['?', '*', ':', ';', '<', '>']) {
             return Err(Error::PathNotChild);
         }
         Ok(name.to_lowercase())
@@ -181,13 +181,13 @@ mod tests {
 
     #[test]
     fn roundtrip_unix_modebits_false() {
-        assert_eq!(wrap().can_roundtrip_unix_modebits(), false);
+        assert!(!wrap().can_roundtrip_unix_modebits());
     }
 
     #[test]
     fn mkdir_squashes_name() {
         let t = wrap();
         t.mkdir("NewDir", None).unwrap();
-        assert_eq!(t.has("newdir").unwrap(), true);
+        assert!(t.has("newdir").unwrap());
     }
 }

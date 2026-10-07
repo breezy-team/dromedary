@@ -412,10 +412,9 @@ pub fn evaluate_proxy_bypass(host: &str, no_proxy: Option<&str>) -> ProxyBypass 
             continue;
         }
         let (dhost, dport) = splitport(domain);
-        if hport == dport || dport.is_none() {
-            if glob_prefix_match_ignore_ascii_case(dhost, hhost) {
-                return ProxyBypass::Bypass;
-            }
+        if (hport == dport || dport.is_none()) && glob_prefix_match_ignore_ascii_case(dhost, hhost)
+        {
+            return ProxyBypass::Bypass;
         }
     }
     // A no_proxy list was configured but the host didn't match any

@@ -91,7 +91,7 @@ mod tests {
 
     #[test]
     fn listable_returns_false() {
-        assert_eq!(wrap().listable(), false);
+        assert!(!wrap().listable());
     }
 
     #[test]
@@ -136,6 +136,6 @@ mod tests {
         let t = wrap();
         let cloned = t.clone(Some("sub")).unwrap();
         assert!(cloned.base().as_str().starts_with("unlistable+"));
-        assert_eq!(cloned.listable(), false);
+        assert!(!cloned.listable());
     }
 }

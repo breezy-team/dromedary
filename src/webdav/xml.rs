@@ -245,16 +245,15 @@ fn commit_element(acc: &mut ResponseAccumulator, stack: &[String], name: &str, c
                 acc.executable = Some(chars.trim().to_string());
             }
         }
-        "collection" => {
+        "collection"
             if depth == 5
                 && stack[0] == "multistatus"
                 && stack[1] == "response"
                 && stack[2] == "propstat"
                 && stack[3] == "prop"
-                && stack[4] == "resourcetype"
-            {
-                acc.is_dir = true;
-            }
+                && stack[4] == "resourcetype" =>
+        {
+            acc.is_dir = true;
         }
         _ => {}
     }
@@ -392,10 +391,10 @@ mod tests {
         let entries = parse_propfind_dir(DIR_LIST, "/dir/").unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].href, "a.txt");
-        assert_eq!(entries[0].is_dir, false);
+        assert!(!entries[0].is_dir);
         assert_eq!(entries[0].size, 10);
         assert_eq!(entries[1].href, "sub");
-        assert_eq!(entries[1].is_dir, true);
+        assert!(entries[1].is_dir);
     }
 
     #[test]

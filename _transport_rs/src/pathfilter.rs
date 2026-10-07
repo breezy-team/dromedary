@@ -8,9 +8,7 @@ fn make_filter_func(filter_py: Option<Py<PyAny>>) -> Option<FilterFunc> {
     let f = filter_py?;
     Some(Arc::new(move |p: &str| -> dromedary::Result<String> {
         Python::attach(|py| match f.call1(py, (p,)) {
-            Ok(r) => r
-                .extract::<String>(py)
-                .map_err(|e| dromedary::Error::from(e)),
+            Ok(r) => r.extract::<String>(py).map_err(dromedary::Error::from),
             Err(e) => Err(dromedary::Error::from(e)),
         })
     }))
