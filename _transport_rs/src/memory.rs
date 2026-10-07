@@ -54,7 +54,10 @@ fn split_url(url: &str) -> (String, String, String) {
 impl MemoryTransport {
     #[new]
     #[pyo3(signature = (url="", _shared_store=None))]
-    fn new(url: &str, _shared_store: Option<Py<MemoryStoreHandle>>) -> PyResult<(Self, Transport)> {
+    fn new(
+        url: &str,
+        _shared_store: Option<Py<MemoryStoreHandle>>,
+    ) -> PyResult<PyClassInitializer<Self>> {
         let (normalised, scheme, cwd) = split_url(url);
 
         let rust = match _shared_store {
@@ -67,13 +70,12 @@ impl MemoryTransport {
                 .map_err(|e| map_transport_err_to_py_err(e, None, None))?,
         };
 
-        Ok((
-            MemoryTransport {
+        Ok(
+            PyClassInitializer::from(Transport(Box::new(rust))).add_subclass(MemoryTransport {
                 _scheme: scheme,
                 _cwd: cwd,
-            },
-            Transport(Box::new(rust)),
-        ))
+            }),
+        )
     }
 
     #[pyo3(signature = (offset=None))]

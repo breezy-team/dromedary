@@ -1203,19 +1203,15 @@ struct LocalTransport {}
 #[pymethods]
 impl LocalTransport {
     #[new]
-    fn new(url: &str) -> PyResult<(Self, Transport)> {
-        Ok((
-            LocalTransport {},
-            Transport(Box::new(
-                dromedary::local::LocalTransport::new(url)
-                    .map_err(|e| map_transport_err_to_py_err(e, None, None))?,
-            )),
-        ))
+    fn new(url: &str) -> PyResult<PyClassInitializer<Self>> {
+        let rust = dromedary::local::LocalTransport::new(url)
+            .map_err(|e| map_transport_err_to_py_err(e, None, None))?;
+        Ok(PyClassInitializer::from(Transport(Box::new(rust))).add_subclass(LocalTransport {}))
     }
 
     #[pyo3(signature = (abspath,))]
     #[classmethod]
-    fn from_abspath<'a>(cls: &'a Bound<'a, PyType>, abspath: &'a str) -> PyResult<Bound<'a, Self>> {
+    fn from_abspath<'a>(cls: &Bound<'a, PyType>, abspath: &str) -> PyResult<Bound<'a, Self>> {
         let ret = dromedary::local::LocalTransport::from_abspath(Path::new(abspath))
             .map_err(|e| map_transport_err_to_py_err(e, None, Some(abspath)))?;
 

@@ -8,11 +8,11 @@ pub(crate) struct GioTransport {}
 impl GioTransport {
     #[new]
     #[pyo3(signature = (base, _from_transport=None))]
-    fn new(base: &str, _from_transport: Option<Py<PyAny>>) -> PyResult<(Self, Transport)> {
+    fn new(base: &str, _from_transport: Option<Py<PyAny>>) -> PyResult<PyClassInitializer<Self>> {
         let _ = _from_transport;
         let rust = dromedary::gio::GioTransport::new(base)
             .map_err(|e| map_transport_err_to_py_err(e, None, None))?;
-        Ok((GioTransport {}, Transport(Box::new(rust))))
+        Ok(PyClassInitializer::from(Transport(Box::new(rust))).add_subclass(GioTransport {}))
     }
 
     #[pyo3(signature = (offset=None))]
