@@ -332,9 +332,14 @@ impl HttpResponse {
     /// buffer without re-reading.
     #[getter]
     fn data<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let mut inner = self.inner.lock().unwrap();
-        let body = inner.body().map_err(py_io_err)?;
-        Ok(PyBytes::new(py, body))
+        // Drain the body with the GIL released (see `read`), then copy
+        // the buffered bytes out under the GIL.
+        let bytes = py.detach(|| {
+            let mut inner = self.inner.lock().unwrap();
+            inner.body().map(|b| b.to_vec())
+        });
+        let bytes = bytes.map_err(py_io_err)?;
+        Ok(PyBytes::new(py, &bytes))
     }
 
     /// Decoded body as str, using the Content-Type charset when
@@ -342,32 +347,38 @@ impl HttpResponse {
     /// returns `None` on a 204 No Content response.
     #[getter]
     fn text(&self, py: Python) -> PyResult<Py<PyAny>> {
-        let mut inner = self.inner.lock().unwrap();
-        if inner.status == 204 {
-            return Ok(py.None());
-        }
-        // Read the charset out of the Content-Type header before
-        // borrowing the body; the two &self borrows otherwise
-        // overlap because `body()` takes &mut.
-        let _charset = inner
-            .header("content-type")
-            .and_then(|v| {
-                v.split(';').find_map(|piece| {
-                    let piece = piece.trim();
-                    piece
-                        .strip_prefix("charset=")
-                        .map(|c| c.trim_matches('"').to_string())
+        // Drain and decode the body with the GIL released (see `read`).
+        let text = py.detach(|| {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.status == 204 {
+                return Ok(None);
+            }
+            // Read the charset out of the Content-Type header before
+            // borrowing the body; the two &self borrows otherwise
+            // overlap because `body()` takes &mut.
+            let _charset = inner
+                .header("content-type")
+                .and_then(|v| {
+                    v.split(';').find_map(|piece| {
+                        let piece = piece.trim();
+                        piece
+                            .strip_prefix("charset=")
+                            .map(|c| c.trim_matches('"').to_string())
+                    })
                 })
-            })
-            .unwrap_or_else(|| "utf-8".to_string());
+                .unwrap_or_else(|| "utf-8".to_string());
 
-        // Only UTF-8 is handled natively; everything else falls back
-        // to replacing invalid bytes. Real non-UTF-8 payloads are
-        // vanishingly rare on the Bazaar smart-protocol path this
-        // is aimed at, and breezy didn't support them either.
-        let body = inner.body().map_err(py_io_err)?;
-        let text = String::from_utf8_lossy(body).into_owned();
-        Ok(PyString::new(py, &text).into())
+            // Only UTF-8 is handled natively; everything else falls
+            // back to replacing invalid bytes. Real non-UTF-8 payloads
+            // are vanishingly rare on the Bazaar smart-protocol path
+            // this is aimed at, and breezy didn't support them either.
+            let body = inner.body()?;
+            Ok(Some(String::from_utf8_lossy(body).into_owned()))
+        });
+        match text.map_err(py_io_err)? {
+            Some(s) => Ok(PyString::new(py, &s).into()),
+            None => Ok(py.None()),
+        }
     }
 
     /// File-like read. `size=None` (or negative) reads all remaining
@@ -376,13 +387,18 @@ impl HttpResponse {
     /// rest available for subsequent reads.
     #[pyo3(signature = (size=None))]
     fn read<'py>(&self, py: Python<'py>, size: Option<i64>) -> PyResult<Bound<'py, PyBytes>> {
-        let mut inner = self.inner.lock().unwrap();
         let n = match size {
             None | Some(-1) => None,
             Some(n) if n < 0 => None,
             Some(n) => Some(n as usize),
         };
-        let data = inner.read(n).map_err(py_io_err)?;
+        // Release the GIL around the blocking body read. The test HTTP
+        // servers run their request handlers in Python, so holding the
+        // GIL here would deadlock: the handler thread can't acquire the
+        // GIL to write the response body that this read is waiting for.
+        let data = py
+            .detach(|| self.inner.lock().unwrap().read(n))
+            .map_err(py_io_err)?;
         Ok(PyBytes::new(py, &data))
     }
 
@@ -394,25 +410,30 @@ impl HttpResponse {
     /// anyway.
     #[pyo3(signature = (_size=-1))]
     fn readline<'py>(&self, py: Python<'py>, _size: i64) -> PyResult<Bound<'py, PyBytes>> {
-        let mut inner = self.inner.lock().unwrap();
-        // Drain the body into the buffer so we can scan for '\n'
-        // without losing the rest of the stream.
-        let _ = inner.body().map_err(py_io_err)?;
-        // Now read one byte at a time until '\n' or EOF. This works
-        // because the BodyState is Buffered after body().
-        let mut line: Vec<u8> = Vec::new();
-        loop {
-            let chunk = inner.read(Some(1)).map_err(py_io_err)?;
-            if chunk.is_empty() {
-                break;
+        // Drain and scan for the newline with the GIL released (see
+        // `read`).
+        let line = py.detach(|| {
+            let mut inner = self.inner.lock().unwrap();
+            // Drain the body into the buffer so we can scan for '\n'
+            // without losing the rest of the stream.
+            inner.body()?;
+            // Now read one byte at a time until '\n' or EOF. This works
+            // because the BodyState is Buffered after body().
+            let mut line: Vec<u8> = Vec::new();
+            loop {
+                let chunk = inner.read(Some(1))?;
+                if chunk.is_empty() {
+                    break;
+                }
+                let b = chunk[0];
+                line.push(b);
+                if b == b'\n' {
+                    break;
+                }
             }
-            let b = chunk[0];
-            line.push(b);
-            if b == b'\n' {
-                break;
-            }
-        }
-        Ok(PyBytes::new(py, &line))
+            Ok(line)
+        });
+        Ok(PyBytes::new(py, &line.map_err(py_io_err)?))
     }
 
     fn readlines<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
@@ -430,8 +451,11 @@ impl HttpResponse {
     /// Close the response by discarding any unread body, returning
     /// the underlying socket to ureq's pool. Mirrors the file-like
     /// `close()` contract.
-    fn close(&self) -> PyResult<()> {
-        self.inner.lock().unwrap().discard_body().map_err(py_io_err)
+    fn close(&self, py: Python) -> PyResult<()> {
+        // Drain with the GIL released (see `read`): discarding an
+        // undrained streamed body blocks on the same socket read.
+        py.detach(|| self.inner.lock().unwrap().discard_body())
+            .map_err(py_io_err)
     }
 }
 
