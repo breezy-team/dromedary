@@ -37,7 +37,7 @@
 //! [`crate::pathfilter::PathFilterTransport`] directly.
 
 use std::collections::HashMap;
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use crate::{Error, Result, Transport};
 
@@ -71,7 +71,7 @@ where
     }
 }
 
-type Registry = RwLock<HashMap<String, Box<dyn TransportFactory>>>;
+type Registry = RwLock<HashMap<String, Arc<dyn TransportFactory>>>;
 
 /// Lazily-initialised global registry. The first access seeds it with
 /// the built-in prefixes so `get_transport("file:///tmp")` works without
@@ -81,7 +81,7 @@ fn registry() -> &'static Registry {
     R.get_or_init(|| {
         let mut m: HashMap<String, Box<dyn TransportFactory>> = HashMap::new();
         register_builtins(&mut m);
-        RwLock::new(m)
+        RwLock::new(m.into_iter().map(|(k, f)| (k, Arc::from(f))).collect())
     })
 }
 
@@ -216,16 +216,16 @@ fn default_log_sink() -> crate::log::LogSink {
 pub fn register(
     prefix: &str,
     factory: Box<dyn TransportFactory>,
-) -> Option<Box<dyn TransportFactory>> {
+) -> Option<Arc<dyn TransportFactory>> {
     registry()
         .write()
         .unwrap()
-        .insert(prefix.to_string(), factory)
+        .insert(prefix.to_string(), Arc::from(factory))
 }
 
 /// Drop the registration for `prefix`. Returns the displaced factory if
 /// there was one.
-pub fn unregister(prefix: &str) -> Option<Box<dyn TransportFactory>> {
+pub fn unregister(prefix: &str) -> Option<Arc<dyn TransportFactory>> {
     registry().write().unwrap().remove(prefix)
 }
 
@@ -247,23 +247,27 @@ pub fn registered_prefixes() -> Vec<String> {
 /// can detect.
 pub fn get_transport(url: &str) -> Result<Box<dyn Transport + Send + Sync>> {
     // Find the longest registered prefix that's a literal prefix of the
-    // URL. We do this under a single read lock; the registry is small
-    // enough that scanning is cheaper than maintaining a sorted index.
-    let r = registry().read().unwrap();
-    let mut best: Option<(&str, &Box<dyn TransportFactory>)> = None;
-    for (prefix, factory) in r.iter() {
-        if !url.starts_with(prefix.as_str()) {
-            continue;
+    // URL. The registry is small enough that scanning is cheaper than
+    // maintaining a sorted index. The lock is released before calling the
+    // factory: decorator factories recurse into get_transport, and
+    // re-acquiring the read lock deadlocks if a writer is waiting.
+    let factory = {
+        let r = registry().read().unwrap();
+        let mut best: Option<(&str, &Arc<dyn TransportFactory>)> = None;
+        for (prefix, factory) in r.iter() {
+            if !url.starts_with(prefix.as_str()) {
+                continue;
+            }
+            match best {
+                Some((cur, _)) if cur.len() >= prefix.len() => {}
+                _ => best = Some((prefix.as_str(), factory)),
+            }
         }
-        match best {
-            Some((cur, _)) if cur.len() >= prefix.len() => {}
-            _ => best = Some((prefix.as_str(), factory)),
-        }
-    }
-    if let Some((_, f)) = best {
+        best.map(|(_, f)| Arc::clone(f))
+    };
+    if let Some(f) = factory {
         return f.build(url);
     }
-    drop(r);
 
     // Fallback: a `+vendor` qualifier on a base scheme (e.g.
     // `http+urllib://`) — strip the qualifier and retry. Mirrors what
@@ -384,6 +388,53 @@ mod tests {
         t.put_bytes("k", b"v", None).unwrap();
         assert!(unregister(prefix).is_some());
         assert!(!is_registered(prefix));
+    }
+
+    #[test]
+    fn factory_can_dispatch_while_writer_waits() {
+        // A decorator factory recursing into get_transport while another
+        // thread is waiting to register must not deadlock.
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let prefix = "test-reentrant+";
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let entered_tx = std::sync::Mutex::new(entered_tx);
+        register(
+            prefix,
+            Box::new(
+                move |url: &str| -> Result<Box<dyn Transport + Send + Sync>> {
+                    entered_tx.lock().unwrap().send(()).unwrap();
+                    // Give the writer time to start waiting on the lock.
+                    std::thread::sleep(Duration::from_millis(200));
+                    decorate_inner(url, "test-reentrant+")
+                },
+            ),
+        );
+
+        let writer = std::thread::spawn(move || {
+            entered_rx.recv().unwrap();
+            register(
+                "test-reentrant-writer://",
+                Box::new(|_url: &str| -> Result<Box<dyn Transport + Send + Sync>> {
+                    Ok(Box::new(crate::memory::MemoryTransport::new("memory:///")?))
+                }),
+            );
+        });
+
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            done_tx
+                .send(get_transport("test-reentrant+memory:///").is_ok())
+                .unwrap();
+        });
+        let ok = done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("get_transport deadlocked against a waiting writer");
+        assert!(ok);
+        writer.join().unwrap();
+        unregister(prefix);
+        unregister("test-reentrant-writer://");
     }
 
     #[test]
