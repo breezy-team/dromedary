@@ -135,9 +135,9 @@ class CatchingExceptionThread(threading.Thread):
     def set_ignored_exceptions(
         self,
         ignored: Callable[[BaseException], bool]
-        | None
         | list[type[Exception]]
-        | type[Exception],
+        | type[Exception]
+        | None,
     ) -> None:
         """Declare which exceptions will be ignored.
 

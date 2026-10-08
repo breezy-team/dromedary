@@ -8,9 +8,7 @@ fn make_filter_func(filter_py: Option<Py<PyAny>>) -> Option<FilterFunc> {
     let f = filter_py?;
     Some(Arc::new(move |p: &str| -> dromedary::Result<String> {
         Python::attach(|py| match f.call1(py, (p,)) {
-            Ok(r) => r
-                .extract::<String>(py)
-                .map_err(|e| dromedary::Error::from(e)),
+            Ok(r) => r.extract::<String>(py).map_err(dromedary::Error::from),
             Err(e) => Err(dromedary::Error::from(e)),
         })
     }))
@@ -60,19 +58,20 @@ pub(crate) struct PathFilteringTransport {
 #[pymethods]
 impl PathFilteringTransport {
     #[new]
-    fn new(py: Python, server: Py<PyAny>, base: String) -> PyResult<(Self, Transport)> {
+    fn new(py: Python, server: Py<PyAny>, base: String) -> PyResult<PyClassInitializer<Self>> {
         let rust = build_rust_transport(py, &server, &base)?;
         let mut stored_base = base.clone();
         if !stored_base.ends_with('/') {
             stored_base.push('/');
         }
-        Ok((
-            PathFilteringTransport {
-                server,
-                base: stored_base,
-            },
-            Transport(Box::new(rust)),
-        ))
+        Ok(
+            PyClassInitializer::from(Transport(Box::new(rust))).add_subclass(
+                PathFilteringTransport {
+                    server,
+                    base: stored_base,
+                },
+            ),
+        )
     }
 
     #[getter]
@@ -157,11 +156,7 @@ pub(crate) struct ChrootTransport {}
 impl ChrootTransport {
     #[new]
     fn new(py: Python, server: Py<PyAny>, base: String) -> PyResult<PyClassInitializer<Self>> {
-        let (parent, t) = PathFilteringTransport::new(py, server, base)?;
-        let init = PyClassInitializer::from(t)
-            .add_subclass(parent)
-            .add_subclass(ChrootTransport {});
-        Ok(init)
+        Ok(PathFilteringTransport::new(py, server, base)?.add_subclass(ChrootTransport {}))
     }
 }
 

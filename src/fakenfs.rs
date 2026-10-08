@@ -72,9 +72,10 @@ impl Transport for FakeNfsTransport {
             Ok(()) => Ok(()),
             Err(e @ Error::DirectoryNotEmptyError(_)) | Err(e @ Error::FileExists(_)) => {
                 match self.inner.stat(rel_to) {
-                    Ok(Stat { kind, .. }) if kind == crate::FileKind::Dir => {
-                        Err(Error::ResourceBusy(Some(rel_to.to_string())))
-                    }
+                    Ok(Stat {
+                        kind: crate::FileKind::Dir,
+                        ..
+                    }) => Err(Error::ResourceBusy(Some(rel_to.to_string()))),
                     _ => Err(e),
                 }
             }

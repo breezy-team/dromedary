@@ -1,15 +1,13 @@
 [workspace]
 resolver = "2"
-members = [
-    "_transport_rs",
-]
+members = ["_transport_rs"]
 
 [workspace.package]
 version = "0.1.7"
 
 [workspace.dependencies]
 nix = "0.31"
-pyo3 = "0.28"
+pyo3 = ">=0.28,<0.30"
 pyo3-filelike = "0.5.2"
 url = "2"
 log = "0.4"
@@ -23,7 +21,10 @@ license = "GPL-2.0+"
 repository = "https://github.com/breezy-team/dromedary"
 homepage = "https://www.breezy-vcs.org/"
 documentation = "https://www.breezy-vcs.org/doc/"
-authors = [ "Martin Packman <gzlist@googlemail.com>", "Jelmer Vernooij <jelmer@jelmer.uk>"]
+authors = [
+	"Martin Packman <gzlist@googlemail.com>",
+	"Jelmer Vernooij <jelmer@jelmer.uk>",
+]
 
 [lib]
 
@@ -51,7 +52,11 @@ base64 = "0.22"
 # keeps our sync API shape; `native-tls` uses the platform TLS
 # library (OpenSSL on Linux, SChannel on Windows, Secure Transport
 # on macOS), which matches Python's `ssl` module behaviour.
-reqwest = { version = "0.13", default-features = false, features = ["native-tls", "gzip", "blocking"] }
+reqwest = { version = "0.13", default-features = false, features = [
+	"native-tls",
+	"gzip",
+	"blocking",
+] }
 # Lightweight dep used only for typed error classification — we
 # downcast reqwest's error chain to `hyper::Error` so we can
 # distinguish protocol-level parse failures (bad HTTP version, bad

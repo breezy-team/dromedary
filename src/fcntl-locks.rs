@@ -21,6 +21,7 @@ fn open(filename: &Path, options: &OpenOptions) -> std::result::Result<(PathBuf,
                 );
                 let f = OpenOptions::new()
                     .create(true)
+                    .truncate(false)
                     .write(true)
                     .read(true)
                     .open(&filename)?;
@@ -248,6 +249,7 @@ impl TemporaryWriteLock {
             .write(true)
             .read(true)
             .create(true)
+            .truncate(false)
             .open(&filename)
         {
             Ok(f) => Ok(f),
@@ -296,7 +298,7 @@ impl TemporaryWriteLock {
             Err(e) => {
                 debug!(
                     "error unlocking file {}: {}",
-                    &self.filename.to_string_lossy(),
+                    self.filename.to_string_lossy(),
                     e
                 );
             }

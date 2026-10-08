@@ -32,14 +32,14 @@ pip install dromedary
 from dromedary import get_transport
 
 # Get a transport for a local directory
-transport = get_transport('/path/to/directory')
+transport = get_transport("/path/to/directory")
 
 # Get a transport for an HTTP URL
-transport = get_transport('http://example.com/repo')
+transport = get_transport("http://example.com/repo")
 
 # Use the transport
-files = transport.list_dir('.')
-content = transport.get('filename').read()
+files = transport.list_dir(".")
+content = transport.get("filename").read()
 ```
 
 ## Requirements

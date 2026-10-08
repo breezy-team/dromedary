@@ -269,6 +269,16 @@ fn extract_userinfo_raw(url: &str) -> Option<String> {
     Some(userinfo.to_string())
 }
 
+/// `(protocol, host, port, embedded_credentials, user_hint)` identifying
+/// who to authenticate against.
+type AuthTarget = (
+    String,
+    String,
+    Option<u16>,
+    Option<(String, String)>,
+    Option<String>,
+);
+
 /// Break a proxy URL down into the parts the credential-lookup path
 /// needs. Returns `(scheme, host, port, embedded_creds, user_hint)`.
 ///
@@ -283,15 +293,7 @@ fn extract_userinfo_raw(url: &str) -> Option<String> {
 /// (`http://joe@proxy/`), that's a hint: we still need the
 /// CredentialProvider to supply the password, but we want it to
 /// skip its own user lookup/prompt and use `joe` as the default.
-fn proxy_connection_parts(
-    proxy_url: &str,
-) -> (
-    String,
-    String,
-    Option<u16>,
-    Option<(String, String)>,
-    Option<String>,
-) {
+fn proxy_connection_parts(proxy_url: &str) -> AuthTarget {
     let parsed = match Url::parse(proxy_url) {
         Ok(u) => u,
         Err(_) => return (String::new(), String::new(), None, None, None),
@@ -471,8 +473,8 @@ fn is_incomplete_message(err: &reqwest::Error) -> bool {
 }
 
 /// Estimate the status-line + header block length of the response
-/// as the server wrote it on the wire: "HTTP/1.1 NNN reason\r\n"
-/// + each header line + blank line. Mirrors the server-side count
+/// as the server wrote it on the wire: "HTTP/1.1 NNN reason\r\n",
+/// each header line and a blank line. Mirrors the server-side count
 /// `PredefinedRequestHandler` uses for `bytes_written` (which is
 /// just `len(canned_response)`).
 fn estimate_response_header_size(
@@ -1789,10 +1791,7 @@ impl HttpResponse {
     fn buffer_all(&mut self) -> std::io::Result<()> {
         if let BodyState::Streaming(reader) = &mut self.body {
             let mut buf = Vec::new();
-            let err = match std::io::Read::read_to_end(reader, &mut buf) {
-                Ok(_) => None,
-                Err(e) => Some(e),
-            };
+            let err = std::io::Read::read_to_end(reader, &mut buf).err();
             self.body = BodyState::Buffered(std::io::Cursor::new(buf));
             if let Some(e) = err {
                 return Err(e);
@@ -2615,8 +2614,9 @@ mod tests {
         // Custom provider that captures the lookup args so we can
         // assert send_with_auth (and direct callers) hand through
         // protocol/host/port/path verbatim.
+        type Lookup = (String, String, Option<u16>, Option<String>);
         struct Recorder {
-            seen: Mutex<Option<(String, String, Option<u16>, Option<String>)>>,
+            seen: Mutex<Option<Lookup>>,
             answer: Option<(String, String)>,
         }
         impl TokenProvider for Recorder {

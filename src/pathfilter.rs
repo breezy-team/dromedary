@@ -365,7 +365,7 @@ mod tests {
     fn pass_through_filter_none() {
         let t = make("/", None);
         assert_eq!(t.get_bytes("a").unwrap(), b"A");
-        assert_eq!(t.has("sub/b").unwrap(), true);
+        assert!(t.has("sub/b").unwrap());
     }
 
     #[test]
@@ -394,7 +394,7 @@ mod tests {
         t.put_bytes("new/f", b"x", None).unwrap();
         assert_eq!(t.get_bytes("new/f").unwrap(), b"x");
         t.delete("new/f").unwrap();
-        assert_eq!(t.has("new/f").unwrap(), false);
+        assert!(!t.has("new/f").unwrap());
         t.rmdir("new").unwrap();
     }
 
@@ -425,7 +425,7 @@ mod tests {
     #[test]
     fn is_readonly_forwards() {
         let t = make("/", None);
-        assert_eq!(t.is_readonly(), false);
+        assert!(!t.is_readonly());
     }
 
     #[test]

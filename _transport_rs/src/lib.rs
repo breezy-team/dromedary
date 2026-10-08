@@ -43,6 +43,8 @@ import_exception!(dromedary.urlutils, InvalidURL);
 #[pyclass(subclass)]
 pub(crate) struct Transport(pub(crate) Box<dyn TransportTrait>);
 
+type BoxedReadv = Box<dyn Iterator<Item = dromedary::ReadvItem> + Send>;
+
 /// Python-visible iterator wrapping the Rust-side `readv` iterator.
 ///
 /// Holds a strong reference to the parent Transport pyclass
@@ -65,7 +67,7 @@ pub(crate) struct ReadvIter {
     /// caller leaks the iterator pyclass. `Mutex` because PyO3's
     /// `#[pymethods]` takes `&self`, but iterator advancement
     /// needs mutation.
-    iter: Mutex<Option<Box<dyn Iterator<Item = Result<(u64, Vec<u8>), dromedary::Error>> + Send>>>,
+    iter: Mutex<Option<BoxedReadv>>,
     /// Path string used for error-mapping; carried alongside the
     /// iterator for easy access on `__next__`'s Err path.
     path: String,
@@ -994,7 +996,7 @@ impl Transport {
             adjust_for_latency.unwrap_or(false),
             upper_limit,
         );
-        let mut iter: Box<dyn Iterator<Item = Result<(u64, Vec<u8>), dromedary::Error>> + Send> = unsafe {
+        let mut iter: BoxedReadv = unsafe {
             std::mem::transmute::<
                 Box<dyn Iterator<Item = _> + Send + '_>,
                 Box<dyn Iterator<Item = _> + Send + 'static>,
@@ -1013,8 +1015,7 @@ impl Transport {
         if let Some(Err(e)) = first {
             return Err(map_transport_err_to_py_err(e, None, Some(&path)));
         }
-        let prefixed: Box<dyn Iterator<Item = Result<(u64, Vec<u8>), dromedary::Error>> + Send> =
-            Box::new(first.into_iter().chain(iter));
+        let prefixed: BoxedReadv = Box::new(first.into_iter().chain(iter));
         Py::new(
             py,
             ReadvIter {
@@ -1203,19 +1204,15 @@ struct LocalTransport {}
 #[pymethods]
 impl LocalTransport {
     #[new]
-    fn new(url: &str) -> PyResult<(Self, Transport)> {
-        Ok((
-            LocalTransport {},
-            Transport(Box::new(
-                dromedary::local::LocalTransport::new(url)
-                    .map_err(|e| map_transport_err_to_py_err(e, None, None))?,
-            )),
-        ))
+    fn new(url: &str) -> PyResult<PyClassInitializer<Self>> {
+        let rust = dromedary::local::LocalTransport::new(url)
+            .map_err(|e| map_transport_err_to_py_err(e, None, None))?;
+        Ok(PyClassInitializer::from(Transport(Box::new(rust))).add_subclass(LocalTransport {}))
     }
 
     #[pyo3(signature = (abspath,))]
     #[classmethod]
-    fn from_abspath<'a>(cls: &'a Bound<'a, PyType>, abspath: &'a str) -> PyResult<Bound<'a, Self>> {
+    fn from_abspath<'a>(cls: &Bound<'a, PyType>, abspath: &str) -> PyResult<Bound<'a, Self>> {
         let ret = dromedary::local::LocalTransport::from_abspath(Path::new(abspath))
             .map_err(|e| map_transport_err_to_py_err(e, None, Some(abspath)))?;
 
@@ -1262,7 +1259,7 @@ fn coalesce_offsets(
     mut limit: Option<usize>,
     mut fudge_factor: Option<usize>,
     mut max_size: Option<usize>,
-) -> PyResult<Vec<(usize, usize, Vec<(usize, usize)>)>> {
+) -> PyResult<Vec<dromedary::readv::CoalescedRange>> {
     if limit == Some(0) {
         limit = None;
     }

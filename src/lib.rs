@@ -106,6 +106,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 pub type UrlFragment = str;
 
+/// One `(offset, data)` result yielded by `Transport::readv`.
+pub type ReadvItem = Result<(u64, Vec<u8>)>;
+
 pub fn map_io_err_to_transport_err(err: std::io::Error, path: Option<&str>) -> Error {
     match err.kind() {
         std::io::ErrorKind::NotFound => Error::NoSuchFile(path.map(|p| p.to_string())),

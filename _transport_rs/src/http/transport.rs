@@ -207,8 +207,8 @@ impl HttpTransport {
     fn _max_readv_combine(&self) -> usize {
         self.inner.readv_tuning().max_readv_combine
     }
-    #[setter]
-    fn set__max_readv_combine(&self, v: usize) {
+    #[setter(_max_readv_combine)]
+    fn set_max_readv_combine(&self, v: usize) {
         let mut t = self.inner.readv_tuning();
         t.max_readv_combine = v;
         self.inner.set_readv_tuning(t);
@@ -218,8 +218,8 @@ impl HttpTransport {
     fn _bytes_to_read_before_seek(&self) -> usize {
         self.inner.readv_tuning().bytes_to_read_before_seek
     }
-    #[setter]
-    fn set__bytes_to_read_before_seek(&self, v: usize) {
+    #[setter(_bytes_to_read_before_seek)]
+    fn set_bytes_to_read_before_seek(&self, v: usize) {
         let mut t = self.inner.readv_tuning();
         t.bytes_to_read_before_seek = v;
         self.inner.set_readv_tuning(t);
@@ -229,8 +229,8 @@ impl HttpTransport {
     fn _get_max_size(&self) -> usize {
         self.inner.readv_tuning().get_max_size
     }
-    #[setter]
-    fn set__get_max_size(&self, v: usize) {
+    #[setter(_get_max_size)]
+    fn set_get_max_size(&self, v: usize) {
         let mut t = self.inner.readv_tuning();
         t.get_max_size = v;
         self.inner.set_readv_tuning(t);
@@ -240,8 +240,8 @@ impl HttpTransport {
     fn _max_get_ranges(&self) -> usize {
         self.inner.readv_tuning().max_get_ranges
     }
-    #[setter]
-    fn set__max_get_ranges(&self, v: usize) {
+    #[setter(_max_get_ranges)]
+    fn set_max_get_ranges(&self, v: usize) {
         let mut t = self.inner.readv_tuning();
         t.max_get_ranges = v;
         self.inner.set_readv_tuning(t);

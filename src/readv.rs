@@ -17,6 +17,13 @@ impl std::fmt::Display for OverlappingRange {
     }
 }
 
+/// A coalesced read: `(start, length, [(offset_in_chunk, size), ...])`.
+pub type CoalescedRange = (usize, usize, Vec<(usize, usize)>);
+
+/// Error from `seek_and_read`: the I/O error plus the offset, requested
+/// length and number of bytes actually read.
+pub type ReadvError = (std::io::Error, usize, usize, usize);
+
 /// Yield coalesced offsets.
 ///
 /// With a long list of neighboring requests, combine them
@@ -49,7 +56,7 @@ pub fn coalesce_offsets(
     limit: Option<usize>,
     fudge_factor: Option<usize>,
     max_size: Option<usize>,
-) -> std::result::Result<Vec<(usize, usize, Vec<(usize, usize)>)>, OverlappingRange> {
+) -> std::result::Result<Vec<CoalescedRange>, OverlappingRange> {
     let mut offsets = offsets.to_vec();
     offsets.sort();
 
@@ -109,7 +116,7 @@ pub fn coalesce_offsets(
 struct ReadvIter<T> {
     fp: T,
     offsets: VecDeque<(usize, usize)>,
-    coalesced: VecDeque<(usize, usize, Vec<(usize, usize)>)>,
+    coalesced: VecDeque<CoalescedRange>,
     data_map: HashMap<(usize, usize), Vec<u8>>,
 }
 
@@ -127,7 +134,7 @@ impl<T: Read + Seek> ReadvIter<T> {
             Some(bytes_to_read_before_seek),
             None,
         )
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         Ok(Self {
             fp,
@@ -137,7 +144,7 @@ impl<T: Read + Seek> ReadvIter<T> {
         })
     }
 
-    fn read_more(&mut self) -> Result<bool, (std::io::Error, usize, usize, usize)> {
+    fn read_more(&mut self) -> Result<bool, ReadvError> {
         // Cache the results, but only until they have been fulfilled
         if let Some((start, length, ranges)) = self.coalesced.pop_front() {
             self.fp
@@ -161,7 +168,7 @@ impl<T: Read + Seek> ReadvIter<T> {
 }
 
 impl<T: Read + Seek> Iterator for ReadvIter<T> {
-    type Item = Result<(usize, Vec<u8>), (std::io::Error, usize, usize, usize)>;
+    type Item = Result<(usize, Vec<u8>), ReadvError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(key) = self.offsets.pop_front() {
@@ -196,9 +203,7 @@ pub fn seek_and_read<T: Read + Seek>(
     offsets: Vec<(usize, usize)>,
     max_readv_combine: usize,
     bytes_to_read_before_seek: usize,
-) -> std::io::Result<
-    impl Iterator<Item = Result<(usize, Vec<u8>), (std::io::Error, usize, usize, usize)>>,
-> {
+) -> std::io::Result<impl Iterator<Item = Result<(usize, Vec<u8>), ReadvError>>> {
     ReadvIter::new(fp, offsets, max_readv_combine, bytes_to_read_before_seek)
 }
 

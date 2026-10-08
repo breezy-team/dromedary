@@ -156,7 +156,7 @@ impl MemoryTransport {
 
     fn check_parent(store: &MemoryStore, abspath: &str) -> Result<()> {
         let parent = match abspath.rsplit_once('/') {
-            Some((head, _)) if head.is_empty() => "/".to_string(),
+            Some(("", _)) => "/".to_string(),
             Some((head, _)) => head.to_string(),
             None => "/".to_string(),
         };
@@ -390,9 +390,7 @@ impl Transport for MemoryTransport {
     fn delete(&self, relpath: &UrlFragment) -> Result<()> {
         let abspath = self.abspath_internal(relpath)?;
         let mut store = self.store.lock().unwrap();
-        if store.files.remove(&abspath).is_some() {
-            Ok(())
-        } else if store.symlinks.remove(&abspath).is_some() {
+        if store.files.remove(&abspath).is_some() || store.symlinks.remove(&abspath).is_some() {
             Ok(())
         } else {
             Err(Error::NoSuchFile(Some(relpath.to_string())))
@@ -688,9 +686,9 @@ mod tests {
     #[test]
     fn put_get_has_and_stat_file() {
         let t = t();
-        assert_eq!(t.has("hello").unwrap(), false);
+        assert!(!t.has("hello").unwrap());
         t.put_bytes("hello", b"world", None).unwrap();
-        assert_eq!(t.has("hello").unwrap(), true);
+        assert!(t.has("hello").unwrap());
         assert_eq!(t.get_bytes("hello").unwrap(), b"world");
         let st = t.stat("hello").unwrap();
         assert_eq!(st.size, 5);
@@ -743,9 +741,9 @@ mod tests {
         t.mkdir("d", None).unwrap();
         t.put_bytes("d/f", b"x", None).unwrap();
         t.delete("d/f").unwrap();
-        assert_eq!(t.has("d/f").unwrap(), false);
+        assert!(!t.has("d/f").unwrap());
         t.rmdir("d").unwrap();
-        assert_eq!(t.has("d").unwrap(), false);
+        assert!(!t.has("d").unwrap());
     }
 
     #[test]
@@ -764,7 +762,7 @@ mod tests {
         let t = t();
         t.put_bytes("a", b"hi", None).unwrap();
         t.rename("a", "b").unwrap();
-        assert_eq!(t.has("a").unwrap(), false);
+        assert!(!t.has("a").unwrap());
         assert_eq!(t.get_bytes("b").unwrap(), b"hi");
     }
 
@@ -792,7 +790,7 @@ mod tests {
     fn lock_read_contention() {
         let t = t();
         t.put_bytes("f", b"", None).unwrap();
-        let _l = t.lock_read("f").ok().expect("first lock");
+        let _l = t.lock_read("f").expect("first lock");
         match t.lock_read("f") {
             Err(Error::LockContention(_)) => {}
             Err(other) => panic!("expected LockContention, got {:?}", other),
@@ -805,10 +803,10 @@ mod tests {
         let t = t();
         t.put_bytes("f", b"", None).unwrap();
         {
-            let mut l = t.lock_read("f").ok().expect("first lock");
+            let mut l = t.lock_read("f").expect("first lock");
             l.unlock().ok().expect("unlock");
         }
-        let _l2 = t.lock_read("f").ok().expect("reacquire");
+        let _l2 = t.lock_read("f").expect("reacquire");
     }
 
     #[test]
