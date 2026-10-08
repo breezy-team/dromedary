@@ -152,7 +152,11 @@ class http:
 
     class HttpResponse:
         status: int
+        reason: str
+        final_url: str
         redirected_to: str | None
+        data: bytes
+        text: str | None
         def close(self) -> None: ...
         def getheader(self, name: str, default: str | None = None) -> str | None: ...
         def getheaders(self) -> list[tuple[str, str]]: ...
