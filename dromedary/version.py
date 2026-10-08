@@ -17,7 +17,7 @@
 
 """Version information for dromedary."""
 
-__version__ = "0.1.7"
+__version__ = "0.1.8"
 
 # Version information for dromedary
 version_info = (0, 1, 7, "final", 0)

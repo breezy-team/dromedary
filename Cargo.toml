@@ -3,7 +3,7 @@ resolver = "2"
 members = ["_transport_rs"]
 
 [workspace.package]
-version = "0.1.7"
+version = "0.1.8"
 
 [workspace.dependencies]
 nix = "0.31"
