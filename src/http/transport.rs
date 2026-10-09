@@ -585,8 +585,7 @@ fn normalise_http_url(
     // that we store separately from the URL proper: they never go on
     // the wire. Split them off here so the rest of the transport
     // sees a clean URL.
-    let (base_part, params) = crate::urlutils::split_segment_parameters(&canonical)
-        .map_err(|_| Error::UrlError(url::ParseError::RelativeUrlWithoutBase))?;
+    let (base_part, subsegments) = crate::urlutils::split_segment_parameters_raw(&canonical);
     let base_with_slash = if base_part.ends_with('/') {
         base_part.to_string()
     } else {
@@ -598,10 +597,16 @@ fn normalise_http_url(
     // paths that came in needlessly-escaped (`%7E` → `~` etc.).
     let base_with_slash = crate::urlutils::unquote_unreserved(&base_with_slash);
     let parsed = Url::parse(&base_with_slash)?;
-    let segment_parameters: std::collections::BTreeMap<String, String> = params
+    // Values are kept escaped so that base() reproduces them exactly.
+    let segment_parameters = subsegments
         .iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
+        .map(|subsegment| {
+            subsegment
+                .split_once('=')
+                .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+                .ok_or(Error::UrlError(url::ParseError::RelativeUrlWithoutBase))
+        })
+        .collect::<Result<std::collections::BTreeMap<String, String>>>()?;
     Ok((unqualified, parsed, segment_parameters))
 }
 
@@ -893,16 +898,19 @@ impl Transport for HttpTransport {
             return self.base.clone();
         }
         let raw = self.base.as_str();
-        let params: std::collections::HashMap<&str, &str> = self
+        let subsegments: Vec<String> = self
             .segment_parameters
             .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .map(|(k, v)| format!("{}={}", k, v))
             .collect();
-        // join_segment_parameters can only fail for malformed inputs
-        // (`=` in key, `,` in value); our params came from set_segment
-        // which pre-validates, so this is infallible in practice.
-        let joined = crate::urlutils::join_segment_parameters(raw, &params)
-            .unwrap_or_else(|_| raw.to_string());
+        // join_segment_parameters_raw can only fail for malformed inputs
+        // (`,` in key); values are stored escaped, so this is
+        // infallible in practice.
+        let joined = crate::urlutils::join_segment_parameters_raw(
+            raw,
+            &subsegments.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        )
+        .unwrap_or_else(|_| raw.to_string());
         Url::parse(&joined).unwrap_or_else(|_| self.base.clone())
     }
 
@@ -1015,11 +1023,10 @@ impl Transport for HttpTransport {
         }
         match value {
             Some(v) => {
-                if v.contains(',') {
-                    return Err(Error::UrlError(url::ParseError::InvalidDomainCharacter));
-                }
-                self.segment_parameters
-                    .insert(key.to_string(), v.to_string());
+                self.segment_parameters.insert(
+                    key.to_string(),
+                    crate::urlutils::escape(v.as_bytes(), Some("")),
+                );
             }
             None => {
                 self.segment_parameters.remove(key);
@@ -1032,7 +1039,14 @@ impl Transport for HttpTransport {
         Ok(self
             .segment_parameters
             .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    percent_encoding::percent_decode_str(v)
+                        .decode_utf8_lossy()
+                        .into_owned(),
+                )
+            })
             .collect())
     }
 
@@ -1895,11 +1909,40 @@ mod tests {
     }
 
     #[test]
-    fn set_segment_parameter_rejects_comma_in_value() {
+    fn set_segment_parameter_escapes_value() {
         let mut t = HttpTransport::new("http://example.com/", fresh_client()).unwrap();
-        // Commas separate parameters, so a value containing one would
-        // be indistinguishable from two parameters on the next parse.
-        assert!(t.set_segment_parameter("k", Some("bad,value")).is_err());
+        t.set_segment_parameter("k", Some("a,b/c")).unwrap();
+        assert_eq!(t.base().as_str(), "http://example.com/,k=a%2Cb%2Fc");
+        assert_eq!(
+            t.get_segment_parameters().unwrap().get("k"),
+            Some(&"a,b/c".to_string())
+        );
+    }
+
+    #[test]
+    fn segment_parameters_unescaped_from_base_url() {
+        let t = HttpTransport::new("http://example.com/repo,branch=a%2Fb", fresh_client()).unwrap();
+        assert_eq!(
+            t.get_segment_parameters().unwrap().get("branch"),
+            Some(&"a/b".to_string())
+        );
+        assert_eq!(t.base().as_str(), "http://example.com/repo/,branch=a%2Fb");
+    }
+
+    #[test]
+    fn segment_parameters_invalid_utf8_kept_in_base() {
+        let mut t =
+            HttpTransport::new("http://example.com/repo,ref=caf%E9", fresh_client()).unwrap();
+        assert_eq!(t.base().as_str(), "http://example.com/repo/,ref=caf%E9");
+        assert_eq!(
+            t.get_segment_parameters().unwrap().get("ref"),
+            Some(&"caf\u{fffd}".to_string())
+        );
+        t.set_segment_parameter("arm", Some("board")).unwrap();
+        assert_eq!(
+            t.base().as_str(),
+            "http://example.com/repo/,arm=board,ref=caf%E9"
+        );
     }
 
     #[test]

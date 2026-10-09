@@ -207,7 +207,7 @@ fn join(url: &str, args: &Bound<PyTuple>) -> PyResult<String> {
 }
 
 #[pyfunction]
-fn split_segment_parameters(url: &str) -> PyResult<(&str, HashMap<&str, &str>)> {
+fn split_segment_parameters(url: &str) -> PyResult<(&str, HashMap<&str, String>)> {
     dromedary::urlutils::split_segment_parameters(url).map_err(map_urlutils_error_to_pyerr)
 }
 
@@ -282,7 +282,7 @@ fn join_segment_parameters_raw(url: &str, args: &Bound<PyTuple>) -> PyResult<Str
 
 #[pyfunction]
 fn join_segment_parameters(url: &str, parameters: HashMap<String, String>) -> PyResult<String> {
-    let parameters = parameters
+    let parameters: HashMap<&str, &str> = parameters
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
