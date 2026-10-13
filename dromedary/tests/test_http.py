@@ -252,5 +252,147 @@ class TestTokenProviderEndToEnd(unittest.TestCase):
         self.assertIsNone(self.server.last_authorization)
 
 
+class _RedirectHandler(BaseHTTPRequestHandler):
+    """HTTP handler driven by ``server.routes``: a path maps to a
+    redirect target, to ``"challenge"`` (401 Basic until credentials
+    arrive) or to nothing (200). Every request is recorded.
+    """
+
+    def do_GET(self):
+        self.server.seen.append((self.path, self.headers))
+        action = self.server.routes.get(self.path)
+        if action == "challenge" and "Authorization" not in self.headers:
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="test"')
+        elif action not in (None, "challenge"):
+            self.send_response(302)
+            self.send_header("Location", action)
+        else:
+            self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *args, **kwargs):  # silence stderr noise
+        pass
+
+
+class TestRedirectCredentials(unittest.TestCase):
+    """Drive the Rust HTTP client through redirects between two
+    stdlib HTTPServers (two ports, so two origins) and check which of
+    them receives the caller's credentials.
+    """
+
+    CREDENTIALS = {
+        "Authorization": "token s3cret",
+        "Proxy-Authorization": "Basic cHJveHk6czNjcmV0",
+        "Cookie": "session=s3cret",
+        "Private-Token": "s3cret",
+    }
+    HEADERS = {**CREDENTIALS, "X-Other": "plain"}
+
+    def setUp(self):
+        isolate_proxy_env(self)
+        self._original_token = http.get_token_provider()
+        self.addCleanup(http.set_token_provider, self._original_token)
+        http.set_token_provider(None)
+        self.first = self._start_server()
+        self.other = self._start_server()
+
+    def _start_server(self):
+        server = HTTPServer(("127.0.0.1", 0), _RedirectHandler)
+        server.routes = {}
+        server.seen = []
+        thread = threading.Thread(target=server.serve_forever)
+        thread.daemon = True
+        thread.start()
+        self.addCleanup(self._stop_server, server, thread)
+        return server
+
+    def _stop_server(self, server, thread):
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    def _url(self, server, path, userinfo=""):
+        host, port = server.server_address
+        return f"http://{userinfo}{host}:{port}{path}"
+
+    def _credentials_seen(self, server, path):
+        """Return the credential headers ``server`` got for ``path``."""
+        (headers,) = [h for p, h in server.seen if p == path]
+        self.assertEqual("plain", headers.get("X-Other"))
+        return {k: headers[k] for k in self.CREDENTIALS if k in headers}
+
+    def _get(self, url):
+        return HttpClient().request(
+            "GET", url, list(self.HEADERS.items()), b"", follow_redirects=True
+        )
+
+    def test_same_origin_redirect_keeps_credentials(self):
+        self.first.routes["/start"] = "/end"
+        resp = self._get(self._url(self.first, "/start"))
+        self.assertEqual(200, resp.status)
+        self.assertEqual(self.CREDENTIALS, self._credentials_seen(self.first, "/start"))
+        self.assertEqual(self.CREDENTIALS, self._credentials_seen(self.first, "/end"))
+
+    def test_other_origin_gets_no_credentials(self):
+        self.first.routes["/start"] = self._url(self.other, "/end")
+        resp = self._get(self._url(self.first, "/start"))
+        self.assertEqual(200, resp.status)
+        self.assertEqual(self.CREDENTIALS, self._credentials_seen(self.first, "/start"))
+        self.assertEqual({}, self._credentials_seen(self.other, "/end"))
+
+    def test_other_origin_gets_no_credentials_from_transport(self):
+        from dromedary.http.urllib import HttpTransport
+
+        self.first.routes["/start"] = self._url(self.other, "/end")
+        transport = HttpTransport(self._url(self.first, "/"))
+        resp = transport.request(
+            "GET", self._url(self.first, "/start"), headers=self.HEADERS, retries=3
+        )
+        self.assertEqual(200, resp.status)
+        self.assertEqual(self.CREDENTIALS, self._credentials_seen(self.first, "/start"))
+        self.assertEqual({}, self._credentials_seen(self.other, "/end"))
+
+    def test_back_on_first_origin_gets_credentials_again(self):
+        self.first.routes["/start"] = self._url(self.other, "/middle")
+        self.other.routes["/middle"] = self._url(self.first, "/end")
+        resp = self._get(self._url(self.first, "/start"))
+        self.assertEqual(200, resp.status)
+        self.assertEqual({}, self._credentials_seen(self.other, "/middle"))
+        self.assertEqual(self.CREDENTIALS, self._credentials_seen(self.first, "/end"))
+
+    def test_url_userinfo_not_offered_to_other_origin(self):
+        self.first.routes["/start"] = self._url(self.other, "/end")
+        self.other.routes["/end"] = "challenge"
+        resp = HttpClient().request(
+            "GET",
+            self._url(self.first, "/start", userinfo="joe:s3cret@"),
+            [],
+            b"",
+            follow_redirects=True,
+        )
+        self.assertEqual(401, resp.status)
+        self.assertEqual(
+            [("/end", None)],
+            [(p, h.get("Authorization")) for p, h in self.other.seen],
+        )
+
+    def test_url_userinfo_offered_to_first_origin(self):
+        self.first.routes["/start"] = "/end"
+        self.first.routes["/end"] = "challenge"
+        resp = HttpClient().request(
+            "GET",
+            self._url(self.first, "/start", userinfo="joe:s3cret@"),
+            [],
+            b"",
+            follow_redirects=True,
+        )
+        self.assertEqual(200, resp.status)
+        self.assertEqual(
+            "Basic am9lOnMzY3JldA==", self.first.seen[-1][1].get("Authorization")
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -214,8 +214,55 @@ fn drive_redirects(
         }
 
         current_url = newurl;
-        // Carry headers and body forward unchanged; the Python
-        // HTTPRedirectHandler.redirect_request does the same.
+        // Method and body go forward unchanged; `send` picks the headers.
+    }
+}
+
+/// Caller headers that carry credentials (compared in lower case).
+const CREDENTIAL_HEADERS: [&str; 4] = [
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "private-token",
+];
+
+/// True when both URLs parse and have the same [`auth_cache_key`] (scheme, host, port).
+fn same_origin(a: &str, b: &str) -> bool {
+    fn origin(url: &str) -> Option<AuthCacheKey> {
+        let uri: Uri = url.parse().ok()?;
+        uri.scheme()?;
+        uri.host()?;
+        Some(auth_cache_key(&uri))
+    }
+    match (origin(a), origin(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Copy of `headers` without the ones in [`CREDENTIAL_HEADERS`].
+fn without_credential_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter(|(name, _)| !CREDENTIAL_HEADERS.contains(&name.to_ascii_lowercase().as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Userinfo URL and headers for one hop; credentials stay on the origin of `first_url`.
+fn hop_credentials<'a>(
+    first_url: &str,
+    target: &'a str,
+    origin_url: &'a str,
+    headers: &'a [(String, String)],
+) -> (&'a str, std::borrow::Cow<'a, [(String, String)]>) {
+    if same_origin(first_url, target) {
+        (origin_url, std::borrow::Cow::Borrowed(headers))
+    } else {
+        (
+            target,
+            std::borrow::Cow::Owned(without_credential_headers(headers)),
+        )
     }
 }
 
@@ -903,11 +950,16 @@ impl HttpClient {
     ///
     /// The redirect loop matches breezy's
     /// `HTTPRedirectHandler.http_error_302` semantics: 301, 302,
-    /// 303, 307, and 308 are followed; the request method and
-    /// headers are carried unchanged (the Python version doesn't
-    /// rewrite POST→GET on 303 either); `Location:` wins over
-    /// `URI:` if both appear. Relative redirect URLs are resolved
-    /// against the request URL.
+    /// 303, 307, and 308 are followed; the request method is
+    /// carried unchanged (the Python version doesn't rewrite
+    /// POST→GET on 303 either); `Location:` wins over `URI:` if
+    /// both appear. Relative redirect URLs are resolved against the
+    /// request URL.
+    ///
+    /// Headers are carried unchanged while a hop stays on the scheme,
+    /// host and port of `url`. Any other hop is sent without the
+    /// caller's credential headers and is not offered the userinfo
+    /// of the first URL; see [`hop_credentials`].
     ///
     /// When `follow_redirects` is false, the first 3xx response is
     /// returned with `redirected_to` set to the target URL so the
@@ -950,7 +1002,8 @@ impl HttpClient {
         // auth, and handling that here keeps the redirect-loop code
         // from having to know anything about auth.
         drive_redirects(options, url, |target| {
-            self.send_with_auth(&method, target, origin_url, headers, body, activity)
+            let (origin_url, headers) = hop_credentials(url, target, origin_url, headers);
+            self.send_with_auth(&method, target, origin_url, &headers, body, activity)
         })
     }
 
@@ -2164,6 +2217,172 @@ mod tests {
         let resp = drive_redirects(&opts, "http://a/", |u| Ok(mk_resp(302, None, u))).unwrap();
         assert_eq!(resp.status, 302);
         assert!(resp.redirected_to.is_none());
+    }
+
+    fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
+        items
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn without_credential_headers_drops_only_credentials() {
+        let headers = pairs(&[
+            ("Accept", "*/*"),
+            ("Authorization", "token s3cret"),
+            ("PROXY-AUTHORIZATION", "Basic eDp5"),
+            ("cookie", "session=1"),
+            ("Private-Token", "glpat"),
+            ("pRiVaTe-ToKeN", "glpat2"),
+            ("X-Authorization-Hint", "kept"),
+            ("Content-Type", "text/plain"),
+        ]);
+        assert_eq!(
+            without_credential_headers(&headers),
+            pairs(&[
+                ("Accept", "*/*"),
+                ("X-Authorization-Hint", "kept"),
+                ("Content-Type", "text/plain"),
+            ])
+        );
+        assert!(without_credential_headers(&[]).is_empty());
+    }
+
+    #[test]
+    fn same_origin_table() {
+        let same = [
+            ("http://example.com/a", "http://example.com/b?q=1"),
+            ("http://example.com/", "http://example.com:80/"),
+            ("https://example.com/", "https://example.com:443/"),
+            ("http://example.com/", "HTTP://EXAMPLE.COM/"),
+            ("http://Example.Com:8080/", "http://example.com:8080/x"),
+            ("http://user:pw@example.com/", "http://example.com/"),
+            ("http://[::1]/", "http://[::1]:80/"),
+            (
+                "https://[2001:db8::1]:8443/",
+                "https://[2001:DB8::1]:8443/x",
+            ),
+        ];
+        for (a, b) in same {
+            assert!(same_origin(a, b), "{} and {} should match", a, b);
+            assert!(same_origin(b, a), "{} and {} should match", b, a);
+        }
+        let other = [
+            ("http://example.com/", "http://example.com:8080/"),
+            ("http://example.com:8080/", "http://example.com:8081/"),
+            ("http://example.com/", "https://example.com/"),
+            ("https://example.com/", "http://example.com/"),
+            ("http://example.com:443/", "https://example.com/"),
+            ("https://example.com:80/", "http://example.com/"),
+            ("http://example.com/", "http://example.org/"),
+            ("http://example.com/", "http://sub.example.com/"),
+            ("http://example.com/", "http://example.com.evil.test/"),
+            ("http://example.com/", "http://evil.test/example.com"),
+            ("http://example.com/", "http://example.com@evil.test/"),
+            ("http://[::1]/", "http://[::2]/"),
+            ("http://[::1]:8080/", "http://[::1]:8081/"),
+            ("http://[::1]/", "https://[::1]/"),
+            ("http://[::1]/", "http://127.0.0.1/"),
+            ("http://example.com/", "/relative"),
+            ("http://example.com/", "example.com"),
+            ("http://example.com/", "not a url"),
+            ("not a url", "not a url"),
+            ("/relative", "/relative"),
+        ];
+        for (a, b) in other {
+            assert!(!same_origin(a, b), "{} and {} should differ", a, b);
+            assert!(!same_origin(b, a), "{} and {} should differ", b, a);
+        }
+    }
+
+    #[test]
+    fn hop_credentials_keeps_everything_on_first_origin() {
+        let headers = pairs(&[("Authorization", "token s3cret"), ("Accept", "*/*")]);
+        let (origin_url, sent) = hop_credentials(
+            "http://a.test/x",
+            "http://A.test:80/y",
+            "http://user:pw@a.test/",
+            &headers,
+        );
+        assert_eq!(origin_url, "http://user:pw@a.test/");
+        assert_eq!(sent.as_ref(), headers.as_slice());
+    }
+
+    #[test]
+    fn hop_credentials_strips_on_other_origin() {
+        let headers = pairs(&[("Authorization", "token s3cret"), ("Accept", "*/*")]);
+        for target in [
+            "http://b.test/y",
+            "http://a.test:8080/y",
+            "https://a.test/y",
+        ] {
+            let (origin_url, sent) = hop_credentials(
+                "http://a.test/x",
+                target,
+                "http://user:pw@a.test/",
+                &headers,
+            );
+            assert_eq!(origin_url, target);
+            assert_eq!(extract_userinfo_raw(origin_url), None);
+            assert_eq!(sent.as_ref(), pairs(&[("Accept", "*/*")]).as_slice());
+        }
+    }
+
+    #[test]
+    fn hop_credentials_through_a_chain_back_to_first_origin() {
+        // Only the hops on http://a.test (port 80) get credentials; Location is normalised.
+        let opts = RequestOptions {
+            follow_redirects: true,
+            ..RequestOptions::default()
+        };
+        let first = "http://a.test/0";
+        let chain = [
+            "http://b.test/1",
+            "http://A.TEST:80/2",
+            "http://a.test:8080/3",
+            "https://a.test/4",
+            "http://a.test/5",
+        ];
+        let headers = pairs(&[
+            ("Authorization", "token s3cret"),
+            ("Cookie", "session=1"),
+            ("Accept", "*/*"),
+        ]);
+        let mut seen: Vec<(String, bool, bool)> = Vec::new();
+        let mut next = chain.iter();
+        let resp = drive_redirects(&opts, first, |target| {
+            let (origin_url, sent) =
+                hop_credentials(first, target, "http://user:pw@a.test/", &headers);
+            let has_credentials = sent
+                .iter()
+                .any(|(k, _)| k == "Authorization" || k == "Cookie");
+            assert!(sent.iter().any(|(k, _)| k == "Accept"));
+            seen.push((
+                target.to_string(),
+                has_credentials,
+                extract_userinfo_raw(origin_url).is_some(),
+            ));
+            Ok(match next.next() {
+                Some(location) => mk_resp(302, Some(location), target),
+                None => mk_resp(200, None, target),
+            })
+        })
+        .unwrap();
+        assert_eq!(resp.status, 200);
+        let expected = [
+            ("http://a.test/0", true),
+            ("http://b.test/1", false),
+            ("http://a.test/2", true),
+            ("http://a.test:8080/3", false),
+            ("https://a.test/4", false),
+            ("http://a.test/5", true),
+        ];
+        let expected: Vec<(String, bool, bool)> = expected
+            .iter()
+            .map(|(url, credentials)| (url.to_string(), *credentials, *credentials))
+            .collect();
+        assert_eq!(seen, expected);
     }
 
     #[test]
