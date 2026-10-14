@@ -880,6 +880,10 @@ fn is_io_hyper_parse_error(err: &std::io::Error) -> bool {
 }
 
 impl Transport for HttpTransport {
+    fn reuse_for(&self, url: &str) -> Result<Option<Box<dyn Transport>>> {
+        crate::connected_reuse_for(self, url)
+    }
+
     fn external_url(&self) -> Result<Url> {
         // `base` already has the unqualified scheme after
         // `normalise_http_url`, so we just hand it back.
@@ -1666,6 +1670,29 @@ mod tests {
 
     fn fresh_client() -> Arc<HttpClient> {
         Arc::new(HttpClient::new(HttpClientConfig::default()).expect("client builds"))
+    }
+
+    #[test]
+    fn reuse_for_the_same_server() {
+        let client = fresh_client();
+        let t = HttpTransport::new("http://example.com/a/", Arc::clone(&client)).unwrap();
+        let reused = t.reuse_for("http://example.com/b").unwrap().unwrap();
+        assert_eq!("http://example.com/b/", reused.base().as_str());
+        let same = t.reuse_for("http://example.com/a/").unwrap().unwrap();
+        assert_eq!("http://example.com/a/", same.base().as_str());
+        // A file-shaped URL still turns into a directory base, because
+        // HttpTransport::clone normalises the new base to end in `/`.
+        let file_like = t.reuse_for("http://example.com/thing.txt").unwrap().unwrap();
+        assert_eq!("http://example.com/thing.txt/", file_like.base().as_str());
+        for other in [
+            "http://other.com/a/",
+            "https://example.com/a/",
+            "http://example.com:8080/a/",
+            "http://bob@example.com/a/",
+            "not a url",
+        ] {
+            assert!(t.reuse_for(other).unwrap().is_none(), "{other}");
+        }
     }
 
     #[test]

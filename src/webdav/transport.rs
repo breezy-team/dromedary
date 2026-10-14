@@ -326,6 +326,10 @@ impl Drop for DavWriteStream {
 }
 
 impl Transport for HttpDavTransport {
+    fn reuse_for(&self, url: &str) -> Result<Option<Box<dyn Transport>>> {
+        crate::connected_reuse_for(self, url)
+    }
+
     fn external_url(&self) -> Result<Url> {
         self.inner.external_url()
     }

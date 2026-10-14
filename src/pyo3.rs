@@ -386,6 +386,17 @@ impl Transport for PyTransport {
         })
     }
 
+    fn reuse_for(&self, url: &str) -> Result<Option<Box<dyn Transport>>> {
+        Python::attach(|py| {
+            let reused = self.0.call_method1(py, "_reuse_for", (url,))?;
+            Ok(if reused.is_none(py) {
+                None
+            } else {
+                Some(Box::new(PyTransport(reused)) as Box<dyn Transport>)
+            })
+        })
+    }
+
     fn clone(&self, path: Option<&UrlFragment>) -> Result<Box<dyn Transport>> {
         Python::attach(|py| {
             let obj = self.0.call_method1(py, "clone", (path,))?;
