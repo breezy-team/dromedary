@@ -386,6 +386,19 @@ impl Transport for PyTransport {
         })
     }
 
+    fn redirected_to(&self, source: &str, target: &str) -> Result<Option<Box<dyn Transport>>> {
+        Python::attach(|py| {
+            let redirected = self
+                .0
+                .call_method1(py, "_redirected_to", (source, target))?;
+            Ok(if redirected.is_none(py) {
+                None
+            } else {
+                Some(Box::new(PyTransport(redirected)) as Box<dyn Transport>)
+            })
+        })
+    }
+
     fn reuse_for(&self, url: &str) -> Result<Option<Box<dyn Transport>>> {
         Python::attach(|py| {
             let reused = self.0.call_method1(py, "_reuse_for", (url,))?;

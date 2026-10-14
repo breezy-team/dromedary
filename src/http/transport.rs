@@ -125,6 +125,12 @@ impl HttpTransport {
         })
     }
 
+    /// The scheme without any `+impl` qualifier.
+    #[cfg(feature = "webdav")]
+    pub(crate) fn unqualified_scheme(&self) -> &str {
+        &self.unqualified_scheme
+    }
+
     /// Install (or replace) the per-transport activity callback.
     /// Called from the PyO3 layer after construction so breezy's
     /// `_report_activity` hook reaches internal get/has/post/readv
@@ -879,7 +885,71 @@ fn is_io_hyper_parse_error(err: &std::io::Error) -> bool {
     is_hyper_parse_chain(inner)
 }
 
+/// ``_redirected_to`` for HTTP transports: `transport` itself at the new
+/// path when the redirect stays on the same server, otherwise a transport for
+/// the target, keeping the credentials when it stays HTTP. A redirect that
+/// renamed the file asked for cannot be followed.
+pub(crate) fn http_redirected_to(
+    transport: &dyn Transport,
+    unqualified_scheme: &str,
+    source: &str,
+    target: &str,
+) -> Result<Option<Box<dyn Transport>>> {
+    let unusable = |reason: &str| Error::UnusableRedirect {
+        source: source.to_string(),
+        target: target.to_string(),
+        reason: reason.to_string(),
+    };
+    let source_url = Url::parse(source).map_err(|_| unusable("source URL does not parse"))?;
+    let target_url = Url::parse(target).map_err(|_| unusable("target URL does not parse"))?;
+    let base = transport.base();
+    let Some(excess_tail) = source_url.path().strip_prefix(base.path()) else {
+        return Err(unusable("source is not under the transport's base"));
+    };
+    let excess_tail = excess_tail.trim_matches('/');
+    if !target_url.path().ends_with(excess_tail) {
+        return Err(unusable("final part of the url was renamed"));
+    }
+    let target_path = &target_url.path()[..target_url.path().len() - excess_tail.len()];
+    let scheme = target_url.scheme();
+    // Another HTTP server gets the credentials of this one, which it
+    // rejects if they do not apply there; anything else those of the target.
+    let credentials_from = if scheme == "http" || scheme == "https" {
+        if scheme == unqualified_scheme
+            && target_url.host_str() == base.host_str()
+            && target_url.port() == base.port()
+            && (target_url.username().is_empty() || target_url.username() == base.username())
+        {
+            return transport.clone(Some(target_path)).map(Some);
+        }
+        &base
+    } else {
+        &target_url
+    };
+    let mut auth = String::new();
+    if !credentials_from.username().is_empty() {
+        auth.push_str(credentials_from.username());
+        if let Some(password) = credentials_from.password() {
+            auth.push(':');
+            auth.push_str(password);
+        }
+        auth.push('@');
+    }
+    let host = target_url.host_str().unwrap_or_default();
+    let port = target_url
+        .port()
+        .map(|port| format!(":{port}"))
+        .unwrap_or_default();
+    let new_url = format!("{scheme}://{auth}{host}{port}{target_path}");
+    let redirected: Box<dyn Transport> = crate::registry::get_transport(&new_url)?;
+    Ok(Some(redirected))
+}
+
 impl Transport for HttpTransport {
+    fn redirected_to(&self, source: &str, target: &str) -> Result<Option<Box<dyn Transport>>> {
+        http_redirected_to(self, &self.unqualified_scheme, source, target)
+    }
+
     fn reuse_for(&self, url: &str) -> Result<Option<Box<dyn Transport>>> {
         crate::connected_reuse_for(self, url)
     }
@@ -1670,6 +1740,41 @@ mod tests {
 
     fn fresh_client() -> Arc<HttpClient> {
         Arc::new(HttpClient::new(HttpClientConfig::default()).expect("client builds"))
+    }
+
+    #[test]
+    fn redirected_to_follows_the_redirect() {
+        let t = HttpTransport::new("http://example.com/a/", fresh_client()).unwrap();
+        let same = t
+            .redirected_to(
+                "http://example.com/a/.bzr/branch-format",
+                "http://example.com/b/.bzr/branch-format",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!("http://example.com/b/", same.base().as_str());
+        let other = t
+            .redirected_to(
+                "http://example.com/a/.bzr/branch-format",
+                "https://other.example.com/c/.bzr/branch-format",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!("https://other.example.com/c/", other.base().as_str());
+        let Err(Error::UnusableRedirect { reason, .. }) = t.redirected_to(
+            "http://example.com/a/.bzr/branch-format",
+            "http://example.com/b/renamed",
+        ) else {
+            panic!("followed a redirect that renamed the file");
+        };
+        assert_eq!("final part of the url was renamed", reason);
+        let Err(Error::UnusableRedirect { reason, .. }) = t.redirected_to(
+            "http://example.com/elsewhere",
+            "http://example.com/wherever",
+        ) else {
+            panic!("followed a redirect whose source was not under the base");
+        };
+        assert_eq!("source is not under the transport's base", reason);
     }
 
     #[test]

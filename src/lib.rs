@@ -368,6 +368,17 @@ pub trait Transport: std::any::Any + std::fmt::Debug + Send + Sync {
         Ok(None)
     }
 
+    /// The transport to repeat a request on that was redirected from
+    /// `source` to `target`. Transports that cannot be redirected fail with
+    /// [`Error::UnusableRedirect`].
+    fn redirected_to(&self, source: &str, target: &str) -> Result<Option<Box<dyn Transport>>> {
+        Err(Error::UnusableRedirect {
+            source: source.to_string(),
+            target: target.to_string(),
+            reason: "transport does not support redirection".to_string(),
+        })
+    }
+
     fn abspath(&self, relpath: &UrlFragment) -> Result<Url>;
 
     fn relpath(&self, abspath: &Url) -> Result<String>;
