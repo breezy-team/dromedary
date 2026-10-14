@@ -214,6 +214,20 @@ impl From<PyErr> for Error {
                 Error::UrlutilsError(crate::urlutils::Error::UrlNotAscii(
                     arg(0).unwrap_or_default(),
                 ))
+            } else if e.is_instance_of::<RedirectRequested>(py) {
+                let value = e.value(py);
+                Error::RedirectRequested {
+                    source: value.getattr("source").unwrap().extract().unwrap(),
+                    target: value.getattr("target").unwrap().extract().unwrap(),
+                    is_permanent: value.getattr("is_permanent").unwrap().extract().unwrap(),
+                }
+            } else if e.is_instance_of::<UnusableRedirect>(py) {
+                let value = e.value(py);
+                Error::UnusableRedirect {
+                    source: value.getattr("source").unwrap().extract().unwrap(),
+                    target: value.getattr("target").unwrap().extract().unwrap(),
+                    reason: value.getattr("reason").unwrap().extract().unwrap(),
+                }
             } else if e.is_instance_of::<ShortReadvError>(py) {
                 let value = e.value(py);
                 Error::ShortReadvError(
