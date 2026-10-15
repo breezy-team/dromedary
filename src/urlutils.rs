@@ -337,6 +337,41 @@ pub fn strip_segment_parameters(url: &str) -> &str {
     split_segment_parameters_raw(url).0
 }
 
+/// Split the segment parameters of the last segment of a URL, decoding
+/// the values.
+///
+/// Only the values are decoded. Keys are not.
+/// Invalid UTF-8 is replaced, unlike `unescape`, which keeps the
+/// original escaped text.
+///
+/// Args:
+///   url: A relative or absolute URL
+/// Returns: (url, segment_parameters)
+pub fn split_segment_parameters_decoded(
+    url: &str,
+) -> Result<(&str, std::collections::HashMap<&str, String>)> {
+    use percent_encoding::percent_decode_str;
+
+    let (base_url, subsegments) = split_segment_parameters_raw(url);
+    let parameters = subsegments
+        .iter()
+        .map(|subsegment| {
+            subsegment
+                .split_once('=')
+                .ok_or_else(|| Error::SubsegmentMissesEquals(subsegment.to_string()))
+                .map(|(key, value)| {
+                    (
+                        key.trim(),
+                        percent_decode_str(value.trim())
+                            .decode_utf8_lossy()
+                            .into_owned(),
+                    )
+                })
+        })
+        .collect::<Result<HashMap<&str, String>>>()?;
+    Ok((base_url, parameters))
+}
+
 /// Create a new URL by adding subsegments to an existing one.
 ///
 /// This adds the specified subsegments to the last path in the specified
@@ -389,6 +424,57 @@ pub fn join_segment_parameters(url: &str, parameters: &HashMap<&str, &str>) -> R
     let sorted_parameters: Vec<_> = items
         .iter()
         .map(|(key, value)| format!("{}={}", key, value))
+        .collect();
+
+    join_segment_parameters_raw(
+        base,
+        &sorted_parameters
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// Create a new URL by adding segment parameters, encoding the values.
+///
+/// The parameters of the last segment in the URL will be updated. If a
+/// parameter with the same key already exists it is overwritten. Only
+/// the values are encoded with `escape`, so a value may hold `/` or
+/// `,` and still come back unchanged from
+/// `split_segment_parameters_decoded`. Keys are not encoded. The value
+/// type is generic so that the `String` values that split returns can
+/// be passed straight back in.
+///
+/// Args:
+///   url: A URL, as string
+///    parameters: Dictionary of parameters, keys and values as strings
+pub fn join_segment_parameters_encoded<V: AsRef<str>>(
+    url: &str,
+    parameters: &HashMap<&str, V>,
+) -> Result<String> {
+    let (base, existing_parameters) = split_segment_parameters_decoded(url)?;
+    let mut new_parameters: HashMap<&str, &str> = existing_parameters
+        .iter()
+        .map(|(key, value)| (*key, value.as_str()))
+        .collect();
+
+    for (key, value) in parameters {
+        if key.contains('=') {
+            return Err(Error::SegmentParameterKeyContainsEquals(
+                url.to_string(),
+                key.to_string(),
+            ));
+        }
+
+        new_parameters.insert(key, value.as_ref());
+    }
+
+    let mut items: Vec<_> = new_parameters.iter().collect();
+    items.sort_by(|a, b| a.0.cmp(b.0));
+
+    let sorted_parameters: Vec<_> = items
+        .iter()
+        .map(|(key, value)| format!("{}={}", key, escape(value.as_bytes(), Some(""))))
         .collect();
 
     join_segment_parameters_raw(
@@ -931,6 +1017,158 @@ pub fn parse_url(url: &str) -> Result<ParsedUrl> {
         port,
         quoted_path: path,
     })
+}
+
+#[cfg(test)]
+mod segment_parameter_encoding_tests {
+    use super::*;
+
+    fn params<'a>(pairs: &[(&'a str, &'a str)]) -> HashMap<&'a str, &'a str> {
+        pairs.iter().copied().collect()
+    }
+
+    fn joined(url: &str, pairs: &[(&str, &str)]) -> String {
+        join_segment_parameters_encoded(url, &params(pairs)).unwrap()
+    }
+
+    #[test]
+    fn encodes_reserved_characters() {
+        for (value, expected) in [
+            ("tip", "tip"),
+            ("foo/bar", "foo%2Fbar"),
+            ("foo,bar", "foo%2Cbar"),
+            ("foo=bar", "foo%3Dbar"),
+        ] {
+            assert_eq!(
+                format!("/path,branch={expected}"),
+                joined("/path", &[("branch", value)])
+            );
+        }
+    }
+
+    #[test]
+    fn a_percent_in_a_value_is_encoded() {
+        // A value that already looks escaped is data, not markup.
+        assert_eq!(
+            "/path,branch=foo%252Fbar",
+            joined("/path", &[("branch", "foo%2Fbar")])
+        );
+        assert_eq!("/path,branch=%25", joined("/path", &[("branch", "%")]));
+    }
+
+    #[test]
+    fn encodes_non_ascii_and_space() {
+        assert_eq!(
+            "/path,branch=%C3%A5",
+            joined("/path", &[("branch", "\u{e5}")])
+        );
+        assert_eq!(
+            "/path,branch=%20a%20",
+            joined("/path", &[("branch", " a ")])
+        );
+    }
+
+    #[test]
+    fn an_empty_value_survives() {
+        assert_eq!("/path,branch=", joined("/path", &[("branch", "")]));
+        let (_, got) = split_segment_parameters_decoded("/path,branch=").unwrap();
+        assert_eq!(Some(&String::new()), got.get("branch"));
+    }
+
+    #[test]
+    fn the_pair_round_trips() {
+        for value in [
+            "tip",
+            "foo/bar",
+            "foo,bar",
+            "foo=bar",
+            "foo%2Fbar",
+            "%",
+            "%2",
+            " a ",
+            "\u{e5} b",
+        ] {
+            let url = joined("/path", &[("branch", value)]);
+            let (base, got) = split_segment_parameters_decoded(&url).unwrap();
+            assert_eq!("/path", base);
+            assert_eq!(
+                Some(&value.to_string()),
+                got.get("branch"),
+                "failed for {value:?} via {url:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_url_with_no_parameters_decodes_to_nothing() {
+        let (base, got) = split_segment_parameters_decoded("/path").unwrap();
+        assert_eq!("/path", base);
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn a_subsegment_without_equals_is_an_error() {
+        assert!(matches!(
+            split_segment_parameters_decoded("/path,novalue"),
+            Err(Error::SubsegmentMissesEquals(_))
+        ));
+    }
+
+    #[test]
+    fn keys_are_not_encoded() {
+        assert_eq!("/path,a%2Fb=x", joined("/path", &[("a%2Fb", "x")]));
+        let (_, got) = split_segment_parameters_decoded("/path,a%2Fb=x").unwrap();
+        assert_eq!(Some(&"x".to_string()), got.get("a%2Fb"));
+    }
+
+    #[test]
+    fn an_existing_parameter_survives_unchanged() {
+        // The existing value is decoded and encoded again, not encoded twice.
+        assert_eq!("/path,a=x%2Fy,b=z", joined("/path,a=x%2Fy", &[("b", "z")]));
+    }
+
+    #[test]
+    fn invalid_utf8_in_a_value_is_replaced() {
+        let (_, got) = split_segment_parameters_decoded("/path,a=%FF").unwrap();
+        assert_eq!(Some(&"\u{FFFD}".to_string()), got.get("a"));
+    }
+
+    #[test]
+    fn an_existing_key_is_overwritten() {
+        assert_eq!("/path,a=q", joined("/path,a=x%2Fy", &[("a", "q")]));
+    }
+
+    #[test]
+    fn a_key_holding_equals_is_an_error() {
+        assert!(matches!(
+            join_segment_parameters_encoded("/path", &params(&[("a=b", "x")])),
+            Err(Error::SegmentParameterKeyContainsEquals(_, _))
+        ));
+    }
+
+    #[test]
+    fn the_existing_pair_still_loses_a_slash() {
+        // This is what the new pair exists for. The existing functions write
+        // the value as given, so the comma that separates parameters is no
+        // longer the last one in the URL and the parameter is not found.
+        let joined_old =
+            join_segment_parameters("/path", &params(&[("branch", "foo/bar")])).unwrap();
+        assert_eq!("/path,branch=foo/bar", joined_old);
+        let (base, got) = split_segment_parameters(&joined_old).unwrap();
+        assert_eq!("/path,branch=foo/bar", base);
+        assert!(
+            got.is_empty(),
+            "expected the parameter to be lost, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn the_existing_pair_still_refuses_a_comma() {
+        assert!(matches!(
+            join_segment_parameters("/path", &params(&[("branch", "foo,bar")])),
+            Err(Error::SegmentParameterContainsComma(_, _))
+        ));
+    }
 }
 
 #[cfg(test)]
