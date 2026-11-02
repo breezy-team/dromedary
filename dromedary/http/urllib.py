@@ -65,6 +65,7 @@ class HttpTransport(_http_rs.HttpTransport):
         base: str,
         _from_transport: "HttpTransport | None" = None,
         ca_certs: str | None = None,
+        headers: dict[str, str] | None = None,
     ) -> Self:
         """Build the Rust transport.
 
@@ -101,6 +102,7 @@ class HttpTransport(_http_rs.HttpTransport):
         base: str,
         _from_transport: "HttpTransport | None" = None,
         ca_certs: str | None = None,
+        headers: dict[str, str] | None = None,
     ) -> None:
         """Initialise Python-side state and TLS-configured inner client.
 
@@ -111,6 +113,9 @@ class HttpTransport(_http_rs.HttpTransport):
         underlying client was built with the wrong ones. We rebuild the
         whole inner state (fresh HttpClient with the right TLS config)
         and graft it in.
+
+        ``headers`` are sent with every request of this transport and
+        its clones, e.g. a ``traceparent`` for distributed tracing.
         """
         self._medium = None
         if _from_transport is None:
@@ -140,6 +145,7 @@ class HttpTransport(_http_rs.HttpTransport):
                 ca_certs=ca_certs,
                 disable_verification=disable_verification,
                 user_agent=_default_user_agent(),
+                headers=headers,
             )
             # ``offset=None`` lets ``_clone_from``
             # share ``fresh``'s inner directly, preserving raw_base

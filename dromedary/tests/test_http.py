@@ -27,6 +27,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from dromedary import http
 from dromedary._transport_rs.http import HttpClient
 from dromedary.http import ca_bundle
+from dromedary.http.urllib import HttpTransport
 from dromedary.tests import isolate_proxy_env
 
 
@@ -250,6 +251,41 @@ class TestTokenProviderEndToEnd(unittest.TestCase):
         resp = client.request("GET", self._url(), [], b"")
         self.assertEqual(200, resp.status)
         self.assertIsNone(self.server.last_authorization)
+
+
+class _CaptureTraceparentHandler(BaseHTTPRequestHandler):
+    """Record each request's traceparent header and reply 200 OK."""
+
+    def do_GET(self):
+        self.server.seen.append(self.headers.get("traceparent"))
+        self.send_response(200)
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, *args, **kwargs):  # silence stderr noise
+        pass
+
+
+class TestTransportHeaders(unittest.TestCase):
+    def setUp(self):
+        isolate_proxy_env(self)
+        self.server = HTTPServer(("127.0.0.1", 0), _CaptureTraceparentHandler)
+        self.server.seen = []
+        thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    def test_headers_sent_by_transport_and_clones(self):
+        host, port = self.server.server_address
+        tp = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+        t = HttpTransport(f"http://{host}:{port}/", headers={"traceparent": tp})
+        t.get_bytes("a")
+        t.clone("sub").get_bytes("b")
+        t.request("GET", t.abspath("c"), headers={"Traceparent": "explicit"})
+        self.assertEqual([tp, tp, "explicit"], self.server.seen)
 
 
 if __name__ == "__main__":
