@@ -14,7 +14,7 @@ pyo3-log = "0.13"
 sftp = ">=0.2.3, <0.4"
 url = { workspace = true }
 log = { workspace = true }
-russh = { version = "0.64", optional = true }
+russh = { version = "0.65", optional = true }
 lazy_static = "1"
 
 [features]
