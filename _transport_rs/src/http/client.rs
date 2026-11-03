@@ -40,11 +40,9 @@ pub(super) fn client_err_to_py(err: ClientError) -> PyErr {
         ClientError::InvalidRequest(msg) => PyValueError::new_err(msg),
         ClientError::Io(e) => PyIOError::new_err(e.to_string()),
         ClientError::Transport(e) => {
-            // `ureq::Error`'s Display carries the useful context
-            // (hostname, port, TLS reason). Wrap as ConnectionError
-            // so breezy's retry loop triggers on it the way it did
-            // for the old handler-layer errors.
-            ConnectionError::new_err(e.to_string())
+            // Wrap as ConnectionError so breezy's retry loop triggers
+            // on it the way it did for the old handler-layer errors.
+            ConnectionError::new_err(dromedary::http::client::error_with_sources(&e))
         }
     }
 }
