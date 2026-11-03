@@ -795,7 +795,7 @@ fn client_err_to_transport_err(err: crate::http::client::ClientError) -> Error {
             // tests below; we mirror that approach rather than
             // string-matching the Display output, which would
             // inevitably drift.
-            let msg = e.to_string();
+            let msg = crate::http::client::error_with_sources(&e);
             if is_http_parse_error(&e) {
                 Error::InvalidHttpResponse {
                     path: String::new(),
@@ -1696,6 +1696,20 @@ mod tests {
     #[test]
     fn normalise_http_url_rejects_non_http() {
         assert!(normalise_http_url("ftp://example.com/").is_err());
+    }
+
+    #[test]
+    fn refused_connection_error_names_the_cause() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let refused = std::net::TcpStream::connect(addr).unwrap_err().to_string();
+        let t = HttpTransport::new(&format!("http://{}/", addr), fresh_client()).unwrap();
+        let proxy_vars = ["http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY"];
+        match super::super::tests::with_env_vars(&proxy_vars, &[], || t.has("x")) {
+            Err(Error::ConnectionError(msg)) => assert!(msg.ends_with(&refused), "{}", msg),
+            other => panic!("expected ConnectionError, got {:?}", other),
+        }
     }
 
     #[test]
