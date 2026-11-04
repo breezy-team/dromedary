@@ -15,12 +15,16 @@
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
 
 import errno
+import http.client
+import os
 import socket
 import socketserver
+import ssl
 import threading
 import unittest
+from unittest import mock
 
-from dromedary.tests import test_server
+from dromedary.tests import https_server, test_server
 
 
 def portable_socket_pair():
@@ -243,3 +247,39 @@ class TestTCPServerInAThread_TestingThreadingTCPServer(
     TestTCPServerInAThreadBase, unittest.TestCase
 ):
     server_class = test_server.TestingThreadingTCPServer
+
+
+class TestHTTPSServerPeerGone(unittest.TestCase):
+    def check_server_survives_peer_gone(self, protocol_version):
+        real_getpeername = socket.socket.getpeername
+        failed = []
+
+        def getpeername(sock):
+            if sock.server_side and not failed:
+                failed.append(sock)
+                raise OSError(errno.EINVAL, os.strerror(errno.EINVAL))
+            return real_getpeername(sock)
+
+        patcher = mock.patch.object(ssl.SSLSocket, "getpeername", getpeername)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        server = https_server.HTTPSServer(protocol_version=protocol_version)
+        server.start_server()
+        self.addCleanup(server.stop_server)
+        test_server.connect_socket((server.host, server.port)).close()
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        conn = http.client.HTTPSConnection(
+            server.host, server.port, timeout=5, context=context
+        )
+        self.addCleanup(conn.close)
+        conn.request("HEAD", "/no-such-file")
+        self.assertEqual(404, conn.getresponse().status)
+        self.assertEqual(1, len(failed))
+
+    def test_http_1_0(self):
+        self.check_server_survives_peer_gone("HTTP/1.0")
+
+    def test_http_1_1(self):
+        self.check_server_survives_peer_gone("HTTP/1.1")
