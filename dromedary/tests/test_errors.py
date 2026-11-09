@@ -18,7 +18,7 @@
 
 import unittest
 
-from dromedary.errors import SocketConnectionError
+from dromedary.errors import PathNotChild, PermissionDenied, SocketConnectionError
 
 
 class TestSocketConnectionError(unittest.TestCase):
@@ -69,4 +69,27 @@ class TestSocketConnectionError(unittest.TestCase):
             port=444,
             msg="Unable to connect to ssh host",
             orig_error="my_error",
+        )
+
+
+class TestPathError(unittest.TestCase):
+    def test_reason(self):
+        e = PermissionDenied("/a", extra=OSError(13, "Permission denied"))
+        self.assertEqual(
+            (
+                'Permission denied: "/a": [Errno 13] Permission denied',
+                "[Errno 13] Permission denied",
+            ),
+            (str(e), e.reason),
+        )
+
+    def test_no_reason(self):
+        e = PermissionDenied("/a")
+        self.assertEqual(('Permission denied: "/a"', None), (str(e), e.reason))
+
+    def test_path_not_child(self):
+        e = PathNotChild("/b", "/a", extra="outside")
+        self.assertEqual(
+            ('Path "/b" is not a child of path "/a": outside', "outside"),
+            (str(e), e.reason),
         )

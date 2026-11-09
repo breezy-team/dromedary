@@ -81,10 +81,9 @@ class PathError(TransportError):
         """Initialize with the offending path and optional extra detail."""
         TransportError.__init__(self)
         self.path = path
-        if extra:
-            self.extra = ": " + str(extra)
-        else:
-            self.extra = ""
+        # The detail alone; extra adds the ": " for the message.
+        self.reason = str(extra) if extra else None
+        self.extra = "" if self.reason is None else ": " + self.reason
 
 
 class NotADirectory(PathError):
@@ -172,10 +171,8 @@ class PathNotChild(PathError, ValueError):
         TransportError.__init__(self)
         self.path = path
         self.base = base
-        if extra:
-            self.extra = ": " + str(extra)
-        else:
-            self.extra = ""
+        self.reason = str(extra) if extra else None
+        self.extra = "" if self.reason is None else ": " + self.reason
 
 
 class TransportNotPossible(TransportError):
