@@ -1610,9 +1610,13 @@ fn build_client(config: &HttpClientConfig, proxy: Option<Proxy>) -> Result<Clien
         .unwrap_or_else(crate::http::default_user_agent);
     builder = builder.user_agent(ua);
 
-    if let Some(t) = config.read_timeout {
-        builder = builder.timeout(t);
-    }
+    // reqwest's default 30 s total limit cuts off slow uploads; keep it for connecting only.
+    builder = match config.read_timeout {
+        Some(t) => builder.timeout(t),
+        None => builder
+            .timeout(None)
+            .connect_timeout(Duration::from_secs(30)),
+    };
 
     if config.disable_verification {
         builder = builder
