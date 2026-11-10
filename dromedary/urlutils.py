@@ -40,10 +40,10 @@ class InvalidURLJoin(errors.PathError):
 
     def __init__(self, reason: str, base: str, join_args: tuple[str, ...]) -> None:
         """Initialize with the join failure reason, base URL, and join args."""
-        self.reason = reason
         self.base = base
         self.join_args = join_args
         errors.PathError.__init__(self, base, reason)
+        self.reason = reason
 
 
 class InvalidRebaseURLs(errors.TransportError):
