@@ -89,6 +89,14 @@ impl From<std::io::Error> for ClientError {
     }
 }
 
+/// `err` followed by each error in its source chain, joined by ": ".
+pub fn error_with_sources(err: &(dyn std::error::Error + 'static)) -> String {
+    std::iter::successors(Some(err), |e| e.source())
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>()
+        .join(": ")
+}
+
 pub type Result<T> = std::result::Result<T, ClientError>;
 
 /// Direction of a byte transfer reported via [`ActivityCallback`].
