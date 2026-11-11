@@ -781,6 +781,8 @@ pub struct HttpClientConfig {
     pub user_agent: Option<String>,
     /// Read timeout for each response. `None` means "no timeout".
     pub read_timeout: Option<Duration>,
+    /// Headers sent with every request; a caller-supplied header of the same name wins.
+    pub headers: Vec<(String, String)>,
 }
 
 /// HTTP client wrapper around [`reqwest::blocking::Client`].
@@ -998,13 +1000,21 @@ impl HttpClient {
     ) -> Result<HttpResponse> {
         let method = Method::from_bytes(method.as_bytes())
             .map_err(|_| ClientError::InvalidRequest(format!("bad method: {}", method)))?;
+        let headers: Vec<(String, String)> = self
+            .config
+            .headers
+            .iter()
+            .filter(|(k, _)| !headers.iter().any(|(h, _)| h.eq_ignore_ascii_case(k)))
+            .chain(headers)
+            .cloned()
+            .collect();
 
         // Each redirect hop does its own auth dance — a 3xx to a
         // different host mustn't reuse the previous host's cached
         // auth, and handling that here keeps the redirect-loop code
         // from having to know anything about auth.
         drive_redirects(options, url, |target| {
-            let (origin_url, headers) = hop_credentials(url, target, origin_url, headers);
+            let (origin_url, headers) = hop_credentials(url, target, origin_url, &headers);
             self.send_with_auth(&method, target, origin_url, &headers, body, activity)
         })
     }
