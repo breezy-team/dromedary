@@ -326,6 +326,13 @@ type AuthTarget = (
     Option<String>,
 );
 
+/// The host as authentication.conf names it, without an IPv6 URL's brackets.
+fn credential_host(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
 /// Break a proxy URL down into the parts the credential-lookup path
 /// needs. Returns `(scheme, host, port, embedded_creds, user_hint)`.
 ///
@@ -1057,7 +1064,7 @@ impl HttpClient {
                 first_headers.push(("Authorization".into(), hdr));
             } else if let Some((scheme, token)) = self.tokens.lookup(
                 uri.scheme_str().unwrap_or(""),
-                uri.host().unwrap_or(""),
+                credential_host(uri.host().unwrap_or("")),
                 uri.port_u16(),
                 Some(uri.path()),
             ) {
@@ -1346,7 +1353,7 @@ impl HttpClient {
             }
             AuthKind::Proxy => proxy_connection_parts(proxy_url),
         };
-        let host_str = host.as_str();
+        let host_str = credential_host(&host);
         let protocol_str = protocol.as_str();
 
         if negotiate_seen {
