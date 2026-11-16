@@ -371,6 +371,13 @@ class TestUrlToPath(TestCase):
             TypeError, join_segment_parameters, "/,key1=val1", {"foo": 42}
         )
 
+    def test_join_segment_parameters_encoded(self):
+        join = urlutils.join_segment_parameters_encoded
+        self.assertEqual(
+            "/p,a=foo%2Fbar,b=%FF", join("/p", {"a": "foo/bar", "b": "\udcff"})
+        )
+        self.assertRaises(TypeError, join, "/p", {"a": b"bytes"})
+
     def test_posix_local_path_to_url(self):
         to_url = urlutils._posix_local_path_to_url
         self.assertEqual("file:///path/to/foo", to_url("/path/to/foo"))
@@ -650,6 +657,13 @@ class TestUrlToPath(TestCase):
             urlutils.InvalidURL, split_segment_parameters, "foo/base,key1"
         )
         # TODO: Check full URLs as well as relative references
+
+    def test_split_segment_parameters_decoded(self):
+        split = urlutils.split_segment_parameters_decoded
+        self.assertEqual(
+            ("/p", {"a": "foo/bar", "b": "\udcff"}), split("/p,a=foo%2Fbar,b=%FF")
+        )
+        self.assertRaises(urlutils.InvalidURL, split, "/p,a")
 
     def test_win32_strip_local_trailing_slash(self):
         strip = urlutils._win32_strip_local_trailing_slash
