@@ -361,6 +361,24 @@ pub trait Transport: std::any::Any + std::fmt::Debug + Send + Sync {
 
     fn clone(&self, offset: Option<&UrlFragment>) -> Result<Box<dyn Transport>>;
 
+    /// A transport for `url` that shares this one's connection, if this one
+    /// can serve it; `None` otherwise, as for transports without a
+    /// connection.
+    fn reuse_for(&self, _url: &str) -> Result<Option<Box<dyn Transport>>> {
+        Ok(None)
+    }
+
+    /// The transport to repeat a request on that was redirected from
+    /// `source` to `target`. Transports that cannot be redirected fail with
+    /// [`Error::UnusableRedirect`].
+    fn redirected_to(&self, source: &str, target: &str) -> Result<Option<Box<dyn Transport>>> {
+        Err(Error::UnusableRedirect {
+            source: source.to_string(),
+            target: target.to_string(),
+            reason: "transport does not support redirection".to_string(),
+        })
+    }
+
     fn abspath(&self, relpath: &UrlFragment) -> Result<Url>;
 
     fn relpath(&self, abspath: &Url) -> Result<String>;
@@ -676,6 +694,28 @@ pub trait ConnectedTransport: Transport {
     fn disconnect(&self) -> Result<()> {
         Ok(())
     }
+}
+
+/// [`Transport::reuse_for`] for a connected transport: a clone of
+/// `transport` when `url` is on the same server, as the same user, so that
+/// it shares the connection.
+pub fn connected_reuse_for(
+    transport: &dyn Transport,
+    url: &str,
+) -> Result<Option<Box<dyn Transport>>> {
+    // A URL that does not parse is not one this transport serves.
+    let Ok(other) = Url::parse(url) else {
+        return Ok(None);
+    };
+    let base = transport.base();
+    let same_server = connected_url_scheme(&other) == connected_url_scheme(&base)
+        && connected_url_user(&other) == connected_url_user(&base)
+        && connected_url_host(&other) == connected_url_host(&base)
+        && connected_url_port(&other) == connected_url_port(&base);
+    if !same_server {
+        return Ok(None);
+    }
+    transport.clone(Some(other.path())).map(Some)
 }
 
 /// URL scheme (`"http"`, `"https"`, `"sftp"`, …).

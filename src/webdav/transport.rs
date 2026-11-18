@@ -326,6 +326,19 @@ impl Drop for DavWriteStream {
 }
 
 impl Transport for HttpDavTransport {
+    fn reuse_for(&self, url: &str) -> Result<Option<Box<dyn Transport>>> {
+        crate::connected_reuse_for(self, url)
+    }
+
+    fn redirected_to(&self, source: &str, target: &str) -> Result<Option<Box<dyn Transport>>> {
+        crate::http::transport::http_redirected_to(
+            self,
+            self.inner.unqualified_scheme(),
+            source,
+            target,
+        )
+    }
+
     fn external_url(&self) -> Result<Url> {
         self.inner.external_url()
     }

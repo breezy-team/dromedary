@@ -281,6 +281,10 @@ impl Drop for SftpWriteStream {
 }
 
 impl Transport for SftpTransport {
+    fn reuse_for(&self, url: &str) -> Result<Option<Box<dyn Transport>>> {
+        crate::connected_reuse_for(self, url)
+    }
+
     fn external_url(&self) -> Result<Url> {
         Ok(self.base.clone())
     }

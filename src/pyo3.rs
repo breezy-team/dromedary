@@ -214,6 +214,20 @@ impl From<PyErr> for Error {
                 Error::UrlutilsError(crate::urlutils::Error::UrlNotAscii(
                     arg(0).unwrap_or_default(),
                 ))
+            } else if e.is_instance_of::<RedirectRequested>(py) {
+                let value = e.value(py);
+                Error::RedirectRequested {
+                    source: value.getattr("source").unwrap().extract().unwrap(),
+                    target: value.getattr("target").unwrap().extract().unwrap(),
+                    is_permanent: value.getattr("is_permanent").unwrap().extract().unwrap(),
+                }
+            } else if e.is_instance_of::<UnusableRedirect>(py) {
+                let value = e.value(py);
+                Error::UnusableRedirect {
+                    source: value.getattr("source").unwrap().extract().unwrap(),
+                    target: value.getattr("target").unwrap().extract().unwrap(),
+                    reason: value.getattr("reason").unwrap().extract().unwrap(),
+                }
             } else if e.is_instance_of::<ShortReadvError>(py) {
                 let value = e.value(py);
                 Error::ShortReadvError(
@@ -382,6 +396,30 @@ impl Transport for PyTransport {
                 kind,
                 size: stat_result.getattr(py, "st_size")?.extract::<usize>(py)?,
                 mtime,
+            })
+        })
+    }
+
+    fn redirected_to(&self, source: &str, target: &str) -> Result<Option<Box<dyn Transport>>> {
+        Python::attach(|py| {
+            let redirected = self
+                .0
+                .call_method1(py, "_redirected_to", (source, target))?;
+            Ok(if redirected.is_none(py) {
+                None
+            } else {
+                Some(Box::new(PyTransport(redirected)) as Box<dyn Transport>)
+            })
+        })
+    }
+
+    fn reuse_for(&self, url: &str) -> Result<Option<Box<dyn Transport>>> {
+        Python::attach(|py| {
+            let reused = self.0.call_method1(py, "_reuse_for", (url,))?;
+            Ok(if reused.is_none(py) {
+                None
+            } else {
+                Some(Box::new(PyTransport(reused)) as Box<dyn Transport>)
             })
         })
     }

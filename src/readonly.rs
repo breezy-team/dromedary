@@ -70,6 +70,13 @@ impl Transport for ReadonlyTransport {
         Ok(Box::new(ReadonlyTransport::new(inner_clone)))
     }
 
+    fn redirected_to(&self, source: &str, target: &str) -> Result<Option<Box<dyn Transport>>> {
+        Ok(self
+            .decorated
+            .redirected_to(source, target)?
+            .map(|inner| Box::new(ReadonlyTransport::new(inner)) as Box<dyn Transport>))
+    }
+
     fn abspath(&self, relpath: &UrlFragment) -> Result<Url> {
         crate::decorator::prefixed_abspath(Self::PREFIX, self.decorated.as_ref(), relpath)
     }

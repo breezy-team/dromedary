@@ -213,6 +213,7 @@ class RedirectRequested(TransportError):
         """Initialize with the source URL, target URL and whether permanent."""
         self.source = source
         self.target = target
+        self.is_permanent = is_permanent
         if is_permanent:
             self.permanently = " permanently"
         else:

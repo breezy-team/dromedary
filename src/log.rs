@@ -140,6 +140,12 @@ impl Transport for LogTransport {
         )))
     }
 
+    fn redirected_to(&self, source: &str, target: &str) -> Result<Option<Box<dyn Transport>>> {
+        Ok(self.inner.redirected_to(source, target)?.map(|inner| {
+            Box::new(LogTransport::new(inner, Arc::clone(&self.sink))) as Box<dyn Transport>
+        }))
+    }
+
     fn get(&self, relpath: &UrlFragment) -> Result<Box<dyn ReadStream + Send + Sync>> {
         self.log_call("get", relpath, "");
         match self.inner.get(relpath) {

@@ -423,6 +423,16 @@ macro_rules! fwd_decorator_url {
             let inner_clone = self.$field.clone(offset)?;
             Ok(Box::new($ty::new(inner_clone)))
         }
+        fn redirected_to(
+            &self,
+            source: &str,
+            target: &str,
+        ) -> $crate::Result<Option<Box<dyn $crate::Transport>>> {
+            Ok(self
+                .$field
+                .redirected_to(source, target)?
+                .map(|inner| Box::new($ty::new(inner)) as Box<dyn $crate::Transport>))
+        }
     };
 }
 
