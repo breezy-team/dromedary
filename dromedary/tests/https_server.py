@@ -16,9 +16,16 @@
 
 """HTTPS test server, available when ssl python module is available."""
 
+import errno
 import ssl
 
 from . import http_server, ssl_certs, test_server
+
+# Errors seen when the client has already disconnected by the time the server
+# wraps or handshakes the socket. macOS reports EINVAL rather than ENOTCONN
+# from getpeername() on a reset connection, which ssl.SSLSocket does not
+# tolerate (https://bugs.python.org/issue13721).
+_PEER_GONE_ERRNOS = (errno.ENOTCONN, errno.ECONNRESET, errno.EINVAL)
 
 
 class TestingHTTPSServerMixin:
@@ -36,6 +43,17 @@ class TestingHTTPSServerMixin:
         )
         return ssl_sock, addr
 
+    def get_request(self):
+        while True:
+            sock, addr = super().get_request()
+            try:
+                return self._get_ssl_request(sock, addr)
+            except OSError as e:
+                if e.errno not in _PEER_GONE_ERRNOS:
+                    raise
+            self.clients = [c for c in self.clients if c[0] is not sock]
+            sock.close()
+
     def verify_request(self, request, client_address):
         """Verify the request.
 
@@ -52,6 +70,10 @@ class TestingHTTPSServerMixin:
                 # FIXME: We proabaly want more tests to capture which ssl
                 # errors are worth reporting but mostly our tests want an https
                 # server that works -- vila 2012-01-19
+                return False
+            except OSError as e:
+                if e.errno not in _PEER_GONE_ERRNOS:
+                    raise
                 return False
         return serving
 
@@ -74,10 +96,6 @@ class TestingHTTPSServer(TestingHTTPSServerMixin, http_server.TestingHTTPServer)
             self, server_address, request_handler_class, test_case_server
         )
 
-    def get_request(self):
-        sock, addr = http_server.TestingHTTPServer.get_request(self)
-        return self._get_ssl_request(sock, addr)
-
 
 class TestingThreadingHTTPSServer(
     TestingHTTPSServerMixin, http_server.TestingThreadingHTTPServer
@@ -94,10 +112,6 @@ class TestingThreadingHTTPSServer(
         http_server.TestingThreadingHTTPServer.__init__(
             self, server_address, request_handler_class, test_case_server
         )
-
-    def get_request(self):
-        sock, addr = http_server.TestingThreadingHTTPServer.get_request(self)
-        return self._get_ssl_request(sock, addr)
 
 
 class HTTPSServer(http_server.HttpServer):
