@@ -32,7 +32,7 @@ use super::client::{
 ///
 /// Constructor: `HttpTransport(base, ca_certs=None,
 /// disable_verification=False, user_agent=None,
-/// read_timeout_ms=0)`. Each construction builds a fresh
+/// read_timeout_ms=0, headers=None)`. Each construction builds a fresh
 /// `HttpClient`; call `clone()` to get a sibling transport that
 /// shares the underlying agent and auth cache.
 ///
@@ -59,13 +59,16 @@ impl HttpTransport {
         disable_verification=false,
         user_agent=None,
         read_timeout_ms=0,
+        headers=None,
     ))]
     fn new(
+        py: Python,
         base: &str,
         ca_certs: Option<PathBuf>,
         disable_verification: bool,
         user_agent: Option<String>,
         read_timeout_ms: i64,
+        headers: Option<Py<PyAny>>,
     ) -> PyResult<PyClassInitializer<Self>> {
         let timeout = if read_timeout_ms > 0 {
             Some(Duration::from_millis(read_timeout_ms as u64))
@@ -77,6 +80,10 @@ impl HttpTransport {
             disable_verification,
             user_agent,
             read_timeout: timeout,
+            headers: match headers {
+                Some(h) => extract_headers(py, &h)?,
+                None => Vec::new(),
+            },
         };
         let mut client = HttpClient::with_full_providers(
             cfg,

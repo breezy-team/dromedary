@@ -138,6 +138,7 @@ impl HttpClient {
             disable_verification,
             user_agent,
             read_timeout: timeout,
+            headers: Vec::new(),
         };
         let mut inner = RsHttpClient::with_full_providers(
             cfg,
