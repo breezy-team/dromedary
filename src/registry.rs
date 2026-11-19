@@ -46,7 +46,9 @@ use crate::{Error, Result, Transport};
 fn http_client_err_to_transport_err(e: crate::http::client::ClientError) -> Error {
     use crate::http::client::ClientError;
     match e {
-        ClientError::Transport(re) => Error::ConnectionError(re.to_string()),
+        ClientError::Transport(re) => {
+            Error::ConnectionError(crate::http::client::error_with_sources(&re))
+        }
         ClientError::InvalidRequest(s) => Error::TransportNotPossible(Some(s)),
         ClientError::Io(io) => Error::Io(io),
     }
