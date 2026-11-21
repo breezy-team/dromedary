@@ -16,6 +16,7 @@
 
 """HTTPS test server, available when ssl python module is available."""
 
+import errno
 import ssl
 
 from . import http_server, ssl_certs, test_server
@@ -31,9 +32,16 @@ class TestingHTTPSServerMixin:
         ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         if self.cert_file:
             ssl_context.load_cert_chain(self.cert_file, self.key_file)
-        ssl_sock = ssl_context.wrap_socket(
-            sock=sock, server_side=True, do_handshake_on_connect=False
-        )
+        try:
+            ssl_sock = ssl_context.wrap_socket(
+                sock=sock, server_side=True, do_handshake_on_connect=False
+            )
+        except OSError as e:
+            # macOS can give EINVAL from getpeername() when the connection
+            # is already gone. verify_request() drops the detached socket.
+            if e.errno != errno.EINVAL:
+                raise
+            return sock, addr
         return ssl_sock, addr
 
     def verify_request(self, request, client_address):
@@ -42,6 +50,8 @@ class TestingHTTPSServerMixin:
         Return True if we should proceed with this request, False if we should
         not even touch a single byte in the socket !
         """
+        if not isinstance(request, ssl.SSLSocket):
+            return False
         serving = test_server.TestingTCPServerMixin.verify_request(
             self, request, client_address
         )
