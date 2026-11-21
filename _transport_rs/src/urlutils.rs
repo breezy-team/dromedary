@@ -2,7 +2,8 @@ use pyo3::exceptions::PyTypeError;
 use pyo3::exceptions::PyValueError;
 use pyo3::import_exception;
 use pyo3::prelude::*;
-use pyo3::types::PyTuple;
+use pyo3::pybacked::PyBackedBytes;
+use pyo3::types::{PyBytes, PyString, PyTuple};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -212,6 +213,24 @@ fn split_segment_parameters(url: &str) -> PyResult<(&str, HashMap<&str, &str>)> 
 }
 
 #[pyfunction]
+fn split_segment_parameters_decoded<'py>(
+    py: Python<'py>,
+    url: &str,
+) -> PyResult<(String, HashMap<String, Bound<'py, PyAny>>)> {
+    let (base, parameters) = dromedary::urlutils::split_segment_parameters_decoded(url)
+        .map_err(map_urlutils_error_to_pyerr)?;
+    let parameters = parameters
+        .into_iter()
+        .map(|(key, value)| {
+            let value =
+                PyBytes::new(py, &value).call_method1("decode", ("utf-8", "surrogateescape"))?;
+            Ok((key.to_string(), value))
+        })
+        .collect::<PyResult<_>>()?;
+    Ok((base.to_string(), parameters))
+}
+
+#[pyfunction]
 fn split_segment_parameters_raw(url: &str) -> (&str, Vec<&str>) {
     dromedary::urlutils::split_segment_parameters_raw(url)
 }
@@ -287,6 +306,24 @@ fn join_segment_parameters(url: &str, parameters: HashMap<String, String>) -> Py
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
     dromedary::urlutils::join_segment_parameters(url, &parameters)
+        .map_err(map_urlutils_error_to_pyerr)
+}
+
+#[pyfunction]
+fn join_segment_parameters_encoded(
+    url: &str,
+    parameters: HashMap<String, Bound<PyString>>,
+) -> PyResult<String> {
+    let parameters = parameters
+        .iter()
+        .map(|(k, v)| {
+            let v: PyBackedBytes = v
+                .call_method1("encode", ("utf-8", "surrogateescape"))?
+                .extract()?;
+            Ok((k.as_str(), v))
+        })
+        .collect::<PyResult<HashMap<&str, PyBackedBytes>>>()?;
+    dromedary::urlutils::join_segment_parameters_encoded(url, &parameters)
         .map_err(map_urlutils_error_to_pyerr)
 }
 
@@ -546,10 +583,12 @@ pub fn _urlutils_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(joinpath, m)?)?;
     m.add_function(wrap_pyfunction!(join, m)?)?;
     m.add_function(wrap_pyfunction!(split_segment_parameters, m)?)?;
+    m.add_function(wrap_pyfunction!(split_segment_parameters_decoded, m)?)?;
     m.add_function(wrap_pyfunction!(split_segment_parameters_raw, m)?)?;
     m.add_function(wrap_pyfunction!(strip_segment_parameters, m)?)?;
     m.add_function(wrap_pyfunction!(join_segment_parameters_raw, m)?)?;
     m.add_function(wrap_pyfunction!(join_segment_parameters, m)?)?;
+    m.add_function(wrap_pyfunction!(join_segment_parameters_encoded, m)?)?;
     m.add_function(wrap_pyfunction!(relative_url, m)?)?;
     m.add_function(wrap_pyfunction!(combine_paths, m)?)?;
     m.add_function(wrap_pyfunction!(escape, m)?)?;
