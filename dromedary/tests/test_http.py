@@ -17,6 +17,7 @@
 """Tests for dromedary.http and dromedary.http.ca_bundle."""
 
 import os
+import socket
 import ssl
 import sys
 import tempfile
@@ -392,6 +393,48 @@ class TestRedirectCredentials(unittest.TestCase):
         self.assertEqual(
             "Basic am9lOnMzY3JldA==", self.first.seen[-1][1].get("Authorization")
         )
+
+
+class _IPv6HTTPServer(HTTPServer):
+    address_family = socket.AF_INET6
+
+
+class TestCredentialLookupIPv6Host(unittest.TestCase):
+    def setUp(self):
+        isolate_proxy_env(self)
+        self._original = http.get_credential_lookup()
+        self.addCleanup(http.set_credential_lookup, self._original)
+        self._original_token = http.get_token_provider()
+        self.addCleanup(http.set_token_provider, self._original_token)
+        self.server = _IPv6HTTPServer(("::1", 0), _RedirectHandler)
+        self.server.routes = {"/": "challenge"}
+        self.server.seen = []
+        thread = threading.Thread(target=self.server.serve_forever)
+        thread.daemon = True
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    def test_lookups_get_host_without_brackets(self):
+        token_hosts = []
+        hosts = []
+
+        def token(protocol, host, port=None, path=None):
+            token_hosts.append(host)
+            return (None, None)
+
+        def lookup(protocol, host, port=None, path=None, realm=None):
+            hosts.append(host)
+            return ("joe", "s3cret")
+
+        http.set_token_provider(token)
+        http.set_credential_lookup(lookup)
+        port = self.server.server_address[1]
+        resp = HttpClient().request("GET", f"http://[::1]:{port}/", [], b"")
+        self.assertEqual(200, resp.status)
+        self.assertEqual(["::1"], token_hosts)
+        self.assertEqual(["::1"], hosts)
 
 
 if __name__ == "__main__":
