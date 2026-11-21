@@ -73,6 +73,7 @@ impl HttpDavTransport {
             disable_verification,
             user_agent,
             read_timeout: timeout,
+            headers: Vec::new(),
         };
         let mut client = HttpClient::with_providers(
             cfg,
