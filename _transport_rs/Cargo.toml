@@ -11,7 +11,7 @@ dromedary = { path = "..", version = "0.1.11" }
 pyo3 = { workspace = true, features = ["extension-module"] }
 pyo3-filelike = { workspace = true }
 pyo3-log = "0.13"
-sftp = ">=0.2.3, <0.4"
+sftp = ">=0.2.3, <0.5"
 url = { workspace = true }
 log = { workspace = true }
 russh = { version = "0.64", optional = true }
