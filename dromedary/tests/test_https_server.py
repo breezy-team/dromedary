@@ -15,9 +15,9 @@
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
 
 import os
+import select
 import socket
 import struct
-import time
 import unittest
 
 from dromedary.tests import http_server, https_server, ssl_certs
@@ -31,6 +31,13 @@ def _reset(sock):
     """Close sock so that the peer sees a connection reset."""
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
     sock.close()
+
+
+def _wait_readable(sock, timeout=10.0):
+    """Block until sock is readable (e.g. has a pending connection or RST)."""
+    r, _, _ = select.select([sock], [], [], timeout)
+    if not r:
+        raise AssertionError(f"socket not readable within {timeout}s")
 
 
 class TestDroppedConnections(unittest.TestCase):
@@ -57,8 +64,6 @@ class TestDroppedConnections(unittest.TestCase):
     def test_reset_before_accept(self):
         _reset(self.connect())
         good = self.connect()
-        # Give the reset time to reach the server's accept queue.
-        time.sleep(0.1)
         request, addr = self.server.get_request()
         self.addCleanup(request.close)
         self.assertEqual(good.getsockname(), addr)
@@ -68,5 +73,5 @@ class TestDroppedConnections(unittest.TestCase):
         request, addr = self.server.get_request()
         self.addCleanup(request.close)
         _reset(client)
-        time.sleep(0.1)
+        _wait_readable(request)
         self.assertFalse(self.server.verify_request(request, addr))
