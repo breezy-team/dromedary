@@ -18,14 +18,22 @@
 
 import errno
 import ssl
+import sys
 
 from . import http_server, ssl_certs, test_server
 
 # Errors seen when the client has already disconnected by the time the server
-# wraps or handshakes the socket. macOS reports EINVAL rather than ENOTCONN
-# from getpeername() on a reset connection, which ssl.SSLSocket does not
-# tolerate (https://bugs.python.org/issue13721).
-_PEER_GONE_ERRNOS = (errno.ENOTCONN, errno.ECONNRESET, errno.EINVAL)
+# wraps or handshakes the socket.
+_PEER_GONE_ERRNOS = (errno.ENOTCONN, errno.ECONNRESET)
+
+
+def _wrap_socket_peer_gone_errnos():
+    # macOS reports EINVAL rather than ENOTCONN from getpeername() on a reset
+    # connection, which ssl.SSLSocket._create() does not tolerate
+    # (https://bugs.python.org/issue13721).
+    if sys.platform == "darwin":
+        return (*_PEER_GONE_ERRNOS, errno.EINVAL)
+    return _PEER_GONE_ERRNOS
 
 
 class TestingHTTPSServerMixin:
@@ -33,24 +41,34 @@ class TestingHTTPSServerMixin:
         self.key_file = key_file
         self.cert_file = cert_file
 
-    def _get_ssl_request(self, sock, addr):
-        """Wrap the socket with SSL."""
+    def _create_ssl_context(self):
         ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         if self.cert_file:
             ssl_context.load_cert_chain(self.cert_file, self.key_file)
+        return ssl_context
+
+    def _get_ssl_request(self, sock, addr):
+        """Wrap the socket with SSL."""
+        ssl_context = self._create_ssl_context()
         ssl_sock = ssl_context.wrap_socket(
             sock=sock, server_side=True, do_handshake_on_connect=False
         )
         return ssl_sock, addr
 
     def get_request(self):
+        wrap_errnos = _wrap_socket_peer_gone_errnos()
+        ssl_context = self._create_ssl_context()
         while True:
             sock, addr = super().get_request()
             try:
-                return self._get_ssl_request(sock, addr)
+                ssl_sock = ssl_context.wrap_socket(
+                    sock=sock, server_side=True, do_handshake_on_connect=False
+                )
             except OSError as e:
-                if e.errno not in _PEER_GONE_ERRNOS:
+                if e.errno not in wrap_errnos:
                     raise
+            else:
+                return ssl_sock, addr
             self.clients = [c for c in self.clients if c[0] is not sock]
             sock.close()
 

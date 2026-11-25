@@ -14,11 +14,15 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
 
+import errno
 import os
 import select
 import socket
+import ssl
 import struct
+import sys
 import unittest
+from unittest import mock
 
 from dromedary.tests import http_server, https_server, ssl_certs
 
@@ -75,3 +79,68 @@ class TestDroppedConnections(unittest.TestCase):
         _reset(client)
         _wait_readable(request)
         self.assertFalse(self.server.verify_request(request, addr))
+
+    def test_einval_in_wrap_socket_retried_on_macos(self):
+        self.connect()
+        second = self.connect()
+        orig_wrap = ssl.SSLContext.wrap_socket
+        calls = 0
+
+        def wrap_once_einval(ctx, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise OSError(errno.EINVAL, "Invalid argument")
+            return orig_wrap(ctx, *args, **kwargs)
+
+        with (
+            mock.patch.object(sys, "platform", "darwin"),
+            mock.patch.object(ssl.SSLContext, "wrap_socket", wrap_once_einval),
+        ):
+            request, addr = self.server.get_request()
+        self.addCleanup(request.close)
+        self.assertEqual(2, calls)
+        self.assertEqual(second.getsockname(), addr)
+        self.assertEqual(1, len(self.server.clients))
+        self.assertEqual(second.getsockname(), self.server.clients[0][1])
+
+    def test_einval_in_wrap_socket_propagates_off_macos(self):
+        self.connect()
+        try:
+            with (
+                mock.patch.object(sys, "platform", "linux"),
+                mock.patch.object(
+                    ssl.SSLContext,
+                    "wrap_socket",
+                    side_effect=OSError(errno.EINVAL, "Invalid argument"),
+                ),
+                self.assertRaises(OSError) as cm,
+            ):
+                self.server.get_request()
+        finally:
+            for sock, _addr, _thread in self.server.clients:
+                sock.close()
+        self.assertEqual(errno.EINVAL, cm.exception.errno)
+
+    def test_einval_in_verify_request_is_not_swallowed(self):
+        request = mock.Mock()
+        request.do_handshake.side_effect = OSError(errno.EINVAL, "Invalid argument")
+        with (
+            mock.patch.object(sys, "platform", "darwin"),
+            self.assertRaises(OSError) as cm,
+        ):
+            self.server.verify_request(request, ("127.0.0.1", 12345))
+        self.assertEqual(errno.EINVAL, cm.exception.errno)
+
+    def test_einval_in_context_setup_is_not_swallowed(self):
+        with (
+            mock.patch.object(sys, "platform", "darwin"),
+            mock.patch.object(
+                ssl.SSLContext,
+                "load_cert_chain",
+                side_effect=OSError(errno.EINVAL, "Invalid argument"),
+            ),
+            self.assertRaises(OSError) as cm,
+        ):
+            self.server.get_request()
+        self.assertEqual(errno.EINVAL, cm.exception.errno)
