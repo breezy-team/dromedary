@@ -122,6 +122,15 @@ class TestDroppedConnections(unittest.TestCase):
                 sock.close()
         self.assertEqual(errno.EINVAL, cm.exception.errno)
 
+    def test_verify_request_handles_peer_gone_oserror(self):
+        for err in (errno.ECONNRESET, errno.ENOTCONN):
+            with self.subTest(errno=err):
+                request = mock.Mock()
+                request.do_handshake.side_effect = OSError(err, os.strerror(err))
+                self.assertFalse(
+                    self.server.verify_request(request, ("127.0.0.1", 12345))
+                )
+
     def test_einval_in_verify_request_is_not_swallowed(self):
         request = mock.Mock()
         request.do_handshake.side_effect = OSError(errno.EINVAL, "Invalid argument")
