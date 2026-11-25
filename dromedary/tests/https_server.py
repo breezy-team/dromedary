@@ -69,7 +69,8 @@ class TestingHTTPSServerMixin:
                     raise
             else:
                 return ssl_sock, addr
-            self.clients = [c for c in self.clients if c[0] is not sock]
+            if self.clients and self.clients[-1][0] is sock:
+                self.clients.pop()
             sock.close()
 
     def verify_request(self, request, client_address):
