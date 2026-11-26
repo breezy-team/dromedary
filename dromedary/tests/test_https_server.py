@@ -66,10 +66,20 @@ class TestDroppedConnections(unittest.TestCase):
         return sock
 
     def test_reset_before_accept(self):
-        _reset(self.connect())
+        bad = self.connect()
+        bad_addr = bad.getsockname()
+        _reset(bad)
         good = self.connect()
         request, addr = self.server.get_request()
         self.addCleanup(request.close)
+        if addr == bad_addr:
+            # On Windows, getpeername() still succeeds on a reset accepted
+            # socket, so wrap_socket() does not detect the reset until the
+            # handshake in verify_request().
+            _wait_readable(request)
+            self.assertFalse(self.server.verify_request(request, addr))
+            request, addr = self.server.get_request()
+            self.addCleanup(request.close)
         self.assertEqual(good.getsockname(), addr)
 
     def test_reset_before_handshake(self):
