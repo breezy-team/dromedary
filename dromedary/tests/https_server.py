@@ -16,9 +16,24 @@
 
 """HTTPS test server, available when ssl python module is available."""
 
+import errno
 import ssl
+import sys
 
 from . import http_server, ssl_certs, test_server
+
+# Errors seen when the client has already disconnected by the time the server
+# wraps or handshakes the socket.
+_PEER_GONE_ERRNOS = (errno.ENOTCONN, errno.ECONNRESET)
+
+
+def _wrap_socket_peer_gone_errnos():
+    # macOS reports EINVAL rather than ENOTCONN from getpeername() on a reset
+    # connection, which ssl.SSLSocket._create() does not tolerate
+    # (https://bugs.python.org/issue13721).
+    if sys.platform == "darwin":
+        return (*_PEER_GONE_ERRNOS, errno.EINVAL)
+    return _PEER_GONE_ERRNOS
 
 
 class TestingHTTPSServerMixin:
@@ -26,15 +41,37 @@ class TestingHTTPSServerMixin:
         self.key_file = key_file
         self.cert_file = cert_file
 
-    def _get_ssl_request(self, sock, addr):
-        """Wrap the socket with SSL."""
+    def _create_ssl_context(self):
         ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         if self.cert_file:
             ssl_context.load_cert_chain(self.cert_file, self.key_file)
+        return ssl_context
+
+    def _get_ssl_request(self, sock, addr):
+        """Wrap the socket with SSL."""
+        ssl_context = self._create_ssl_context()
         ssl_sock = ssl_context.wrap_socket(
             sock=sock, server_side=True, do_handshake_on_connect=False
         )
         return ssl_sock, addr
+
+    def get_request(self):
+        wrap_errnos = _wrap_socket_peer_gone_errnos()
+        ssl_context = self._create_ssl_context()
+        while True:
+            sock, addr = super().get_request()
+            try:
+                ssl_sock = ssl_context.wrap_socket(
+                    sock=sock, server_side=True, do_handshake_on_connect=False
+                )
+            except OSError as e:
+                if e.errno not in wrap_errnos:
+                    raise
+            else:
+                return ssl_sock, addr
+            if self.clients and self.clients[-1][0] is sock:
+                self.clients.pop()
+            sock.close()
 
     def verify_request(self, request, client_address):
         """Verify the request.
@@ -52,6 +89,10 @@ class TestingHTTPSServerMixin:
                 # FIXME: We proabaly want more tests to capture which ssl
                 # errors are worth reporting but mostly our tests want an https
                 # server that works -- vila 2012-01-19
+                return False
+            except OSError as e:
+                if e.errno not in _PEER_GONE_ERRNOS:
+                    raise
                 return False
         return serving
 
@@ -74,10 +115,6 @@ class TestingHTTPSServer(TestingHTTPSServerMixin, http_server.TestingHTTPServer)
             self, server_address, request_handler_class, test_case_server
         )
 
-    def get_request(self):
-        sock, addr = http_server.TestingHTTPServer.get_request(self)
-        return self._get_ssl_request(sock, addr)
-
 
 class TestingThreadingHTTPSServer(
     TestingHTTPSServerMixin, http_server.TestingThreadingHTTPServer
@@ -94,10 +131,6 @@ class TestingThreadingHTTPSServer(
         http_server.TestingThreadingHTTPServer.__init__(
             self, server_address, request_handler_class, test_case_server
         )
-
-    def get_request(self):
-        sock, addr = http_server.TestingThreadingHTTPServer.get_request(self)
-        return self._get_ssl_request(sock, addr)
 
 
 class HTTPSServer(http_server.HttpServer):
